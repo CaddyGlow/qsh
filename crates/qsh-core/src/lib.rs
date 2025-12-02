@@ -20,6 +20,9 @@ pub mod session;
 pub mod terminal;
 pub mod transport;
 
+#[cfg(feature = "tunnel")]
+pub mod tunnel;
+
 pub use error::{Error, Result};
 pub use logging::{LogFormat, init_logging};
 pub use metrics::ConnectionMetrics;

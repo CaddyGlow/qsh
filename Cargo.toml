@@ -51,10 +51,11 @@ rand = "0.8"
 base64 = "0.22"
 
 # IP networking
-ipnet = "2.9"
+ipnet = { version = "2.9", features = ["serde"] }
 
 # Utilities
 uuid = { version = "1.10", features = ["v4"] }
+shell-escape = "0.1"
 
 # Internal crates
 qsh-core = { path = "crates/qsh-core" }

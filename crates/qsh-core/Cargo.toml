@@ -29,3 +29,4 @@ tokio-test = { workspace = true }
 proptest = { workspace = true }
 test-case = { workspace = true }
 assert_matches = { workspace = true }
+qsh-test-utils = { workspace = true }
