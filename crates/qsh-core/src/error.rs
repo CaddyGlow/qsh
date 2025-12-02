@@ -40,6 +40,10 @@ pub enum Error {
     /// Operation timed out.
     #[error("operation timed out")]
     Timeout,
+
+    /// Invalid forward specification.
+    #[error("invalid forward spec: {message}")]
+    InvalidForwardSpec { message: String },
 }
 
 /// Convenience result type for qsh operations.

@@ -11,6 +11,7 @@
 pub mod bootstrap;
 pub mod constants;
 pub mod error;
+pub mod forward;
 pub mod protocol;
 pub mod session;
 pub mod terminal;

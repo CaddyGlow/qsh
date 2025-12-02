@@ -5,6 +5,8 @@
 //! - Overlay rendering for status and predictions
 //! - Bootstrap client for SSH-based server discovery
 //! - Session management
+//! - Port forwarding handlers
 
+pub mod forward;
 pub mod overlay;
 pub mod prediction;

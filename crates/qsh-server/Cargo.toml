@@ -6,6 +6,9 @@ authors.workspace = true
 license.workspace = true
 description = "qsh server binary - PTY management and QUIC endpoint"
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "qsh-server"
 path = "src/main.rs"
