@@ -104,11 +104,9 @@
         ];
 
         # Darwin-specific inputs
+        # Note: With newer nixpkgs, frameworks are bundled in apple-sdk and
+        # propagated automatically by stdenv. We only need libiconv explicitly.
         darwinInputs = with pkgs; pkgs.lib.optionals isDarwin [
-          darwin.apple_sdk.frameworks.Security
-          darwin.apple_sdk.frameworks.SystemConfiguration
-          darwin.apple_sdk.frameworks.CoreFoundation
-          darwin.apple_sdk.frameworks.CoreServices
           libiconv
         ];
 

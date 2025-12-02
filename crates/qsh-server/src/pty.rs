@@ -137,7 +137,7 @@ impl Pty {
 
                 // Set controlling terminal
                 unsafe {
-                    libc::ioctl(slave_fd, libc::TIOCSCTTY, 0);
+                    libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0);
                 }
 
                 // Duplicate slave to stdin/stdout/stderr
