@@ -9,9 +9,9 @@ use clap::Parser;
 use quinn::{Endpoint, ServerConfig};
 use tracing::{error, info, warn};
 
-use qsh_core::protocol::Capabilities;
+use qsh_core::protocol::{Capabilities, Message, ResizePayload};
 use qsh_core::transport::server_crypto_config;
-use qsh_server::{Cli, ServerSession, SessionConfig};
+use qsh_server::{Cli, Pty, PtyRelay, ServerSession, SessionConfig};
 
 fn main() {
     // Parse CLI arguments
@@ -178,7 +178,7 @@ async fn handle_connection(
     let quic = qsh_core::transport::QuicConnection::new(conn);
 
     // Accept session (no expected key for now - would come from bootstrap)
-    let session = ServerSession::accept(quic, None, config).await?;
+    let mut session = ServerSession::accept(quic, None, config).await?;
 
     info!(
         addr = %session.remote_addr(),
@@ -186,19 +186,102 @@ async fn handle_connection(
         "Session established"
     );
 
-    // In a full implementation, we would:
-    // 1. Spawn PTY with user's shell
-    // 2. Start bidirectional I/O relay (PTY <-> QUIC streams)
-    // 3. Handle terminal input/output messages
-    // 4. Handle resize, ping/pong, forwards, etc.
-    // 5. Handle reconnection
+    // Get terminal size from session
+    let (cols, rows) = session.term_size();
 
-    eprintln!(
-        "Session from {} - full PTY handling not yet implemented",
-        session.remote_addr()
-    );
-    eprintln!("Closing session...");
+    // Spawn PTY with user's shell
+    let pty = match Pty::spawn(cols, rows, None, &[]) {
+        Ok(pty) => Arc::new(pty),
+        Err(e) => {
+            error!(error = %e, "Failed to spawn PTY");
+            session.close();
+            return Err(e);
+        }
+    };
 
+    info!(cols, rows, "PTY spawned");
+
+    // Start PTY relay
+    let mut relay = PtyRelay::start(pty.clone());
+
+    // Track input sequence for confirmation
+    let mut last_input_seq = 0u64;
+
+    // Main session loop
+    loop {
+        tokio::select! {
+            // Handle PTY output -> send to client
+            output = relay.recv_output() => {
+                match output {
+                    Some(data) if !data.is_empty() => {
+                        if let Err(e) = session.send_state_update(data, last_input_seq).await {
+                            error!(error = %e, "Failed to send state update");
+                            break;
+                        }
+                    }
+                    Some(_) => {
+                        // Empty data, continue
+                    }
+                    None => {
+                        // PTY closed
+                        info!("PTY closed");
+                        break;
+                    }
+                }
+            }
+
+            // Handle client messages
+            msg = session.process_control() => {
+                match msg {
+                    Ok(Some(Message::TerminalInput(input))) => {
+                        last_input_seq = input.sequence;
+                        if let Err(e) = relay.send_input(input.data).await {
+                            error!(error = %e, "Failed to send input to PTY");
+                            break;
+                        }
+                    }
+                    Ok(Some(Message::Resize(ResizePayload { cols, rows }))) => {
+                        info!(cols, rows, "Terminal resize");
+                        // Note: resize is tracked but not fully implemented
+                        // Would need to resize PTY here
+                    }
+                    Ok(Some(Message::Ping(timestamp))) => {
+                        if let Err(e) = session.send_pong(timestamp).await {
+                            warn!(error = %e, "Failed to send pong");
+                        }
+                    }
+                    Ok(Some(Message::Shutdown(_))) => {
+                        info!("Client requested shutdown");
+                        break;
+                    }
+                    Ok(Some(other)) => {
+                        warn!(msg = ?other, "Unexpected message");
+                    }
+                    Ok(None) => {
+                        // Connection closed
+                        info!("Connection closed");
+                        break;
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Control stream error");
+                        break;
+                    }
+                }
+            }
+
+            // Check if PTY child exited
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                if let Ok(Some(code)) = pty.try_wait().await {
+                    info!(exit_code = code, "Shell exited");
+                    break;
+                }
+            }
+        }
+    }
+
+    // Clean up
+    relay.stop();
+    let _ = pty.kill().await;
     session.close();
 
     Ok(())

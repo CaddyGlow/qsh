@@ -48,6 +48,10 @@ pub enum Error {
     /// Transport layer error.
     #[error("transport error: {message}")]
     Transport { message: String },
+
+    /// PTY error.
+    #[error("pty error: {message}")]
+    Pty { message: String },
 }
 
 /// Convenience result type for qsh operations.

@@ -66,6 +66,8 @@ pub struct ServerSession {
     /// Server configuration.
     #[allow(dead_code)] // Will be used for session management
     config: SessionConfig,
+    /// Terminal size (cols, rows).
+    term_size: (u16, u16),
 }
 
 impl ServerSession {
@@ -173,6 +175,7 @@ impl ServerSession {
             parser: Arc::new(Mutex::new(parser)),
             confirmed_input_seq: 0,
             config,
+            term_size: (hello.term_size.cols, hello.term_size.rows),
         })
     }
 
@@ -184,6 +187,11 @@ impl ServerSession {
     /// Get the remote address.
     pub fn remote_addr(&self) -> std::net::SocketAddr {
         self.quic.remote_addr()
+    }
+
+    /// Get the terminal size (cols, rows).
+    pub fn term_size(&self) -> (u16, u16) {
+        self.term_size
     }
 
     /// Get the current RTT.

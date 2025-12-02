@@ -9,7 +9,9 @@
 
 pub mod cli;
 pub mod forward;
+pub mod pty;
 pub mod session;
 
 pub use cli::Cli;
+pub use pty::{Pty, PtyRelay};
 pub use session::{ServerSession, SessionConfig};
