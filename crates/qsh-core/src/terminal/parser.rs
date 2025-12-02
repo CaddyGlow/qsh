@@ -101,12 +101,12 @@ impl Perform for Performer<'_> {
             .iter()
             .next()
             .and_then(|p| p.first().copied())
-            .unwrap_or(0) as u16;
+            .unwrap_or(0);
         let param1 = params
             .iter()
             .nth(1)
             .and_then(|p| p.first().copied())
-            .unwrap_or(0) as u16;
+            .unwrap_or(0);
 
         match (action, intermediates) {
             // Cursor Up (CUU)
@@ -217,7 +217,7 @@ impl Perform for Performer<'_> {
             // Cursor shape (DECSCUSR)
             ('q', [b' ']) => {
                 state.cursor.shape = match param0 {
-                    0 | 1 | 2 => CursorShape::Block,
+                    0..=2 => CursorShape::Block,
                     3 | 4 => CursorShape::Underline,
                     5 | 6 => CursorShape::Bar,
                     _ => CursorShape::Block,
@@ -236,15 +236,11 @@ impl Perform for Performer<'_> {
             .ok()
             .and_then(|s| s.parse::<u8>().ok());
 
-        match cmd {
-            Some(0 | 1 | 2) => {
-                if let Some(title) = params.get(1) {
-                    if let Ok(title) = std::str::from_utf8(title) {
-                        self.state.title = Some(title.to_string());
-                    }
-                }
-            }
-            _ => {}
+        if let Some(0..=2) = cmd
+            && let Some(title) = params.get(1)
+            && let Ok(title) = std::str::from_utf8(title)
+        {
+            self.state.title = Some(title.to_string());
         }
     }
 

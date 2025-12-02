@@ -13,20 +13,15 @@ use serde::{Deserialize, Serialize};
 // =============================================================================
 
 /// Terminal color representation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Color {
     /// Default foreground/background color.
+    #[default]
     Default,
     /// Standard 8/16 color palette (0-15).
     Indexed(u8),
     /// 24-bit RGB color.
     Rgb(u8, u8, u8),
-}
-
-impl Default for Color {
-    fn default() -> Self {
-        Color::Default
-    }
 }
 
 impl std::fmt::Display for Color {

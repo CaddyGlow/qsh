@@ -1,8 +1,8 @@
 # qsh LLM Progress Log Template
 
-Current focus: Phase 3 complete, awaiting review sign-off
+Current focus: Phase 4 complete, awaiting review sign-off
 
-Next step: Phase 4 - Observability
+Next step: Phase 5 - Polish
 
 Blocked: None
 
@@ -59,10 +59,10 @@ Check off tasks as you complete them; keep one line notes per item. Use track le
 - [x] [SYNC] Phase 3 Complete - 214 tests passing (review: claude)
 
 ## Phase 4: Observability
-- [ ] 4.1 [A] Status Overlay Widget (review: ___)
-- [ ] 4.2 [B] Tracing Integration (review: ___)
-- [ ] 4.3 [A] Metrics Collection (review: ___)
-- [ ] [SYNC] Phase 4 Complete (review: ___)
+- [x] 4.1 [A] Status Overlay Widget - already in overlay/status_widget.rs (review: claude)
+- [x] 4.2 [B] Tracing Integration - logging.rs with init_logging (review: claude)
+- [x] 4.3 [A] Metrics Collection - metrics.rs with ConnectionMetrics (review: claude)
+- [x] [SYNC] Phase 4 Complete - 227 tests passing (review: claude)
 
 ## Phase 5: Polish
 - [ ] 5.1 [SEQ] CLI Implementation (Client) (review: ___)

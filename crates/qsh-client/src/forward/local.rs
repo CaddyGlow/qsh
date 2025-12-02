@@ -49,6 +49,7 @@ pub struct LocalForwarder<C: Connection> {
 }
 
 /// State for a single forwarded connection.
+#[allow(dead_code)] // Fields will be used for logging in future
 struct ForwardState {
     /// Target host for logging.
     target_host: String,
@@ -62,9 +63,7 @@ impl<C: Connection + 'static> LocalForwarder<C> {
     /// Binds to the address specified in the forward spec.
     pub async fn new(spec: ForwardSpec, connection: Arc<C>) -> Result<Self> {
         let bind_addr = spec.bind_addr();
-        let listener = TcpListener::bind(bind_addr)
-            .await
-            .map_err(|e| Error::Io(e))?;
+        let listener = TcpListener::bind(bind_addr).await.map_err(Error::Io)?;
 
         info!(
             addr = %bind_addr,
@@ -84,7 +83,7 @@ impl<C: Connection + 'static> LocalForwarder<C> {
 
     /// Get the local address the forwarder is bound to.
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.listener.local_addr().map_err(|e| Error::Io(e))
+        self.listener.local_addr().map_err(Error::Io)
     }
 
     /// Set a shutdown signal for graceful termination.
@@ -170,7 +169,7 @@ impl<C: Connection + 'static> LocalForwarder<C> {
     /// Handle the full lifecycle of a forwarded connection.
     async fn forward_connection(
         forward_id: u64,
-        mut stream: TcpStream,
+        stream: TcpStream,
         peer_addr: SocketAddr,
         target_host: String,
         target_port: u16,
@@ -345,6 +344,7 @@ impl<C: Connection + 'static> LocalForwarder<C> {
 }
 
 /// Manager for multiple local forwards.
+#[allow(dead_code)] // Will be used when CLI is implemented
 pub struct LocalForwardManager<C: Connection> {
     /// Active forwarders.
     forwarders: Vec<LocalForwarder<C>>,
@@ -352,6 +352,7 @@ pub struct LocalForwardManager<C: Connection> {
     connection: Arc<C>,
 }
 
+#[allow(dead_code)] // Will be used when CLI is implemented
 impl<C: Connection + 'static> LocalForwardManager<C> {
     /// Create a new forward manager.
     pub fn new(connection: Arc<C>) -> Self {

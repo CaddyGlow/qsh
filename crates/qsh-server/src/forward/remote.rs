@@ -148,7 +148,7 @@ impl<C: Connection + 'static> RemoteForwarder<C> {
     /// Handle the full lifecycle of a remote forwarded connection.
     async fn forward_connection(
         forward_id: u64,
-        mut stream: TcpStream,
+        stream: TcpStream,
         peer_addr: SocketAddr,
         target_host: String,
         target_port: u16,
@@ -305,6 +305,7 @@ impl<C: Connection + 'static> RemoteForwarder<C> {
 }
 
 /// Manager for multiple remote forwards.
+#[allow(dead_code)] // Will be used when server CLI is implemented
 pub struct RemoteForwardManager<C: Connection> {
     /// Active forwarders.
     forwarders: Vec<RemoteForwarder<C>>,
@@ -312,6 +313,7 @@ pub struct RemoteForwardManager<C: Connection> {
     connection: Arc<C>,
 }
 
+#[allow(dead_code)] // Will be used when server CLI is implemented
 impl<C: Connection + 'static> RemoteForwardManager<C> {
     /// Create a new remote forward manager.
     pub fn new(connection: Arc<C>) -> Self {

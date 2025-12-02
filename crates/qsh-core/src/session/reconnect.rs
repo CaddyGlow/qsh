@@ -105,10 +105,10 @@ impl ReconnectionHandler {
         }
 
         // Check overall timeout
-        if let Some(started) = self.started_at {
-            if started.elapsed() > RECONNECT_TIMEOUT {
-                return false;
-            }
+        if let Some(started) = self.started_at
+            && started.elapsed() > RECONNECT_TIMEOUT
+        {
+            return false;
         }
 
         true

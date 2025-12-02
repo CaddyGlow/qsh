@@ -71,6 +71,7 @@ impl FakePty {
     }
 
     /// Write output synchronously (for non-async tests).
+    #[allow(clippy::result_unit_err)] // Simple test helper
     pub fn write_output_sync(&self, data: &[u8]) -> Result<(), ()> {
         self.output_tx.try_send(data.to_vec()).map_err(|_| ())
     }

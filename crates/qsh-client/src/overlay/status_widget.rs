@@ -76,11 +76,7 @@ impl ConnectionMetrics {
 
         // Jitter calculation (simplified)
         if let Some(srtt) = self.rtt_smoothed {
-            let diff = if sample > srtt {
-                sample - srtt
-            } else {
-                srtt - sample
-            };
+            let diff = Duration::from_nanos(sample.as_nanos().abs_diff(srtt.as_nanos()) as u64);
             self.jitter = Some(match self.jitter {
                 Some(j) => {
                     let j_nanos = j.as_nanos() as u64;
@@ -112,15 +108,15 @@ impl ConnectionMetrics {
     /// Check if connection quality is degraded.
     pub fn is_degraded(&self) -> bool {
         // Consider degraded if RTT > 500ms or packet loss > 5%
-        if let Some(rtt) = self.rtt {
-            if rtt > Duration::from_millis(500) {
-                return true;
-            }
+        if let Some(rtt) = self.rtt
+            && rtt > Duration::from_millis(500)
+        {
+            return true;
         }
-        if let Some(loss) = self.packet_loss {
-            if loss > 0.05 {
-                return true;
-            }
+        if let Some(loss) = self.packet_loss
+            && loss > 0.05
+        {
+            return true;
         }
         false
     }
@@ -207,7 +203,7 @@ impl StatusOverlay {
             return String::new();
         }
 
-        let content = self.build_content();
+        let _content = self.build_content();
         let mut output = String::new();
 
         // Build the display line

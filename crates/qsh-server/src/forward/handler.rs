@@ -27,6 +27,7 @@ const FORWARD_BUFFER_SIZE: usize = 32 * 1024;
 /// active forward connections.
 pub struct ForwardHandler<C: Connection> {
     /// Connection to the client.
+    #[allow(dead_code)] // Will be used for sending responses
     connection: Arc<C>,
     /// Active forward connections keyed by forward_id.
     active_forwards: Arc<Mutex<HashMap<u64, ForwardInfo>>>,
@@ -35,6 +36,7 @@ pub struct ForwardHandler<C: Connection> {
 }
 
 /// Information about an active forward.
+#[allow(dead_code)] // Fields will be used for connection tracking
 struct ForwardInfo {
     spec: ForwardSpec,
 }

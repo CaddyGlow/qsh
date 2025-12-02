@@ -81,6 +81,7 @@ pub struct MockConnection {
     /// Peer address.
     remote_addr: SocketAddr,
     /// Open streams by type.
+    #[allow(dead_code)] // Will be used for stream management in future
     streams: Arc<Mutex<HashMap<StreamType, MockStream>>>,
     /// Pending incoming streams.
     incoming_rx: mpsc::Receiver<(StreamType, MockStream)>,

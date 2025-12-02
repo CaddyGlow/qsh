@@ -201,14 +201,14 @@ impl TerminalState {
                 let self_cell = self_screen.get(col, row);
                 let other_cell = other_screen.get(col, row);
 
-                if let (Some(sc), Some(oc)) = (self_cell, other_cell) {
-                    if sc != oc {
-                        changes.push(CellChange {
-                            col,
-                            row,
-                            cell: oc.clone(),
-                        });
-                    }
+                if let (Some(sc), Some(oc)) = (self_cell, other_cell)
+                    && sc != oc
+                {
+                    changes.push(CellChange {
+                        col,
+                        row,
+                        cell: oc.clone(),
+                    });
                 }
             }
         }

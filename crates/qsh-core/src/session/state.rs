@@ -189,10 +189,12 @@ struct PendingInput {
     /// Sequence number.
     seq: u64,
     /// Input data.
+    #[allow(dead_code)] // Will be used for replay on reconnect
     data: Vec<u8>,
     /// When this was sent.
     sent_at: Instant,
     /// Whether this input is predictable (can show locally).
+    #[allow(dead_code)] // Will be used for prediction display
     predictable: bool,
 }
 
