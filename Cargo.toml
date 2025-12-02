@@ -51,6 +51,7 @@ bytes = "1.7"
 rcgen = "0.13"
 rand = "0.8"
 base64 = "0.22"
+ring = "0.17"
 
 # IP networking
 ipnet = { version = "2.9", features = ["serde"] }

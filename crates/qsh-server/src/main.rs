@@ -11,12 +11,37 @@ use tracing::{error, info, warn};
 
 use qsh_core::protocol::{Capabilities, Message, ResizePayload};
 use qsh_core::transport::server_crypto_config;
-use qsh_server::{Cli, Pty, PtyRelay, ServerSession, SessionConfig};
+use qsh_server::{BootstrapServer, Cli, Pty, PtyRelay, ServerSession, SessionConfig};
 
 fn main() {
     // Parse CLI arguments
     let cli = Cli::parse();
 
+    // Bootstrap mode: minimal logging to stderr, JSON output to stdout
+    if cli.bootstrap {
+        // Only log errors in bootstrap mode (to stderr)
+        if let Err(e) = qsh_core::init_logging(0, None, qsh_core::LogFormat::Text) {
+            eprintln!("Failed to initialize logging: {}", e);
+            std::process::exit(1);
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        let result = rt.block_on(run_bootstrap(&cli));
+
+        if let Err(e) = result {
+            // Output error as JSON
+            let resp = qsh_core::bootstrap::BootstrapResponse::error(e.to_string());
+            if let Ok(json) = resp.to_json() {
+                println!("{}", json);
+            } else {
+                eprintln!("qsh-server: {}", e);
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // Normal server mode
     // Initialize logging
     let log_format = cli.log_format.into();
     if let Err(e) = qsh_core::init_logging(cli.verbose, cli.log_file.as_deref(), log_format) {
@@ -74,6 +99,56 @@ fn main() {
         eprintln!("qsh-server: {}", e);
         std::process::exit(1);
     }
+}
+
+/// Run the server in bootstrap mode.
+///
+/// This mode:
+/// 1. Generates session key and self-signed certificate
+/// 2. Binds to an available port (or specified port)
+/// 3. Outputs JSON with connection info to stdout
+/// 4. Accepts a single connection
+/// 5. Handles that session then exits
+async fn run_bootstrap(cli: &Cli) -> qsh_core::Result<()> {
+    // Use port 0 to auto-select from range, or specified port
+    let port = if cli.port == 4433 { 0 } else { cli.port };
+
+    // Create bootstrap server
+    let bootstrap = BootstrapServer::new(cli.bind_addr, port).await?;
+
+    // Output connection info to stdout
+    bootstrap.print_response(None)?;
+
+    // Accept single connection
+    let conn = bootstrap.accept().await?;
+    let session_key = bootstrap.session_key();
+
+    // Create QUIC connection wrapper
+    let quic = qsh_core::transport::QuicConnection::new(conn);
+
+    // Build session config
+    let session_config = SessionConfig {
+        capabilities: Capabilities {
+            predictive_echo: true,
+            compression: cli.compress,
+            max_forwards: cli.max_forwards,
+            tunnel: false,
+        },
+        idle_timeout: std::time::Duration::from_secs(300),
+        max_forwards: cli.max_forwards,
+        allow_remote_forwards: cli.allow_remote_forwards,
+    };
+
+    // Accept session with expected key
+    let session = ServerSession::accept(quic, Some(session_key), session_config).await?;
+
+    // Handle the session
+    handle_session(session, cli).await?;
+
+    // Clean up
+    bootstrap.close();
+
+    Ok(())
 }
 
 async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
@@ -178,8 +253,15 @@ async fn handle_connection(
     let quic = qsh_core::transport::QuicConnection::new(conn);
 
     // Accept session (no expected key for now - would come from bootstrap)
-    let mut session = ServerSession::accept(quic, None, config).await?;
+    let session = ServerSession::accept(quic, None, config).await?;
 
+    // Handle the session with a dummy CLI for shell config
+    let cli = Cli::default();
+    handle_session(session, &cli).await
+}
+
+/// Handle an established session (shared between bootstrap and normal modes).
+async fn handle_session(mut session: ServerSession, _cli: &Cli) -> qsh_core::Result<()> {
     info!(
         addr = %session.remote_addr(),
         rtt = ?session.rtt(),

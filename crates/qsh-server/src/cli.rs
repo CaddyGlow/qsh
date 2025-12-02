@@ -34,11 +34,15 @@ impl From<CliLogFormat> for qsh_core::LogFormat {
     about = "qsh server - QUIC endpoint for qsh connections"
 )]
 pub struct Cli {
+    /// Run in bootstrap mode (output JSON with connection info, accept single connection)
+    #[arg(long = "bootstrap")]
+    pub bootstrap: bool,
+
     /// Address to listen on
     #[arg(short = 'b', long = "bind", default_value = "0.0.0.0")]
     pub bind_addr: IpAddr,
 
-    /// Port to listen on
+    /// Port to listen on (0 = auto-select from range 4500-4600 in bootstrap mode)
     #[arg(short = 'p', long = "port", default_value = "4433")]
     pub port: u16,
 
@@ -151,6 +155,7 @@ impl Cli {
 impl Default for Cli {
     fn default() -> Self {
         Self {
+            bootstrap: false,
             bind_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             port: 4433,
             cert_file: None,
@@ -194,6 +199,7 @@ mod tests {
     #[test]
     fn default_values() {
         let cli = Cli::try_parse_from(["qsh-server"]).unwrap();
+        assert!(!cli.bootstrap);
         assert_eq!(cli.bind_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(cli.port, 4433);
         assert_eq!(cli.max_connections, 100);
@@ -203,6 +209,12 @@ mod tests {
         assert!(!cli.foreground);
         assert!(!cli.compress);
         assert!(!cli.ipv6);
+    }
+
+    #[test]
+    fn parse_bootstrap() {
+        let cli = Cli::try_parse_from(["qsh-server", "--bootstrap"]).unwrap();
+        assert!(cli.bootstrap);
     }
 
     #[test]
