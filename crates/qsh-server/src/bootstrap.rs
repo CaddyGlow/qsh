@@ -73,34 +73,17 @@ impl BootstrapServer {
             })?,
         ));
 
-        // Find an available port
-        let bind_addr = if port == 0 {
+        // Find an available port and create endpoint
+        let endpoint = if port == 0 {
             // Auto-select from port range
-            find_available_port(bind_ip, DEFAULT_QUIC_PORT_RANGE, &server_config)?
+            find_available_endpoint(bind_ip, DEFAULT_QUIC_PORT_RANGE, server_config)?
         } else {
             // Use specified port
             let addr = SocketAddr::new(bind_ip, port);
-            let endpoint =
-                Endpoint::server(server_config.clone(), addr).map_err(|e| Error::Transport {
-                    message: format!("failed to bind to {}: {}", addr, e),
-                })?;
-            return Ok(Self {
-                session_key,
-                cert_der,
-                cert_hash,
-                key_der,
-                bind_addr: endpoint.local_addr().map_err(|e| Error::Transport {
-                    message: format!("failed to get local address: {}", e),
-                })?,
-                endpoint,
-            });
+            Endpoint::server(server_config, addr).map_err(|e| Error::Transport {
+                message: format!("failed to bind to {}: {}", addr, e),
+            })?
         };
-
-        // Create endpoint with found port
-        let endpoint =
-            Endpoint::server(server_config, bind_addr).map_err(|e| Error::Transport {
-                message: format!("failed to bind to {}: {}", bind_addr, e),
-            })?;
 
         let actual_addr = endpoint.local_addr().map_err(|e| Error::Transport {
             message: format!("failed to get local address: {}", e),
@@ -190,19 +173,18 @@ impl BootstrapServer {
     }
 }
 
-/// Find an available port in the given range.
-fn find_available_port(
+/// Find an available port in the given range and return a bound endpoint.
+fn find_available_endpoint(
     ip: IpAddr,
     port_range: (u16, u16),
-    server_config: &ServerConfig,
-) -> Result<SocketAddr> {
+    server_config: ServerConfig,
+) -> Result<Endpoint> {
     for port in port_range.0..=port_range.1 {
         let addr = SocketAddr::new(ip, port);
         match Endpoint::server(server_config.clone(), addr) {
             Ok(endpoint) => {
-                // Successfully bound, close and return the address
-                endpoint.close(quinn::VarInt::from_u32(0), b"port scan");
-                return Ok(addr);
+                // Successfully bound, return the endpoint
+                return Ok(endpoint);
             }
             Err(_) => {
                 // Port in use, try next
