@@ -5,13 +5,13 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::BytesMut;
-use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::Message;
@@ -128,10 +128,7 @@ impl MockConnection {
 
     /// Accept an incoming stream.
     pub async fn accept_stream(&mut self) -> Result<(StreamType, MockStream)> {
-        self.incoming_rx
-            .recv()
-            .await
-            .ok_or(Error::ConnectionClosed)
+        self.incoming_rx.recv().await.ok_or(Error::ConnectionClosed)
     }
 
     /// Get the remote peer's address.
@@ -188,7 +185,7 @@ pub fn mock_connection_pair() -> (MockConnection, MockConnection) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qsh_core::protocol::{HelloPayload, Capabilities, TermSize};
+    use qsh_core::protocol::{Capabilities, HelloPayload, TermSize};
 
     #[tokio::test]
     async fn mock_stream_send_recv() {

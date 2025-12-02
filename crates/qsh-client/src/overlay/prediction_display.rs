@@ -83,11 +83,7 @@ impl PredictionOverlay {
 
         for pred in &self.predictions {
             // Move to position (1-indexed for ANSI)
-            output.push_str(&format!(
-                "\x1b[{};{}H",
-                pred.row + 1,
-                pred.col + 1
-            ));
+            output.push_str(&format!("\x1b[{};{}H", pred.row + 1, pred.col + 1));
 
             // Apply style
             match pred.style {
@@ -128,11 +124,7 @@ impl PredictionOverlay {
 
         for pred in &self.predictions {
             // Move to position
-            output.push_str(&format!(
-                "\x1b[{};{}H",
-                pred.row + 1,
-                pred.col + 1
-            ));
+            output.push_str(&format!("\x1b[{};{}H", pred.row + 1, pred.col + 1));
 
             // Print original character (no special styling)
             let original = get_original(pred.col, pred.row);

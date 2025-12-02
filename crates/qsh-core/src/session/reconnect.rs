@@ -126,9 +126,7 @@ impl ReconnectionHandler {
         let jitter_range = delay.as_millis() as u64 / 4;
         let jitter = if jitter_range > 0 {
             // Simple deterministic "jitter" based on attempt count
-            Duration::from_millis(
-                (self.current_attempt as u64 * 17) % jitter_range.max(1),
-            )
+            Duration::from_millis((self.current_attempt as u64 * 17) % jitter_range.max(1))
         } else {
             Duration::ZERO
         };
@@ -293,8 +291,11 @@ mod tests {
 
     #[test]
     fn handler_exponential_backoff() {
-        let mut handler =
-            ReconnectionHandler::with_config(10, Duration::from_millis(100), Duration::from_secs(5));
+        let mut handler = ReconnectionHandler::with_config(
+            10,
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+        );
 
         handler.start(0, 0, false);
 
@@ -316,8 +317,11 @@ mod tests {
 
     #[test]
     fn handler_max_delay_cap() {
-        let mut handler =
-            ReconnectionHandler::with_config(20, Duration::from_millis(100), Duration::from_secs(1));
+        let mut handler = ReconnectionHandler::with_config(
+            20,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+        );
 
         handler.start(0, 0, false);
 

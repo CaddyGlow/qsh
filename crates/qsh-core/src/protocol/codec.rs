@@ -66,7 +66,10 @@ impl Codec {
         // Check for oversized message before waiting for more data
         if len > MAX_MESSAGE_SIZE {
             return Err(Error::Codec {
-                message: format!("message length {} exceeds maximum {}", len, MAX_MESSAGE_SIZE),
+                message: format!(
+                    "message length {} exceeds maximum {}",
+                    len, MAX_MESSAGE_SIZE
+                ),
             });
         }
 

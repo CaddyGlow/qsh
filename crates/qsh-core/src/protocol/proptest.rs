@@ -95,11 +95,19 @@ fn arb_shutdown_reason() -> impl Strategy<Value = ShutdownReason> {
 }
 
 prop_compose! {
-    fn arb_forward_spec()(variant in 0u8..3, port in any::<u16>()) -> ForwardSpec {
+    fn arb_forward_spec()(
+        variant in 0u8..3,
+        bind_ip in any::<[u8; 4]>(),
+        bind_port in any::<u16>(),
+        target_host in "[a-z.]{1,32}",
+        target_port in any::<u16>(),
+    ) -> ForwardSpec {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(bind_ip)), bind_port);
         match variant {
-            0 => ForwardSpec::Local { bind_port: port },
-            1 => ForwardSpec::Remote { bind_port: port },
-            _ => ForwardSpec::Dynamic,
+            0 => ForwardSpec::Local { bind_addr, target_host, target_port },
+            1 => ForwardSpec::Remote { bind_addr, target_host, target_port },
+            _ => ForwardSpec::Dynamic { bind_addr },
         }
     }
 }
@@ -115,38 +123,36 @@ fn arb_message() -> impl Strategy<Value = Message> {
             .prop_map(|(cols, rows)| Message::Resize(ResizePayload { cols, rows })),
         (arb_shutdown_reason(), any::<Option<String>>())
             .prop_map(|(reason, message)| Message::Shutdown(ShutdownPayload { reason, message })),
-
         // Terminal messages
         arb_terminal_input().prop_map(Message::TerminalInput),
         any::<u64>().prop_map(|g| Message::StateAck(StateAckPayload { generation: g })),
-
         // Forward messages
-        (any::<u64>(), arb_forward_spec(), "[a-z.]{1,32}", any::<u16>())
-            .prop_map(|(id, spec, target, port)| {
-                Message::ForwardRequest(ForwardRequestPayload {
-                    forward_id: id,
-                    spec,
-                    target,
-                    target_port: port,
-                })
-            }),
+        (any::<u64>(), arb_forward_spec()).prop_map(|(id, spec)| {
+            Message::ForwardRequest(ForwardRequestPayload {
+                forward_id: id,
+                spec,
+            })
+        }),
         any::<u64>().prop_map(|id| Message::ForwardAccept(ForwardAcceptPayload { forward_id: id })),
-        (any::<u64>(), "[a-z ]{0,64}")
-            .prop_map(|(id, reason)| Message::ForwardReject(ForwardRejectPayload {
+        (any::<u64>(), "[a-z ]{0,64}").prop_map(|(id, reason)| Message::ForwardReject(
+            ForwardRejectPayload {
                 forward_id: id,
                 reason,
-            })),
-        (any::<u64>(), prop::collection::vec(any::<u8>(), 0..1024))
-            .prop_map(|(id, data)| Message::ForwardData(ForwardDataPayload {
+            }
+        )),
+        (any::<u64>(), prop::collection::vec(any::<u8>(), 0..1024)).prop_map(|(id, data)| {
+            Message::ForwardData(ForwardDataPayload {
                 forward_id: id,
                 data,
-            })),
+            })
+        }),
         any::<u64>().prop_map(|id| Message::ForwardEof(ForwardEofPayload { forward_id: id })),
-        (any::<u64>(), any::<Option<String>>())
-            .prop_map(|(id, reason)| Message::ForwardClose(ForwardClosePayload {
+        (any::<u64>(), any::<Option<String>>()).prop_map(|(id, reason)| Message::ForwardClose(
+            ForwardClosePayload {
                 forward_id: id,
                 reason,
-            })),
+            }
+        )),
     ]
 }
 

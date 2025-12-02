@@ -624,7 +624,10 @@ mod tests {
         assert_eq!(format!("{}", Color::Indexed(1)), "\x1b[31m");
         assert_eq!(format!("{}", Color::Indexed(9)), "\x1b[91m");
         assert_eq!(format!("{}", Color::Indexed(200)), "\x1b[38;5;200m");
-        assert_eq!(format!("{}", Color::Rgb(255, 128, 0)), "\x1b[38;2;255;128;0m");
+        assert_eq!(
+            format!("{}", Color::Rgb(255, 128, 0)),
+            "\x1b[38;2;255;128;0m"
+        );
     }
 
     #[test]

@@ -10,15 +10,15 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
-use qsh_core::forward::ParsedForwardSpec;
+use qsh_core::forward::ForwardSpec;
 use qsh_core::protocol::{
     ForwardAcceptPayload, ForwardClosePayload, ForwardDataPayload, ForwardEofPayload,
     ForwardRejectPayload, ForwardRequestPayload, Message,
@@ -35,7 +35,7 @@ const FORWARD_BUFFER_SIZE: usize = 32 * 1024; // 32KB
 /// the qsh server.
 pub struct LocalForwarder<C: Connection> {
     /// The forward specification.
-    spec: ParsedForwardSpec,
+    spec: ForwardSpec,
     /// TCP listener for local connections.
     listener: TcpListener,
     /// Connection to the qsh server.
@@ -60,9 +60,11 @@ impl<C: Connection + 'static> LocalForwarder<C> {
     /// Create a new local forwarder.
     ///
     /// Binds to the address specified in the forward spec.
-    pub async fn new(spec: ParsedForwardSpec, connection: Arc<C>) -> Result<Self> {
+    pub async fn new(spec: ForwardSpec, connection: Arc<C>) -> Result<Self> {
         let bind_addr = spec.bind_addr();
-        let listener = TcpListener::bind(bind_addr).await.map_err(|e| Error::Io(e))?;
+        let listener = TcpListener::bind(bind_addr)
+            .await
+            .map_err(|e| Error::Io(e))?;
 
         info!(
             addr = %bind_addr,
@@ -92,12 +94,9 @@ impl<C: Connection + 'static> LocalForwarder<C> {
 
     /// Run the forwarder, accepting connections until shutdown.
     pub async fn run(&mut self) -> Result<()> {
-        let (target_host, target_port) = self
-            .spec
-            .target()
-            .ok_or_else(|| Error::Protocol {
-                message: "local forward requires target".into(),
-            })?;
+        let (target_host, target_port) = self.spec.target().ok_or_else(|| Error::Protocol {
+            message: "local forward requires target".into(),
+        })?;
         let target_host = target_host.to_string();
 
         loop {
@@ -179,16 +178,21 @@ impl<C: Connection + 'static> LocalForwarder<C> {
         active_forwards: Arc<Mutex<HashMap<u64, ForwardState>>>,
     ) -> Result<()> {
         // Open a forward stream to the server
-        let mut server_stream = connection.open_stream(StreamType::Forward(forward_id as u32)).await?;
+        let mut server_stream = connection
+            .open_stream(StreamType::Forward(forward_id as u32))
+            .await?;
 
-        // Send forward request
+        // Send forward request - include full spec info
         let request = Message::ForwardRequest(ForwardRequestPayload {
             forward_id,
-            spec: qsh_core::protocol::ForwardSpec::Local {
-                bind_port: 0, // Server doesn't need this for local forwards
+            spec: ForwardSpec::Local {
+                bind_addr: std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0, // Bind port is not relevant on server side for local forwards
+                ),
+                target_host: target_host.clone(),
+                target_port,
             },
-            target: target_host.clone(),
-            target_port,
         });
         server_stream.send(&request).await?;
 
@@ -202,7 +206,10 @@ impl<C: Connection + 'static> LocalForwarder<C> {
                     "Forward accepted"
                 );
             }
-            Message::ForwardReject(ForwardRejectPayload { forward_id: id, reason }) if id == forward_id => {
+            Message::ForwardReject(ForwardRejectPayload {
+                forward_id: id,
+                reason,
+            }) if id == forward_id => {
                 warn!(forward_id, %reason, "Forward rejected");
                 return Err(Error::Protocol {
                     message: format!("forward rejected: {}", reason),
@@ -356,7 +363,7 @@ impl<C: Connection + 'static> LocalForwardManager<C> {
 
     /// Add a local forward from a specification string.
     pub async fn add_forward(&mut self, spec_str: &str) -> Result<SocketAddr> {
-        let spec = ParsedForwardSpec::parse_local(spec_str)?;
+        let spec = ForwardSpec::parse_local(spec_str)?;
         let forwarder = LocalForwarder::new(spec, Arc::clone(&self.connection)).await?;
         let addr = forwarder.local_addr()?;
         self.forwarders.push(forwarder);

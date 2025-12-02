@@ -6,8 +6,8 @@
 //! - IPv4, IPv6, and domain name addresses
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -143,7 +143,10 @@ impl<C: Connection + 'static> Socks5Proxy<C> {
         }
 
         let nmethods = buf[1] as usize;
-        stream.read_exact(&mut buf[..nmethods]).await.map_err(Error::Io)?;
+        stream
+            .read_exact(&mut buf[..nmethods])
+            .await
+            .map_err(Error::Io)?;
 
         // Check if no-auth is supported
         let supports_no_auth = buf[..nmethods].contains(&AUTH_NO_AUTH);
@@ -235,7 +238,10 @@ impl<C: Connection + 'static> Socks5Proxy<C> {
         );
 
         // Step 3: Connect through qsh server
-        let mut server_stream = match connection.open_stream(StreamType::Forward(forward_id as u32)).await {
+        let mut server_stream = match connection
+            .open_stream(StreamType::Forward(forward_id as u32))
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 Self::send_reply(&mut stream, REPLY_GENERAL_FAILURE).await?;
@@ -243,12 +249,19 @@ impl<C: Connection + 'static> Socks5Proxy<C> {
             }
         };
 
-        // Send forward request
+        // Send forward request - Dynamic forwards include target from SOCKS5 negotiation
         let request = Message::ForwardRequest(ForwardRequestPayload {
             forward_id,
-            spec: qsh_core::protocol::ForwardSpec::Dynamic,
-            target: target_host.clone(),
-            target_port,
+            spec: qsh_core::protocol::ForwardSpec::Local {
+                // For dynamic forwards, the actual target comes from SOCKS5 negotiation
+                // We use Local variant since server connects to target
+                bind_addr: std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0, // Not relevant for server
+                ),
+                target_host: target_host.clone(),
+                target_port,
+            },
         });
 
         if let Err(e) = server_stream.send(&request).await {
@@ -271,9 +284,10 @@ impl<C: Connection + 'static> Socks5Proxy<C> {
                 // Send success reply
                 Self::send_reply(&mut stream, REPLY_SUCCESS).await?;
             }
-            Message::ForwardReject(ForwardRejectPayload { forward_id: id, reason })
-                if id == forward_id =>
-            {
+            Message::ForwardReject(ForwardRejectPayload {
+                forward_id: id,
+                reason,
+            }) if id == forward_id => {
                 warn!(forward_id, %reason, "Forward rejected");
                 Self::send_reply(&mut stream, REPLY_CONNECTION_REFUSED).await?;
                 return Err(Error::Protocol {
@@ -308,10 +322,14 @@ impl<C: Connection + 'static> Socks5Proxy<C> {
         let response = [
             SOCKS_VERSION,
             reply,
-            0x00,                       // Reserved
-            ADDR_IPV4,                  // Address type
-            0x00, 0x00, 0x00, 0x00,     // 0.0.0.0
-            0x00, 0x00,                 // Port 0
+            0x00,      // Reserved
+            ADDR_IPV4, // Address type
+            0x00,
+            0x00,
+            0x00,
+            0x00, // 0.0.0.0
+            0x00,
+            0x00, // Port 0
         ];
         stream.write_all(&response).await.map_err(Error::Io)
     }

@@ -48,8 +48,12 @@ mod socks_protocol {
             CMD_CONNECT,
             0x00, // Reserved
             ADDR_IPV4,
-            127, 0, 0, 1, // IPv4 address
-            0x1F, 0x90, // Port 8080 (big endian)
+            127,
+            0,
+            0,
+            1, // IPv4 address
+            0x1F,
+            0x90, // Port 8080 (big endian)
         ];
 
         assert_eq!(request[0], 0x05);
@@ -89,8 +93,24 @@ mod socks_protocol {
             CMD_CONNECT,
             0x00, // Reserved
             ADDR_IPV6,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, // ::1
-            0x00, 0x16, // Port 22
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1, // ::1
+            0x00,
+            0x16, // Port 22
         ];
 
         assert_eq!(request[3], 0x04); // IPv6
@@ -107,8 +127,12 @@ mod socks_protocol {
             0x00, // Success
             0x00, // Reserved
             ADDR_IPV4,
-            0, 0, 0, 0, // Bound address (0.0.0.0)
-            0, 0, // Bound port (0)
+            0,
+            0,
+            0,
+            0, // Bound address (0.0.0.0)
+            0,
+            0, // Bound port (0)
         ];
 
         assert_eq!(reply[0], 0x05);

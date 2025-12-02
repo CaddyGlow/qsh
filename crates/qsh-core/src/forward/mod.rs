@@ -7,7 +7,7 @@
 
 mod spec;
 
-pub use spec::{ForwardSpec, ParsedForwardSpec};
+pub use spec::ForwardSpec;
 
 #[cfg(test)]
 mod tests;

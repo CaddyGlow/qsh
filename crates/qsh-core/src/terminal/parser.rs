@@ -340,12 +340,9 @@ fn handle_sgr(state: &mut TerminalState, params: &Params) {
                             }
                         }
                         2 => {
-                            let r =
-                                iter.next().and_then(|p| p.first().copied()).unwrap_or(0) as u8;
-                            let g =
-                                iter.next().and_then(|p| p.first().copied()).unwrap_or(0) as u8;
-                            let b =
-                                iter.next().and_then(|p| p.first().copied()).unwrap_or(0) as u8;
+                            let r = iter.next().and_then(|p| p.first().copied()).unwrap_or(0) as u8;
+                            let g = iter.next().and_then(|p| p.first().copied()).unwrap_or(0) as u8;
+                            let b = iter.next().and_then(|p| p.first().copied()).unwrap_or(0) as u8;
                             state.current_fg = Color::Rgb(r, g, b);
                         }
                         _ => {}
@@ -364,12 +361,9 @@ fn handle_sgr(state: &mut TerminalState, params: &Params) {
                             }
                         }
                         2 => {
-                            let r =
-                                iter.next().and_then(|p| p.first().copied()).unwrap_or(0) as u8;
-                            let g =
-                                iter.next().and_then(|p| p.first().copied()).unwrap_or(0) as u8;
-                            let b =
-                                iter.next().and_then(|p| p.first().copied()).unwrap_or(0) as u8;
+                            let r = iter.next().and_then(|p| p.first().copied()).unwrap_or(0) as u8;
+                            let g = iter.next().and_then(|p| p.first().copied()).unwrap_or(0) as u8;
+                            let b = iter.next().and_then(|p| p.first().copied()).unwrap_or(0) as u8;
                             state.current_bg = Color::Rgb(r, g, b);
                         }
                         _ => {}
@@ -593,7 +587,10 @@ mod tests {
         parser.process(b"\x1b[38;2;255;128;0mO");
 
         let state = parser.state();
-        assert_eq!(state.screen().get(0, 0).unwrap().fg, Color::Rgb(255, 128, 0));
+        assert_eq!(
+            state.screen().get(0, 0).unwrap().fg,
+            Color::Rgb(255, 128, 0)
+        );
     }
 
     #[test]

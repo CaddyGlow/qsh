@@ -8,8 +8,8 @@
 //! 5. Bidirectional data relay
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -163,9 +163,14 @@ impl<C: Connection + 'static> RemoteForwarder<C> {
         // Send forward request to client
         let request = Message::ForwardRequest(ForwardRequestPayload {
             forward_id,
-            spec: ForwardSpec::Remote { bind_port },
-            target: target_host.clone(),
-            target_port,
+            spec: ForwardSpec::Remote {
+                bind_addr: std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    bind_port,
+                ),
+                target_host: target_host.clone(),
+                target_port,
+            },
         });
         client_stream.send(&request).await?;
 

@@ -8,15 +8,15 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, error, warn};
 
+use qsh_core::Result;
 use qsh_core::protocol::{
     ForwardAcceptPayload, ForwardClosePayload, ForwardDataPayload, ForwardEofPayload,
     ForwardRejectPayload, ForwardRequestPayload, ForwardSpec, Message,
 };
 use qsh_core::transport::{Connection, StreamPair, StreamType};
-use qsh_core::Result;
 
 /// Maximum buffer size for forwarding data.
 const FORWARD_BUFFER_SIZE: usize = 32 * 1024;
@@ -36,8 +36,6 @@ pub struct ForwardHandler<C: Connection> {
 
 /// Information about an active forward.
 struct ForwardInfo {
-    target_host: String,
-    target_port: u16,
     spec: ForwardSpec,
 }
 
@@ -61,7 +59,8 @@ impl<C: Connection + 'static> ForwardHandler<C> {
         mut stream: impl StreamPair + 'static,
     ) -> Result<()> {
         let forward_id = request.forward_id;
-        let target = format!("{}:{}", request.target, request.target_port);
+        let (target_host, target_port) = request.spec.target().unwrap_or(("localhost", 0));
+        let target = format!("{}:{}", target_host, target_port);
 
         debug!(
             forward_id,
@@ -107,14 +106,7 @@ impl<C: Connection + 'static> ForwardHandler<C> {
         // Register forward
         {
             let mut forwards = self.active_forwards.lock().await;
-            forwards.insert(
-                forward_id,
-                ForwardInfo {
-                    target_host: request.target.clone(),
-                    target_port: request.target_port,
-                    spec: request.spec,
-                },
-            );
+            forwards.insert(forward_id, ForwardInfo { spec: request.spec });
         }
 
         // Spawn relay task
@@ -151,10 +143,7 @@ impl<C: Connection + 'static> ForwardHandler<C> {
                 }
             }
             Ok(other) => {
-                warn!(
-                    forward_id,
-                    "Expected ForwardRequest, got: {:?}", other
-                );
+                warn!(forward_id, "Expected ForwardRequest, got: {:?}", other);
             }
             Err(e) => {
                 error!(forward_id, error = %e, "Failed to read forward request");

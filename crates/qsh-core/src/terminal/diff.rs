@@ -188,9 +188,7 @@ impl TerminalState {
         let other_screen = other.screen();
 
         // If screens have different sizes, we need full state
-        if self_screen.cols() != other_screen.cols()
-            || self_screen.rows() != other_screen.rows()
-        {
+        if self_screen.cols() != other_screen.cols() || self_screen.rows() != other_screen.rows() {
             // Return empty - caller will see size mismatch and use Full
             // Actually, let's compare what we can
         }

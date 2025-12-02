@@ -212,24 +212,21 @@ impl StatusOverlay {
 
         // Build the display line
         let status_char = match self.status {
-            ConnectionStatus::Connected => "+", // checkmark substitute
+            ConnectionStatus::Connected => "+",    // checkmark substitute
             ConnectionStatus::Reconnecting => "~", // arrows substitute
-            ConnectionStatus::Degraded => "!", // warning substitute
+            ConnectionStatus::Degraded => "!",     // warning substitute
             ConnectionStatus::Disconnected => "x",
         };
 
         // Build status bar content
         let user_host = self.user_host.as_deref().unwrap_or("?");
-        let rtt_str = self.metrics.rtt_smoothed
+        let rtt_str = self
+            .metrics
+            .rtt_smoothed
             .map(|d| format!("{}ms", d.as_millis()))
             .unwrap_or_else(|| "-".to_string());
 
-        let bar_content = format!(
-            " qsh | {} | RTT: {} | {} ",
-            user_host,
-            rtt_str,
-            status_char
-        );
+        let bar_content = format!(" qsh | {} | RTT: {} | {} ", user_host, rtt_str, status_char);
 
         // Pad or truncate to fit width
         let bar_width = cols as usize;
@@ -274,7 +271,9 @@ impl StatusOverlay {
             ConnectionStatus::Disconnected => "disconnected",
         };
 
-        let rtt_str = self.metrics.rtt_smoothed
+        let rtt_str = self
+            .metrics
+            .rtt_smoothed
             .map(|d| format!("{}ms", d.as_millis()))
             .unwrap_or_else(|| "?".to_string());
 

@@ -275,23 +275,268 @@ pub struct CursorState {
 pub struct ForwardRequestPayload {
     /// Unique forward ID for this connection.
     pub forward_id: u64,
-    /// Forward specification.
+    /// Forward specification (includes bind address and target info).
     pub spec: ForwardSpec,
-    /// Target host for the forward.
-    pub target: String,
-    /// Target port for the forward.
-    pub target_port: u16,
 }
 
 /// Forward specification enumeration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ForwardSpec {
-    /// -L: Local port forward.
-    Local { bind_port: u16 },
-    /// -R: Remote port forward.
-    Remote { bind_port: u16 },
-    /// -D: Dynamic SOCKS5.
-    Dynamic,
+    /// -L: Local port forward (client listens, server connects to target).
+    Local {
+        /// Bind address on client.
+        bind_addr: std::net::SocketAddr,
+        /// Target hostname on server side.
+        target_host: String,
+        /// Target port on server side.
+        target_port: u16,
+    },
+    /// -R: Remote port forward (server listens, client connects to target).
+    Remote {
+        /// Bind address on server.
+        bind_addr: std::net::SocketAddr,
+        /// Target hostname on client side.
+        target_host: String,
+        /// Target port on client side.
+        target_port: u16,
+    },
+    /// -D: Dynamic SOCKS5 (client runs SOCKS5 proxy).
+    Dynamic {
+        /// Bind address for SOCKS5 proxy.
+        bind_addr: std::net::SocketAddr,
+    },
+}
+
+impl ForwardSpec {
+    /// Parse a local forward specification (-L).
+    ///
+    /// Formats:
+    /// - `[bind_addr:]port:host:hostport`
+    /// - `port:host:hostport` (binds to localhost)
+    pub fn parse_local(s: &str) -> crate::Result<Self> {
+        let (bind_addr, target_host, target_port) = parse_forward_spec(s)?;
+        Ok(Self::Local {
+            bind_addr,
+            target_host,
+            target_port,
+        })
+    }
+
+    /// Parse a remote forward specification (-R).
+    ///
+    /// Formats:
+    /// - `[bind_addr:]port:host:hostport`
+    /// - `port:host:hostport` (binds to localhost on server)
+    pub fn parse_remote(s: &str) -> crate::Result<Self> {
+        let (bind_addr, target_host, target_port) = parse_forward_spec(s)?;
+        Ok(Self::Remote {
+            bind_addr,
+            target_host,
+            target_port,
+        })
+    }
+
+    /// Parse a dynamic forward specification (-D).
+    ///
+    /// Formats:
+    /// - `[bind_addr:]port`
+    /// - `port` (binds to localhost)
+    pub fn parse_dynamic(s: &str) -> crate::Result<Self> {
+        let bind_addr = parse_bind_spec(s)?;
+        Ok(Self::Dynamic { bind_addr })
+    }
+
+    /// Get the bind address.
+    pub fn bind_addr(&self) -> std::net::SocketAddr {
+        match self {
+            Self::Local { bind_addr, .. } => *bind_addr,
+            Self::Remote { bind_addr, .. } => *bind_addr,
+            Self::Dynamic { bind_addr } => *bind_addr,
+        }
+    }
+
+    /// Get the target host and port (if applicable).
+    pub fn target(&self) -> Option<(&str, u16)> {
+        match self {
+            Self::Local {
+                target_host,
+                target_port,
+                ..
+            } => Some((target_host.as_str(), *target_port)),
+            Self::Remote {
+                target_host,
+                target_port,
+                ..
+            } => Some((target_host.as_str(), *target_port)),
+            Self::Dynamic { .. } => None,
+        }
+    }
+}
+
+/// Parse a forward specification in format `[bind_addr:]port:host:hostport`.
+fn parse_forward_spec(s: &str) -> crate::Result<(std::net::SocketAddr, String, u16)> {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    if s.is_empty() {
+        return Err(crate::Error::InvalidForwardSpec {
+            message: "empty specification".into(),
+        });
+    }
+
+    // Check for IPv6 bind address (starts with '[')
+    if s.starts_with('[') {
+        return parse_forward_spec_ipv6(s);
+    }
+
+    let parts: Vec<&str> = s.split(':').collect();
+
+    match parts.len() {
+        // port:host:hostport
+        3 => {
+            let bind_port = parse_port(parts[0])?;
+            let target_host = parts[1].to_string();
+            let target_port = parse_port(parts[2])?;
+
+            let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bind_port);
+            Ok((bind_addr, target_host, target_port))
+        }
+        // bind_addr:port:host:hostport (IPv4)
+        4 => {
+            let bind_ip: IpAddr =
+                parts[0]
+                    .parse()
+                    .map_err(|_| crate::Error::InvalidForwardSpec {
+                        message: format!("invalid bind address: {}", parts[0]),
+                    })?;
+            let bind_port = parse_port(parts[1])?;
+            let target_host = parts[2].to_string();
+            let target_port = parse_port(parts[3])?;
+
+            let bind_addr = SocketAddr::new(bind_ip, bind_port);
+            Ok((bind_addr, target_host, target_port))
+        }
+        _ => Err(crate::Error::InvalidForwardSpec {
+            message: format!(
+                "invalid format: expected [bind_addr:]port:host:hostport, got: {}",
+                s
+            ),
+        }),
+    }
+}
+
+/// Parse a forward specification with IPv6 bind address.
+fn parse_forward_spec_ipv6(s: &str) -> crate::Result<(std::net::SocketAddr, String, u16)> {
+    use std::net::{IpAddr, SocketAddr};
+
+    let close_bracket = s
+        .find(']')
+        .ok_or_else(|| crate::Error::InvalidForwardSpec {
+            message: "unclosed IPv6 bracket".into(),
+        })?;
+
+    let ipv6_str = &s[1..close_bracket];
+    let bind_ip: IpAddr = ipv6_str
+        .parse()
+        .map_err(|_| crate::Error::InvalidForwardSpec {
+            message: format!("invalid IPv6 address: {}", ipv6_str),
+        })?;
+
+    let remainder = &s[close_bracket + 1..];
+    if !remainder.starts_with(':') {
+        return Err(crate::Error::InvalidForwardSpec {
+            message: "expected ':' after IPv6 address".into(),
+        });
+    }
+
+    let parts: Vec<&str> = remainder[1..].split(':').collect();
+    if parts.len() != 3 {
+        return Err(crate::Error::InvalidForwardSpec {
+            message: format!("invalid format after IPv6 address: {}", remainder),
+        });
+    }
+
+    let bind_port = parse_port(parts[0])?;
+    let target_host = parts[1].to_string();
+    let target_port = parse_port(parts[2])?;
+
+    let bind_addr = SocketAddr::new(bind_ip, bind_port);
+    Ok((bind_addr, target_host, target_port))
+}
+
+/// Parse a bind specification in format `[bind_addr:]port`.
+fn parse_bind_spec(s: &str) -> crate::Result<std::net::SocketAddr> {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    if s.is_empty() {
+        return Err(crate::Error::InvalidForwardSpec {
+            message: "empty specification".into(),
+        });
+    }
+
+    // Check for IPv6 bind address (starts with '[')
+    if s.starts_with('[') {
+        return parse_bind_spec_ipv6(s);
+    }
+
+    let parts: Vec<&str> = s.split(':').collect();
+
+    match parts.len() {
+        // port only
+        1 => {
+            let port = parse_port(parts[0])?;
+            Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+        }
+        // bind_addr:port (IPv4)
+        2 => {
+            let bind_ip: IpAddr =
+                parts[0]
+                    .parse()
+                    .map_err(|_| crate::Error::InvalidForwardSpec {
+                        message: format!("invalid bind address: {}", parts[0]),
+                    })?;
+            let port = parse_port(parts[1])?;
+            Ok(SocketAddr::new(bind_ip, port))
+        }
+        _ => Err(crate::Error::InvalidForwardSpec {
+            message: format!("invalid format: expected [bind_addr:]port, got: {}", s),
+        }),
+    }
+}
+
+/// Parse a bind specification with IPv6 address.
+fn parse_bind_spec_ipv6(s: &str) -> crate::Result<std::net::SocketAddr> {
+    use std::net::{IpAddr, SocketAddr};
+
+    let close_bracket = s
+        .find(']')
+        .ok_or_else(|| crate::Error::InvalidForwardSpec {
+            message: "unclosed IPv6 bracket".into(),
+        })?;
+
+    let ipv6_str = &s[1..close_bracket];
+    let bind_ip: IpAddr = ipv6_str
+        .parse()
+        .map_err(|_| crate::Error::InvalidForwardSpec {
+            message: format!("invalid IPv6 address: {}", ipv6_str),
+        })?;
+
+    let remainder = &s[close_bracket + 1..];
+    if !remainder.starts_with(':') {
+        return Err(crate::Error::InvalidForwardSpec {
+            message: "expected ':' after IPv6 address".into(),
+        });
+    }
+
+    let port = parse_port(&remainder[1..])?;
+    Ok(SocketAddr::new(bind_ip, port))
+}
+
+/// Parse a port number string.
+fn parse_port(s: &str) -> crate::Result<u16> {
+    s.parse::<u16>()
+        .map_err(|_| crate::Error::InvalidForwardSpec {
+            message: format!("invalid port: {}", s),
+        })
 }
 
 /// Forward accept payload.
@@ -451,9 +696,14 @@ mod tests {
 
         let _fwd_req = Message::ForwardRequest(ForwardRequestPayload {
             forward_id: 0,
-            spec: ForwardSpec::Local { bind_port: 5432 },
-            target: "localhost".into(),
-            target_port: 5432,
+            spec: ForwardSpec::Local {
+                bind_addr: std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    5432,
+                ),
+                target_host: "localhost".into(),
+                target_port: 5432,
+            },
         });
 
         let _fwd_accept = Message::ForwardAccept(ForwardAcceptPayload { forward_id: 0 });
@@ -520,9 +770,20 @@ mod tests {
 
     #[test]
     fn test_forward_spec_variants() {
-        let _local = ForwardSpec::Local { bind_port: 5432 };
-        let _remote = ForwardSpec::Remote { bind_port: 8080 };
-        let _dynamic = ForwardSpec::Dynamic;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let _local = ForwardSpec::Local {
+            bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5432),
+            target_host: "localhost".into(),
+            target_port: 5432,
+        };
+        let _remote = ForwardSpec::Remote {
+            bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+            target_host: "localhost".into(),
+            target_port: 80,
+        };
+        let _dynamic = ForwardSpec::Dynamic {
+            bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1080),
+        };
     }
 
     #[test]
