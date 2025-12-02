@@ -179,10 +179,11 @@ async fn bootstrap_via_ssh_cli(
         message: format!("failed to spawn ssh: {}", e),
     })?;
 
-    // Take stdout to read the JSON response
+    // Take stdout and stderr to read the response and any error messages
     let stdout = child.stdout.take().ok_or_else(|| Error::Transport {
         message: "failed to capture ssh stdout".to_string(),
     })?;
+    let stderr = child.stderr.take();
 
     // Read until we get a complete JSON line
     // The server outputs a single JSON line to stdout
@@ -204,15 +205,30 @@ async fn bootstrap_via_ssh_cli(
             message: format!("failed to check ssh status: {}", e),
         })?;
 
+        // Try to read stderr for diagnostic info
+        let stderr_output = if let Some(mut stderr) = stderr {
+            let mut stderr_reader = BufReader::new(&mut stderr);
+            let mut stderr_content = String::new();
+            let _ = stderr_reader.read_line(&mut stderr_content).await;
+            stderr_content.trim().to_string()
+        } else {
+            String::new()
+        };
+
         if let Some(exit_status) = status {
             let code = exit_status
                 .code()
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "terminated by signal".to_string());
+            let stderr_msg = if stderr_output.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", stderr_output)
+            };
             return Err(Error::Transport {
                 message: format!(
-                    "ssh bootstrap failed with code {}: no output received",
-                    code
+                    "ssh bootstrap failed with code {}: no output received{}",
+                    code, stderr_msg
                 ),
             });
         }
