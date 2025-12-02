@@ -106,17 +106,23 @@ impl StreamPair for QuicStream {
 
             // Need more data
             let mut chunk = [0u8; 4096];
-            let n = recv
-                .read(&mut chunk)
-                .await
-                .map_err(|e| Error::Transport {
-                    message: format!("failed to read from stream: {}", e),
-                })?
-                .ok_or_else(|| Error::Transport {
-                    message: "stream closed unexpectedly".to_string(),
-                })?;
-
-            self.recv_buf.extend_from_slice(&chunk[..n]);
+            match recv.read(&mut chunk).await {
+                Ok(Some(n)) => {
+                    self.recv_buf.extend_from_slice(&chunk[..n]);
+                }
+                Ok(None) => {
+                    // Stream cleanly closed - check buffer one more time for partial message
+                    if let Some(msg) = Codec::decode(&mut self.recv_buf)? {
+                        return Ok(msg);
+                    }
+                    return Err(Error::ConnectionClosed);
+                }
+                Err(e) => {
+                    return Err(Error::Transport {
+                        message: format!("failed to read from stream: {}", e),
+                    });
+                }
+            }
         }
     }
 

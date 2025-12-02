@@ -261,6 +261,11 @@ impl Pty {
                 Ok(Ok(0)) => return Ok(None), // EOF
                 Ok(Ok(n)) => return Ok(Some(n)),
                 Ok(Err(e)) => {
+                    // EIO is common when the PTY slave is closed (shell exit)
+                    if e.raw_os_error() == Some(libc::EIO) {
+                        debug!("PTY read returned EIO (shell likely exited)");
+                        return Ok(None);
+                    }
                     return Err(Error::Pty {
                         message: format!("failed to read from pty: {}", e),
                     });
@@ -392,17 +397,19 @@ impl PtyRelay {
                         }
                     }
                     Ok(None) => {
-                        // EOF
-                        debug!("PTY EOF");
+                        // EOF - shell exited
+                        info!("PTY EOF - shell exited");
                         break;
                     }
                     Err(e) => {
-                        error!(error = %e, "PTY read error");
+                        // Log but don't treat as fatal - EIO handled in read()
+                        warn!(error = %e, "PTY read error");
                         break;
                     }
                 }
             }
             debug!("PTY output task ended");
+            // Drop output_tx - this signals EOF to the receiver
         });
 
         Self {

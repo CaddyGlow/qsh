@@ -8,6 +8,7 @@
 //! 5. Accepts a single client connection
 //! 6. Transitions to normal session mode
 
+use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
@@ -147,6 +148,9 @@ impl BootstrapServer {
         let response = self.response(external_addr);
         let json = response.to_json()?;
         println!("{}", json);
+        // When invoked via SSH the stdout is a pipe, so force a flush to ensure
+        // the client sees the JSON before we block waiting for QUIC.
+        io::stdout().flush()?;
         Ok(())
     }
 
