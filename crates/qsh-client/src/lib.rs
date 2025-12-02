@@ -14,6 +14,8 @@ pub mod connection;
 pub mod forward;
 pub mod overlay;
 pub mod prediction;
+pub mod ssh;
 
 pub use cli::Cli;
-pub use connection::{ClientConnection, ConnectionConfig, bootstrap_via_ssh};
+pub use connection::{ClientConnection, ConnectionConfig};
+pub use ssh::{bootstrap, SshConfig};

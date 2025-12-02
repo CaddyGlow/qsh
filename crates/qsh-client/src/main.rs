@@ -7,7 +7,7 @@ use std::net::ToSocketAddrs;
 use clap::Parser;
 use tracing::{error, info, warn};
 
-use qsh_client::{Cli, ClientConnection, ConnectionConfig, bootstrap_via_ssh};
+use qsh_client::{bootstrap, Cli, ClientConnection, ConnectionConfig, SshConfig};
 use qsh_core::protocol::TermSize;
 
 fn main() {
@@ -63,7 +63,14 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
     // Step 1: Bootstrap via SSH to get QUIC endpoint info
     info!("Bootstrapping via SSH...");
 
-    let server_info = match bootstrap_via_ssh(host, cli.port, user).await {
+    // Build SSH config from CLI options
+    let ssh_config = SshConfig {
+        connect_timeout: std::time::Duration::from_secs(30),
+        identity_file: cli.identity.first().cloned(),
+        skip_host_key_check: false,
+    };
+
+    let server_info = match bootstrap(host, cli.port, user, &ssh_config).await {
         Ok(info) => info,
         Err(e) => {
             // For now, fall back to direct QUIC connection attempt

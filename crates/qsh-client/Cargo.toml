@@ -23,6 +23,8 @@ tokio = { workspace = true }
 quinn = { workspace = true }
 rustls = { workspace = true }
 russh = { workspace = true }
+russh-keys = { workspace = true }
+async-trait = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

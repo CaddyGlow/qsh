@@ -1602,6 +1602,7 @@ name = "qsh-client"
 version = "0.1.0"
 dependencies = [
  "assert_matches",
+ "async-trait",
  "base64",
  "bytes",
  "clap",
@@ -1610,6 +1611,7 @@ dependencies = [
  "qsh-test-utils",
  "quinn",
  "russh",
+ "russh-keys",
  "rustls",
  "serde",
  "serde_json",

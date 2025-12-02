@@ -14,7 +14,6 @@ use std::time::Duration;
 use quinn::{ClientConfig, Endpoint};
 use tracing::{debug, info};
 
-use qsh_core::bootstrap::ServerInfo;
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
     Capabilities, HelloPayload, Message, ShutdownPayload, ShutdownReason, TermSize,
@@ -248,22 +247,6 @@ impl ClientConnection {
     }
 }
 
-/// Bootstrap via SSH to discover QUIC endpoint.
-pub async fn bootstrap_via_ssh(host: &str, port: u16, user: Option<&str>) -> Result<ServerInfo> {
-    // For now, return an error indicating this requires russh implementation
-    // Full implementation would:
-    // 1. Connect via SSH
-    // 2. Run `qsh-server --bootstrap`
-    // 3. Parse JSON response
-    Err(Error::Transport {
-        message: format!(
-            "SSH bootstrap not yet implemented for {}@{}:{}",
-            user.unwrap_or("(default)"),
-            host,
-            port
-        ),
-    })
-}
 
 #[cfg(test)]
 mod tests {
