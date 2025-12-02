@@ -296,8 +296,8 @@ async fn handle_session(mut session: ServerSession, _cli: &Cli) -> qsh_core::Res
             output = relay.recv_output() => {
                 match output {
                     Some(data) if !data.is_empty() => {
-                        if let Err(e) = session.send_state_update(data, last_input_seq).await {
-                            error!(error = %e, "Failed to send state update");
+                        if let Err(e) = session.send_output(data, last_input_seq).await {
+                            error!(error = %e, "Failed to send output");
                             break;
                         }
                     }

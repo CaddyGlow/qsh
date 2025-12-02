@@ -5,10 +5,13 @@
 use std::net::ToSocketAddrs;
 
 use clap::Parser;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
-use qsh_client::{bootstrap, Cli, ClientConnection, ConnectionConfig, SshConfig};
-use qsh_core::protocol::TermSize;
+use qsh_client::{
+    bootstrap, get_terminal_size, restore_terminal, Cli, ClientConnection, ConnectionConfig,
+    RawModeGuard, SshConfig, StdinReader, StdoutWriter,
+};
+use qsh_core::protocol::{Message, TermSize};
 
 fn main() {
     // Parse CLI arguments
@@ -96,7 +99,7 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
                 server_addr: addr,
                 session_key,
                 cert_hash: None,
-                term_size: get_terminal_size(),
+                term_size: get_term_size(),
                 term_type: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
                 predictive_echo: !cli.no_prediction,
                 connect_timeout: std::time::Duration::from_secs(10),
@@ -130,7 +133,7 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
         server_addr: addr,
         session_key,
         cert_hash,
-        term_size: get_terminal_size(),
+        term_size: get_term_size(),
         term_type: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
         predictive_echo: !cli.no_prediction,
         connect_timeout: std::time::Duration::from_secs(10),
@@ -142,8 +145,7 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
     run_session(conn, cli).await
 }
 
-async fn run_session(conn: ClientConnection, _cli: &Cli) -> qsh_core::Result<()> {
-    // For now, just print connection info and close
+async fn run_session(mut conn: ClientConnection, _cli: &Cli) -> qsh_core::Result<()> {
     info!(
         predictive_echo = conn.server_capabilities().predictive_echo,
         compression = conn.server_capabilities().compression,
@@ -151,15 +153,107 @@ async fn run_session(conn: ClientConnection, _cli: &Cli) -> qsh_core::Result<()>
         "Server capabilities"
     );
 
-    // In a full implementation, we would:
-    // 1. Set up raw terminal mode
-    // 2. Open terminal input/output streams
-    // 3. Start forwarding loops for stdin -> server and server -> stdout
-    // 4. Handle signals (SIGWINCH for resize, SIGINT, etc.)
-    // 5. Set up port forwards if requested
-    // 6. Monitor for reconnection needs
+    // Enter raw terminal mode
+    let _raw_guard = match RawModeGuard::enter() {
+        Ok(guard) => guard,
+        Err(e) => {
+            warn!(error = %e, "Failed to enter raw mode, continuing with cooked mode");
+            // Continue without raw mode - useful for debugging
+            return run_session_cooked(conn).await;
+        }
+    };
 
-    eprintln!("Session established. Full terminal I/O not yet implemented.");
+    debug!("Entered raw terminal mode");
+
+    // Create stdin/stdout handlers
+    let mut stdin = StdinReader::new();
+    let mut stdout = StdoutWriter::new();
+
+    // Main session loop
+    loop {
+        tokio::select! {
+            // Handle stdin -> server
+            input = stdin.read() => {
+                match input {
+                    Some(data) if !data.is_empty() => {
+                        debug!(len = data.len(), "Sending input to server");
+                        if let Err(e) = conn.send_input(&data).await {
+                            error!(error = %e, "Failed to send input");
+                            break;
+                        }
+                    }
+                    Some(_) => {
+                        // Empty data, continue
+                    }
+                    None => {
+                        // stdin closed (EOF)
+                        info!("stdin closed");
+                        break;
+                    }
+                }
+            }
+
+            // Handle server -> stdout
+            msg = conn.recv() => {
+                match msg {
+                    Ok(Message::StateUpdate(update)) => {
+                        // For now, we just look for raw output in the update
+                        // The server sends terminal state, but we need raw output
+                        // This is a simplification - real implementation would
+                        // use the diff to update local terminal state
+                        debug!(
+                            confirmed_seq = update.confirmed_input_seq,
+                            "Received state update"
+                        );
+                    }
+                    Ok(Message::TerminalOutput(output)) => {
+                        // Direct terminal output
+                        if let Err(e) = stdout.write(&output.data).await {
+                            error!(error = %e, "Failed to write output");
+                            break;
+                        }
+                    }
+                    Ok(Message::Pong(_)) => {
+                        // Pong response, ignore
+                    }
+                    Ok(Message::Shutdown(shutdown)) => {
+                        info!(reason = ?shutdown.reason, "Server initiated shutdown");
+                        break;
+                    }
+                    Ok(other) => {
+                        debug!(msg = ?other, "Unexpected message from server");
+                    }
+                    Err(qsh_core::Error::ConnectionClosed) => {
+                        info!("Connection closed by server");
+                        break;
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Error receiving from server");
+                        break;
+                    }
+                }
+            }
+
+            // Handle Ctrl+C (SIGINT)
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received interrupt, shutting down...");
+                break;
+            }
+        }
+    }
+
+    // Restore terminal before closing
+    restore_terminal();
+
+    info!("Shutting down connection...");
+    conn.close().await?;
+
+    Ok(())
+}
+
+/// Fallback session for when raw mode isn't available.
+async fn run_session_cooked(conn: ClientConnection) -> qsh_core::Result<()> {
+    eprintln!("Running in cooked mode (raw terminal unavailable).");
     eprintln!("Press Ctrl+C to exit.");
 
     // Wait for interrupt
@@ -171,8 +265,9 @@ async fn run_session(conn: ClientConnection, _cli: &Cli) -> qsh_core::Result<()>
     Ok(())
 }
 
-fn get_terminal_size() -> TermSize {
-    // Try to get actual terminal size
-    // For now, use defaults
-    TermSize { cols: 80, rows: 24 }
+fn get_term_size() -> TermSize {
+    match get_terminal_size() {
+        Ok(size) => size,
+        Err(_) => TermSize { cols: 80, rows: 24 },
+    }
 }

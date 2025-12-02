@@ -62,6 +62,7 @@ tun = { version = "0.7", features = ["async"] }
 # Utilities
 uuid = { version = "1.10", features = ["v4"] }
 shell-escape = "0.1"
+libc = "0.2"
 
 # Internal crates
 qsh-core = { path = "crates/qsh-core" }

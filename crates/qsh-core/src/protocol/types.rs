@@ -34,6 +34,8 @@ pub enum Message {
     // Terminal streams
     /// User input sent to server (client-uni stream 2).
     TerminalInput(TerminalInputPayload),
+    /// Raw terminal output from server (bypass state tracking).
+    TerminalOutput(TerminalOutputPayload),
     /// Terminal state update from server (server-uni stream 3).
     StateUpdate(StateUpdatePayload),
     /// Client acknowledgment of state update (on control stream).
@@ -175,6 +177,15 @@ pub struct TerminalInputPayload {
     pub data: Vec<u8>,
     /// Hint: these bytes may be predicted locally.
     pub predictable: bool,
+}
+
+/// Raw terminal output payload (bypasses state tracking).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TerminalOutputPayload {
+    /// Raw output bytes from PTY.
+    pub data: Vec<u8>,
+    /// Highest input sequence processed before this output.
+    pub confirmed_input_seq: u64,
 }
 
 /// State update payload.

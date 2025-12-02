@@ -16,7 +16,7 @@ use tracing::{debug, info};
 
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
-    Capabilities, HelloPayload, Message, ShutdownPayload, ShutdownReason, TermSize,
+    Capabilities, HelloPayload, Message, ResizePayload, ShutdownPayload, ShutdownReason, TermSize,
     TerminalInputPayload,
 };
 use qsh_core::session::{InputTracker, SessionState};
@@ -231,6 +231,18 @@ impl ClientConnection {
             .as_micros() as u64;
 
         Ok(Duration::from_micros(now - pong_time))
+    }
+
+    /// Receive a message from the server.
+    pub async fn recv(&mut self) -> Result<Message> {
+        self.control.recv().await
+    }
+
+    /// Send a resize notification to the server.
+    pub async fn send_resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        self.control
+            .send(&Message::Resize(ResizePayload { cols, rows }))
+            .await
     }
 
     /// Close the connection gracefully.

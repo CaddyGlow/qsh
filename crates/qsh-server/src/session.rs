@@ -15,7 +15,7 @@ use tracing::{debug, info};
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
     Capabilities, HelloAckPayload, Message, StateDiff, StateUpdatePayload,
-    TerminalState as ProtoTermState,
+    TerminalOutputPayload, TerminalState as ProtoTermState,
 };
 use qsh_core::session::SessionState;
 use qsh_core::terminal::TerminalParser;
@@ -199,7 +199,25 @@ impl ServerSession {
         self.quic.rtt()
     }
 
+    /// Send raw terminal output to the client.
+    ///
+    /// This sends the raw PTY output directly without state tracking.
+    /// For simple terminal use, this is sufficient.
+    pub async fn send_output(&mut self, data: Vec<u8>, input_seq: u64) -> Result<()> {
+        self.confirmed_input_seq = input_seq;
+
+        let output = TerminalOutputPayload {
+            data,
+            confirmed_input_seq: self.confirmed_input_seq,
+        };
+
+        self.control.send(&Message::TerminalOutput(output)).await
+    }
+
     /// Send a state update to the client.
+    ///
+    /// This parses the output through the terminal emulator and sends
+    /// a state diff. Use `send_output` for simpler raw output mode.
     pub async fn send_state_update(&mut self, data: Vec<u8>, input_seq: u64) -> Result<()> {
         // Parse output through terminal emulator
         let state = {

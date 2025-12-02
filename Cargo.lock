@@ -1606,6 +1606,7 @@ dependencies = [
  "base64",
  "bytes",
  "clap",
+ "libc",
  "proptest",
  "qsh-core",
  "qsh-test-utils",
