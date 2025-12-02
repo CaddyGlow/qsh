@@ -90,7 +90,7 @@ Use Rust 2024 edition. Set up workspace dependencies for:
 - quinn = "0.11"
 - rustls = "0.23"
 - russh = "0.45"
-- portable-pty = "0.8"
+- nix = "0.29" // custom PTY implementation on Unix; platform adapters elsewhere
 - vte = "0.13"
 - tracing = "0.1"
 - tracing-subscriber = "0.3"
@@ -756,7 +756,7 @@ Handle russh Client trait with minimal implementation.
 
 ### Track E: PTY Management (Server)
 
-#### Task 1.16 [E] [TEST] PTY Trait — Tests First
+#### Task 1.16 [E] [TEST] PTY Trait — Tests First (Custom PTY)
 
 **DEP**: 1.12
 **Output**: `qsh-server/src/pty/tests.rs`
@@ -764,6 +764,8 @@ Handle russh Client trait with minimal implementation.
 **Prompt**:
 ```
 Write tests for PTY abstraction. Do NOT implement yet.
+
+Custom PTY abstraction (implemented in-house for cross-platform support — nix/AsyncFd on Unix, platform adapters elsewhere):
 
 ```rust
 pub trait PtyHandle: Send {
@@ -774,7 +776,7 @@ pub trait PtyHandle: Send {
 }
 
 pub struct PtyProcess {
-    // Wraps portable-pty
+    // Uses OS-specific implementation (nix/termios on Unix; stub/adapter for other platforms)
 }
 
 impl PtyProcess {
@@ -794,7 +796,7 @@ Test cases (with real PTY, mark #[ignore] for CI):
 
 ---
 
-#### Task 1.17 [E] [IMPL] PTY Wrapper
+#### Task 1.17 [E] [IMPL] PTY Wrapper (Custom, no portable-pty)
 
 **DEP**: 1.16
 **Output**: `qsh-server/src/pty/mod.rs`
@@ -802,11 +804,9 @@ Test cases (with real PTY, mark #[ignore] for CI):
 
 **Prompt**:
 ```
-Implement PTY wrapper using portable-pty to pass tests:
+Implement PTY wrapper using our custom cross-platform layer (nix/AsyncFd on Unix; platform adapters elsewhere) to pass tests:
 [paste tests from 1.16]
-
-Use portable_pty crate.
-Handle both Unix and Windows (PtySize, CommandBuilder).
+Handle both Unix and Windows (PtySize, CommandBuilder equivalent) within our own implementation; avoid portable-pty dependency.
 ```
 
 ---

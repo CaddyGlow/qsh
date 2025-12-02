@@ -182,7 +182,8 @@ tokio = { version = "1.40", features = ["full"] }
 quinn = "0.11"
 rustls = "0.23"
 russh = "0.45"
-portable-pty = "0.8"
+# Custom PTY implementation (nix/termios on Unix; platform adapters elsewhere)
+nix = { version = "0.29", features = ["term", "process", "fs", "signal"] }
 vte = "0.13"
 tracing = "0.1"
 tracing-subscriber = "0.3"
@@ -259,12 +260,13 @@ pub trait Connection: Send + Sync {
 }
 ```
 
-### 3.2 PTY Abstraction
+### 3.2 PTY Abstraction (Custom, no portable-pty)
 
 ```rust
 // qsh-core/src/pty.rs
 
 /// PTY operations for server-side testing
+/// (implemented in-house: nix/termios + AsyncFd on Unix; platform adapters elsewhere)
 pub trait PtyHandle: Send {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>;
     fn write(&mut self, buf: &[u8]) -> io::Result<usize>;

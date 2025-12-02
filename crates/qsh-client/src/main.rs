@@ -7,7 +7,8 @@ use std::net::ToSocketAddrs;
 use clap::Parser;
 use tracing::{debug, error, info, warn};
 
-use qsh_client::cli::SshBootstrapMode;
+use qsh_client::cli::{OverlayPosition as CliOverlayPosition, SshBootstrapMode};
+use qsh_client::overlay::{ConnectionStatus, OverlayPosition, StatusOverlay};
 use qsh_client::{
     BootstrapMode, Cli, ClientConnection, ConnectionConfig, LocalForwarder, RawModeGuard,
     Socks5Proxy, SshConfig, StdinReader, StdoutWriter, bootstrap, get_terminal_size,
@@ -121,7 +122,8 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
             info!(rtt = ?conn.rtt(), "Connected to server");
 
             // Run the session
-            run_session(conn, cli).await?;
+            let user_host = format_user_host(user, host);
+            run_session(conn, cli, Some(user_host)).await?;
             return Ok(());
         }
     };
@@ -169,16 +171,31 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
     // This will terminate the SSH process / russh session
     drop(bootstrap_handle);
 
-    run_session(conn, cli).await
+    let user_host = format_user_host(user, host);
+    run_session(conn, cli, Some(user_host)).await
 }
 
-async fn run_session(mut conn: ClientConnection, cli: &Cli) -> qsh_core::Result<()> {
+async fn run_session(
+    mut conn: ClientConnection,
+    cli: &Cli,
+    user_host: Option<String>,
+) -> qsh_core::Result<()> {
     info!(
         predictive_echo = conn.server_capabilities().predictive_echo,
         compression = conn.server_capabilities().compression,
         max_forwards = conn.server_capabilities().max_forwards,
         "Server capabilities"
     );
+
+    // Create status overlay
+    let mut overlay = create_status_overlay(cli, user_host);
+    overlay.set_status(ConnectionStatus::Connected);
+
+    // Initialize RTT from connection
+    overlay.metrics_mut().update_rtt(conn.rtt());
+
+    // Parse toggle key (default ctrl+o = 0x0f)
+    let toggle_key = parse_toggle_key(&cli.overlay_key);
 
     // Start port forwarders
     let quic_conn = conn.quic_connection();
@@ -273,6 +290,20 @@ async fn run_session(mut conn: ClientConnection, cli: &Cli) -> qsh_core::Result<
             input = stdin.read() => {
                 match input {
                     Some(data) if !data.is_empty() => {
+                        // Check for overlay toggle key
+                        if let Some(key) = toggle_key {
+                            if data.len() == 1 && data[0] == key {
+                                overlay.toggle();
+                                // Re-render overlay after toggle
+                                let term_size = get_term_size();
+                                let overlay_output = overlay.render(term_size.cols);
+                                if !overlay_output.is_empty() {
+                                    let _ = stdout.write(overlay_output.as_bytes()).await;
+                                }
+                                continue;
+                            }
+                        }
+
                         debug!(len = data.len(), "Sending input to server");
                         // Queue the send without waiting - don't block on network I/O
                         match conn.queue_input(&data) {
@@ -307,6 +338,8 @@ async fn run_session(mut conn: ClientConnection, cli: &Cli) -> qsh_core::Result<
                                 seq = update.confirmed_input_seq,
                                 "Input latency"
                             );
+                            // Update overlay RTT
+                            overlay.metrics_mut().update_rtt(latency);
                         }
                     }
                     Ok(Message::TerminalOutput(output)) => {
@@ -317,11 +350,23 @@ async fn run_session(mut conn: ClientConnection, cli: &Cli) -> qsh_core::Result<
                                 seq = output.confirmed_input_seq,
                                 "Input latency"
                             );
+                            // Update overlay RTT
+                            overlay.metrics_mut().update_rtt(latency);
                         }
-                        // Direct terminal output
+
+                        // Write terminal output
                         if let Err(e) = stdout.write(&output.data).await {
                             error!(error = %e, "Failed to write output");
                             break;
+                        }
+
+                        // Render overlay after terminal output (if visible)
+                        if overlay.is_visible() {
+                            let term_size = get_term_size();
+                            let overlay_output = overlay.render(term_size.cols);
+                            if !overlay_output.is_empty() {
+                                let _ = stdout.write(overlay_output.as_bytes()).await;
+                            }
                         }
                     }
                     Ok(Message::Pong(_)) => {
@@ -414,4 +459,59 @@ fn get_term_size() -> TermSize {
         Ok(size) => size,
         Err(_) => TermSize { cols: 80, rows: 24 },
     }
+}
+
+/// Format user@host string for overlay display.
+fn format_user_host(user: Option<&str>, host: &str) -> String {
+    match user {
+        Some(u) => format!("{}@{}", u, host),
+        None => host.to_string(),
+    }
+}
+
+/// Convert CLI overlay position to overlay module position.
+fn map_overlay_position(cli_pos: CliOverlayPosition) -> Option<OverlayPosition> {
+    match cli_pos {
+        CliOverlayPosition::Top => Some(OverlayPosition::Top),
+        CliOverlayPosition::Bottom => Some(OverlayPosition::Bottom),
+        CliOverlayPosition::TopRight => Some(OverlayPosition::TopRight),
+        CliOverlayPosition::None => None,
+    }
+}
+
+/// Parse toggle key specification (e.g., "ctrl+o", "ctrl+t").
+fn parse_toggle_key(spec: &str) -> Option<u8> {
+    let spec = spec.to_lowercase();
+    if spec.starts_with("ctrl+") {
+        let ch = spec.chars().last()?;
+        if ch.is_ascii_lowercase() {
+            // ctrl+a = 0x01, ctrl+b = 0x02, ..., ctrl+z = 0x1a
+            Some((ch as u8) - b'a' + 1)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+/// Create and configure status overlay from CLI options.
+fn create_status_overlay(cli: &Cli, user_host: Option<String>) -> StatusOverlay {
+    let mut overlay = StatusOverlay::new();
+
+    // Set position
+    if let Some(pos) = map_overlay_position(cli.overlay_position) {
+        overlay.set_position(pos);
+    }
+
+    // Set initial visibility (--status enables, --no-overlay disables)
+    let visible = cli.show_status && !cli.no_overlay && cli.overlay_position != CliOverlayPosition::None;
+    overlay.set_visible(visible);
+
+    // Set user@host if available
+    if let Some(uh) = user_host {
+        overlay.set_user_host(uh);
+    }
+
+    overlay
 }

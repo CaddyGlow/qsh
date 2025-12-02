@@ -1041,7 +1041,7 @@ qsh -f --tun --route 0.0.0.0/0 -L 5432:db:5432 user@server
 | QUIC | Quinn | Mature Rust QUIC implementation |
 | TLS | Rustls | Pure Rust, memory-safe TLS |
 | SSH | Russh | Async SSH client library |
-| PTY | portable-pty | Cross-platform PTY abstraction |
+| PTY | Custom PTY (nix/termios + AsyncFd on Unix; platform adapters elsewhere) | Cross-platform PTY abstraction without external portable-pty |
 | Terminal Parser | vte | VT100/xterm escape parsing |
 | Serialization | bincode | Fast, compact binary format |
 | Logging | tracing | Structured, async-aware logging |

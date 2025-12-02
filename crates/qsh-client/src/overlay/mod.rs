@@ -9,4 +9,4 @@ mod prediction_display;
 mod status_widget;
 
 pub use prediction_display::PredictionOverlay;
-pub use status_widget::{ConnectionMetrics, OverlayPosition, StatusOverlay};
+pub use status_widget::{ConnectionMetrics, ConnectionStatus, OverlayPosition, StatusOverlay};

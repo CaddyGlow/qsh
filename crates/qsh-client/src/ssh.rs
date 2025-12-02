@@ -141,7 +141,7 @@ async fn bootstrap_via_ssh_cli(
 
     let mut cmd = Command::new("ssh");
     cmd.arg("-p").arg(port.to_string());
-    cmd.arg("-o").arg("BatchMode=yes");
+    //cmd.arg("-o").arg("BatchMode=yes");
 
     let timeout_secs = config.connect_timeout.as_secs().max(1);
     cmd.arg("-o")
