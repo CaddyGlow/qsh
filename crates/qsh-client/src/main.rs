@@ -127,7 +127,17 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
     let server_info = &bootstrap_handle.as_ref().unwrap().server_info;
 
     // Use bootstrap info to connect
-    let addr = format!("{}:{}", server_info.address, server_info.port)
+    // If the server reports 0.0.0.0 or an unspecified address, use the original host
+    let connect_host = if server_info.address == "0.0.0.0"
+        || server_info.address == "::"
+        || server_info.address.starts_with("0.")
+    {
+        host.to_string()
+    } else {
+        server_info.address.clone()
+    };
+
+    let addr = format!("{}:{}", connect_host, server_info.port)
         .to_socket_addrs()
         .map_err(|e| qsh_core::Error::Transport {
             message: format!("failed to resolve server address: {}", e),
