@@ -144,20 +144,26 @@ pub fn get_terminal_size() -> Result<TermSize> {
 /// Async stdin reader.
 ///
 /// Spawns a blocking thread to read from stdin and sends
-/// data through a channel.
+/// data through an unbounded channel to never block on stdin reads.
 pub struct StdinReader {
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: mpsc::UnboundedReceiver<Vec<u8>>,
     _cancel_tx: mpsc::Sender<()>,
 }
 
 impl StdinReader {
     /// Create a new stdin reader.
     pub fn new() -> Self {
-        let (tx, rx) = mpsc::channel(64);
+        // Use unbounded channel to never block stdin reads
+        let (tx, rx) = mpsc::unbounded_channel();
         let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(1);
 
         std::thread::spawn(move || {
-            let mut stdin = io::stdin();
+            use std::os::unix::io::AsRawFd;
+            let stdin = io::stdin();
+            let fd = stdin.as_raw_fd();
+
+            // Lock stdin for the duration to avoid any buffering issues
+            let mut stdin_lock = stdin.lock();
             let mut buf = [0u8; 4096];
 
             loop {
@@ -166,29 +172,37 @@ impl StdinReader {
                     break;
                 }
 
-                // Read with a short timeout by setting non-blocking temporarily
-                // For now, just do blocking reads - the channel will buffer
-                match stdin.read(&mut buf) {
+                // Read directly - in raw mode this returns immediately when data is available
+                match stdin_lock.read(&mut buf) {
                     Ok(0) => {
                         // EOF
+                        tracing::debug!("stdin EOF");
                         break;
                     }
                     Ok(n) => {
-                        if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        tracing::debug!(
+                            len = n,
+                            data = ?&buf[..n.min(16)],
+                            fd = fd,
+                            "stdin read"
+                        );
+                        if tx.send(buf[..n].to_vec()).is_err() {
                             // Receiver dropped
+                            tracing::debug!("stdin receiver dropped");
                             break;
                         }
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                        // Interrupted, retry
+                        // Interrupted by signal, retry
                         continue;
                     }
-                    Err(_) => {
-                        // Other error, stop
+                    Err(e) => {
+                        tracing::error!(error = %e, "stdin read error");
                         break;
                     }
                 }
             }
+            tracing::debug!("stdin reader thread exiting");
         });
 
         Self {

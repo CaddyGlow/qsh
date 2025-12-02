@@ -41,14 +41,56 @@ impl QuicStream {
     pub fn from_bi(streams: (SendStream, RecvStream)) -> Self {
         Self::new(streams.0, streams.1)
     }
+
+    /// Get a cloneable sender handle for spawning background send tasks.
+    ///
+    /// This allows non-blocking sends by spawning tasks that don't block
+    /// the main event loop.
+    pub fn sender(&self) -> QuicSender {
+        QuicSender {
+            send: Arc::clone(&self.send),
+        }
+    }
 }
 
-impl StreamPair for QuicStream {
-    async fn send(&mut self, msg: &Message) -> Result<()> {
+/// A cloneable sender handle for a QUIC stream.
+///
+/// Can be used to send messages from spawned tasks without blocking
+/// the main event loop.
+#[derive(Clone)]
+pub struct QuicSender {
+    send: Arc<Mutex<SendStream>>,
+}
+
+impl QuicSender {
+    /// Send a message (includes flush for low latency).
+    pub async fn send(&self, msg: &Message) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
         let data = Codec::encode(msg)?;
         let mut send = self.send.lock().await;
         send.write_all(&data).await.map_err(|e| Error::Transport {
             message: format!("failed to send message: {}", e),
+        })?;
+        send.flush().await.map_err(|e| Error::Transport {
+            message: format!("failed to flush stream: {}", e),
+        })?;
+        Ok(())
+    }
+}
+
+impl StreamPair for QuicStream {
+    async fn send(&mut self, msg: &Message) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        let data = Codec::encode(msg)?;
+        let mut send = self.send.lock().await;
+        send.write_all(&data).await.map_err(|e| Error::Transport {
+            message: format!("failed to send message: {}", e),
+        })?;
+        // Flush to ensure data is sent immediately for low latency
+        send.flush().await.map_err(|e| Error::Transport {
+            message: format!("failed to flush stream: {}", e),
         })?;
         Ok(())
     }

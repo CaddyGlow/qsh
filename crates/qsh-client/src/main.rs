@@ -263,14 +263,24 @@ async fn run_session(mut conn: ClientConnection, cli: &Cli) -> qsh_core::Result<
         let resize_event = std::future::pending::<Option<()>>();
 
         tokio::select! {
-            // Handle stdin -> server
+            // Use biased selection to prioritize input handling for low latency
+            biased;
+
+            // Handle stdin -> server (highest priority for responsiveness)
+            // Use spawn to avoid blocking the select loop on QUIC send
             input = stdin.read() => {
                 match input {
                     Some(data) if !data.is_empty() => {
                         debug!(len = data.len(), "Sending input to server");
-                        if let Err(e) = conn.send_input(&data).await {
-                            error!(error = %e, "Failed to send input");
-                            break;
+                        // Queue the send without waiting - don't block on network I/O
+                        match conn.queue_input(&data) {
+                            Ok(_seq) => {
+                                // Input queued successfully
+                            }
+                            Err(e) => {
+                                error!(error = %e, "Failed to queue input");
+                                break;
+                            }
                         }
                     }
                     Some(_) => {
@@ -288,16 +298,24 @@ async fn run_session(mut conn: ClientConnection, cli: &Cli) -> qsh_core::Result<
             msg = conn.recv() => {
                 match msg {
                     Ok(Message::StateUpdate(update)) => {
-                        // For now, we just look for raw output in the update
-                        // The server sends terminal state, but we need raw output
-                        // This is a simplification - real implementation would
-                        // use the diff to update local terminal state
-                        debug!(
-                            confirmed_seq = update.confirmed_input_seq,
-                            "Received state update"
-                        );
+                        // Record latency from confirmed sequence
+                        if let Some(latency) = conn.record_confirmation(update.confirmed_input_seq) {
+                            debug!(
+                                latency_ms = latency.as_secs_f64() * 1000.0,
+                                seq = update.confirmed_input_seq,
+                                "Input latency"
+                            );
+                        }
                     }
                     Ok(Message::TerminalOutput(output)) => {
+                        // Record latency from confirmed sequence
+                        if let Some(latency) = conn.record_confirmation(output.confirmed_input_seq) {
+                            debug!(
+                                latency_ms = latency.as_secs_f64() * 1000.0,
+                                seq = output.confirmed_input_seq,
+                                "Input latency"
+                            );
+                        }
                         // Direct terminal output
                         if let Err(e) = stdout.write(&output.data).await {
                             error!(error = %e, "Failed to write output");
@@ -308,7 +326,11 @@ async fn run_session(mut conn: ClientConnection, cli: &Cli) -> qsh_core::Result<
                         // Pong response, ignore
                     }
                     Ok(Message::Shutdown(shutdown)) => {
-                        info!(reason = ?shutdown.reason, "Server initiated shutdown");
+                        info!(reason = ?shutdown.reason, msg = ?shutdown.message, "Server initiated shutdown");
+                        if let Some(msg) = &shutdown.message {
+                            // Print shutdown message (e.g., "shell exited with code 0")
+                            eprintln!("\r\n{}", msg);
+                        }
                         break;
                     }
                     Ok(other) => {
@@ -344,6 +366,12 @@ async fn run_session(mut conn: ClientConnection, cli: &Cli) -> qsh_core::Result<
 
     // Restore terminal before closing
     restore_terminal();
+
+    // Print latency statistics
+    let stats = conn.latency_stats();
+    if stats.sample_count > 0 {
+        eprintln!("\nLatency statistics: {}", stats);
+    }
 
     // Abort any running forwarders
     for handle in forward_handles {

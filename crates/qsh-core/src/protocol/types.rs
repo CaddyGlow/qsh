@@ -162,6 +162,8 @@ pub enum ShutdownReason {
     ProtocolError,
     /// Session key mismatch.
     AuthFailure,
+    /// Shell process exited (exit command or ctrl-d).
+    ShellExited,
 }
 
 // =============================================================================

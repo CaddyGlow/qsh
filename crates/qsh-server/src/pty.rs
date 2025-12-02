@@ -6,8 +6,10 @@
 //! - Terminal resize events
 //!
 //! Uses the `nix` crate for cross-platform Unix PTY support (Linux, macOS, Android).
+//! Uses `AsyncFd` for proper async I/O integration with tokio's reactor.
 
 use std::ffi::CString;
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
@@ -15,18 +17,19 @@ use std::sync::Arc;
 use nix::pty::{openpty, Winsize};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::{close, dup2, execvp, fork, setsid, ForkResult, Pid};
-use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
-use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use qsh_core::error::{Error, Result};
 
 /// PTY handle for async I/O.
+///
+/// Uses `AsyncFd` for proper integration with tokio's reactor, avoiding
+/// polling loops that cause latency.
 pub struct Pty {
-    /// Master PTY file descriptor for async I/O.
-    master: Arc<Mutex<File>>,
+    /// Master PTY file descriptor wrapped for async I/O.
+    master: Arc<AsyncFd<std::fs::File>>,
     /// Child process PID.
     child_pid: Pid,
     /// Terminal size.
@@ -107,7 +110,7 @@ impl Pty {
                 // Parent process - close slave fd
                 drop(pty_result.slave);
 
-                // Convert master to async File
+                // Convert master to std::fs::File
                 // SAFETY: We own the fd from openpty and it's valid
                 let master_owned: OwnedFd = pty_result.master;
                 let std_file = unsafe { std::fs::File::from_raw_fd(master_owned.as_raw_fd()) };
@@ -117,10 +120,13 @@ impl Pty {
                 // Set non-blocking mode for async I/O
                 set_nonblocking(master_fd)?;
 
-                let async_file = File::from_std(std_file);
+                // Wrap in AsyncFd for proper reactor integration
+                let async_fd = AsyncFd::new(std_file).map_err(|e| Error::Pty {
+                    message: format!("failed to create AsyncFd: {}", e),
+                })?;
 
                 Ok(Self {
-                    master: Arc::new(Mutex::new(async_file)),
+                    master: Arc::new(async_fd),
                     child_pid: child,
                     cols,
                     rows,
@@ -211,29 +217,59 @@ impl Pty {
     }
 
     /// Write data to the PTY (terminal input from client).
+    ///
+    /// Uses AsyncFd for proper async I/O - waits for write readiness
+    /// before attempting to write.
     pub async fn write(&self, data: &[u8]) -> Result<()> {
-        let mut master = self.master.lock().await;
-        master.write_all(data).await.map_err(|e| Error::Pty {
-            message: format!("failed to write to pty: {}", e),
-        })?;
-        master.flush().await.map_err(|e| Error::Pty {
-            message: format!("failed to flush pty: {}", e),
-        })?;
+        let mut remaining = data;
+        while !remaining.is_empty() {
+            let mut guard = self.master.writable().await.map_err(|e| Error::Pty {
+                message: format!("failed to wait for pty write readiness: {}", e),
+            })?;
+
+            match guard.try_io(|inner| inner.get_ref().write(remaining)) {
+                Ok(Ok(n)) => {
+                    remaining = &remaining[n..];
+                }
+                Ok(Err(e)) => {
+                    return Err(Error::Pty {
+                        message: format!("failed to write to pty: {}", e),
+                    });
+                }
+                Err(_would_block) => {
+                    // Readiness was a false positive, loop and wait again
+                    continue;
+                }
+            }
+        }
         Ok(())
     }
 
     /// Read data from the PTY (terminal output to client).
     ///
-    /// Returns None if the PTY is closed.
+    /// Uses AsyncFd for proper async I/O - waits for read readiness
+    /// before attempting to read. This avoids polling loops.
+    ///
+    /// Returns None if the PTY is closed (EOF).
     pub async fn read(&self, buf: &mut [u8]) -> Result<Option<usize>> {
-        let mut master = self.master.lock().await;
-        match master.read(buf).await {
-            Ok(0) => Ok(None), // EOF
-            Ok(n) => Ok(Some(n)),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(Some(0)),
-            Err(e) => Err(Error::Pty {
-                message: format!("failed to read from pty: {}", e),
-            }),
+        loop {
+            let mut guard = self.master.readable().await.map_err(|e| Error::Pty {
+                message: format!("failed to wait for pty read readiness: {}", e),
+            })?;
+
+            match guard.try_io(|inner| inner.get_ref().read(buf)) {
+                Ok(Ok(0)) => return Ok(None), // EOF
+                Ok(Ok(n)) => return Ok(Some(n)),
+                Ok(Err(e)) => {
+                    return Err(Error::Pty {
+                        message: format!("failed to read from pty: {}", e),
+                    });
+                }
+                Err(_would_block) => {
+                    // Readiness was a false positive, loop and wait again
+                    continue;
+                }
+            }
         }
     }
 
@@ -310,6 +346,7 @@ fn set_nonblocking(fd: RawFd) -> Result<()> {
 /// I/O relay between PTY and channels.
 ///
 /// This spawns tasks for bidirectional communication.
+/// Uses AsyncFd for proper async I/O, avoiding polling loops.
 pub struct PtyRelay {
     /// Channel for sending data to the PTY (input from client).
     input_tx: mpsc::Sender<Vec<u8>>,
@@ -320,7 +357,8 @@ pub struct PtyRelay {
 impl PtyRelay {
     /// Start a new PTY relay.
     ///
-    /// Spawns background tasks for bidirectional I/O.
+    /// Spawns background tasks for bidirectional I/O. The output task
+    /// uses AsyncFd readiness notifications for efficient, low-latency I/O.
     pub fn start(pty: Arc<Pty>) -> Self {
         let (input_tx, mut input_rx) = mpsc::channel::<Vec<u8>>(256);
         let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>(256);
@@ -329,26 +367,25 @@ impl PtyRelay {
         let pty_input = pty.clone();
         tokio::spawn(async move {
             while let Some(data) = input_rx.recv().await {
+                debug!(len = data.len(), data = ?&data[..data.len().min(32)], "PTY input received from channel");
                 if let Err(e) = pty_input.write(&data).await {
                     error!(error = %e, "Failed to write to PTY");
                     break;
                 }
+                debug!(len = data.len(), "PTY input written successfully");
             }
             debug!("PTY input task ended");
         });
 
         // Spawn output task (PTY -> client)
+        // Uses AsyncFd readiness - no polling, immediate wake on data
         let pty_output = pty.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             loop {
                 match pty_output.read(&mut buf).await {
-                    Ok(Some(0)) => {
-                        // Would block, yield briefly
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                        continue;
-                    }
                     Ok(Some(n)) => {
+                        debug!(len = n, data = ?&buf[..n.min(32)], "PTY output read");
                         if output_tx.send(buf[..n].to_vec()).await.is_err() {
                             warn!("Output channel closed");
                             break;
@@ -397,8 +434,8 @@ impl PtyRelay {
 mod tests {
     use super::*;
 
-    #[test]
-    fn pty_spawn_default_shell() {
+    #[tokio::test]
+    async fn pty_spawn_default_shell() {
         // This test may fail in CI without a proper TTY
         let result = Pty::spawn(80, 24, Some("/bin/sh"), &[]);
         if let Err(e) = &result {
@@ -410,8 +447,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn pty_size_tracking() {
+    #[tokio::test]
+    async fn pty_size_tracking() {
         if let Ok(mut pty) = Pty::spawn(80, 24, Some("/bin/sh"), &[]) {
             assert_eq!(pty.size(), (80, 24));
             let _ = pty.resize(120, 40);

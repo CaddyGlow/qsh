@@ -13,7 +13,7 @@
 
 mod quic;
 
-pub use quic::{QuicConnection, QuicStream, client_crypto_config, server_crypto_config};
+pub use quic::{QuicConnection, QuicSender, QuicStream, client_crypto_config, server_crypto_config};
 
 use std::future::Future;
 use std::net::SocketAddr;

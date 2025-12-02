@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use clap::Parser;
 use quinn::{Endpoint, ServerConfig};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
-use qsh_core::protocol::{Capabilities, Message, ResizePayload};
+use qsh_core::protocol::{Capabilities, Message, ResizePayload, ShutdownReason};
 use qsh_core::transport::{Connection, StreamType, server_crypto_config};
 use qsh_server::{
     BootstrapServer, Cli, ForwardHandler, Pty, PtyRelay, ServerSession, SessionConfig,
@@ -327,34 +327,19 @@ async fn handle_session(mut session: ServerSession) -> qsh_core::Result<()> {
     // Main session loop
     loop {
         tokio::select! {
-            // Handle PTY output -> send to client
-            output = relay.recv_output() => {
-                match output {
-                    Some(data) if !data.is_empty() => {
-                        if let Err(e) = session.send_output(data, last_input_seq).await {
-                            error!(error = %e, "Failed to send output");
-                            break;
-                        }
-                    }
-                    Some(_) => {
-                        // Empty data, continue
-                    }
-                    None => {
-                        // PTY closed
-                        if let Ok(Some(code)) = pty.try_wait() {
-                            info!(exit_code = code, "PTY closed");
-                        } else {
-                            info!("PTY closed");
-                        }
-                        break;
-                    }
-                }
-            }
+            // Use biased selection to prioritize client input for low latency
+            biased;
 
-            // Handle client messages
+            // Handle client messages (highest priority - user input)
             msg = session.process_control() => {
                 match msg {
                     Ok(Some(Message::TerminalInput(input))) => {
+                        debug!(
+                            seq = input.sequence,
+                            len = input.data.len(),
+                            data = ?&input.data[..input.data.len().min(32)],
+                            "Received terminal input from client"
+                        );
                         last_input_seq = input.sequence;
                         if let Err(e) = relay.send_input(input.data).await {
                             error!(error = %e, "Failed to send input to PTY");
@@ -362,9 +347,8 @@ async fn handle_session(mut session: ServerSession) -> qsh_core::Result<()> {
                         }
                     }
                     Ok(Some(Message::Resize(ResizePayload { cols, rows }))) => {
-                        info!(cols, rows, "Terminal resize");
-                        // Note: resize is tracked but not fully implemented
-                        // Would need to resize PTY here
+                        debug!(cols, rows, "Terminal resize requested");
+                        // TODO: implement PTY resize (needs interior mutability)
                     }
                     Ok(Some(Message::Ping(timestamp))) => {
                         if let Err(e) = session.send_pong(timestamp).await {
@@ -390,10 +374,50 @@ async fn handle_session(mut session: ServerSession) -> qsh_core::Result<()> {
                 }
             }
 
+            // Handle PTY output -> send to client
+            output = relay.recv_output() => {
+                match output {
+                    Some(data) if !data.is_empty() => {
+                        debug!(
+                            len = data.len(),
+                            data = ?&data[..data.len().min(32)],
+                            confirmed_seq = last_input_seq,
+                            "Sending output to client"
+                        );
+                        if let Err(e) = session.send_output(data, last_input_seq).await {
+                            error!(error = %e, "Failed to send output");
+                            break;
+                        }
+                    }
+                    Some(_) => {
+                        // Empty data, continue
+                    }
+                    None => {
+                        // PTY closed - shell exited
+                        let exit_code = pty.try_wait().ok().flatten();
+                        info!(exit_code = exit_code, "PTY closed, sending shutdown to client");
+
+                        // Send shutdown message to client
+                        let msg = format!("shell exited{}",
+                            exit_code.map(|c| format!(" with code {}", c)).unwrap_or_default());
+                        if let Err(e) = session.send_shutdown(ShutdownReason::ShellExited, Some(msg)).await {
+                            warn!(error = %e, "Failed to send shutdown message");
+                        }
+                        break;
+                    }
+                }
+            }
+
             // Check if PTY child exited
             _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
                 if let Ok(Some(code)) = pty.try_wait() {
-                    info!(exit_code = code, "Shell exited");
+                    info!(exit_code = code, "Shell exited, sending shutdown to client");
+
+                    // Send shutdown message to client
+                    let msg = format!("shell exited with code {}", code);
+                    if let Err(e) = session.send_shutdown(ShutdownReason::ShellExited, Some(msg)).await {
+                        warn!(error = %e, "Failed to send shutdown message");
+                    }
                     break;
                 }
             }

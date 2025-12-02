@@ -19,7 +19,7 @@ pub mod ssh;
 pub mod terminal;
 
 pub use cli::Cli;
-pub use connection::{ClientConnection, ConnectionConfig};
+pub use connection::{ClientConnection, ConnectionConfig, LatencyStats, LatencyTracker};
 pub use forward::{LocalForwarder, Socks5Proxy};
 pub use ssh::{BootstrapHandle, BootstrapMode, SshConfig, bootstrap};
 pub use terminal::{RawModeGuard, StdinReader, StdoutWriter, get_terminal_size, restore_terminal};

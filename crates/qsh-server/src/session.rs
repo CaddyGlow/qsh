@@ -14,8 +14,8 @@ use tracing::{debug, info};
 
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
-    Capabilities, HelloAckPayload, Message, StateDiff, StateUpdatePayload, TerminalOutputPayload,
-    TerminalState as ProtoTermState,
+    Capabilities, HelloAckPayload, Message, ShutdownPayload, ShutdownReason, StateDiff,
+    StateUpdatePayload, TerminalOutputPayload, TerminalState as ProtoTermState,
 };
 use qsh_core::session::SessionState;
 use qsh_core::terminal::TerminalParser;
@@ -272,6 +272,16 @@ impl ServerSession {
     /// Send a ping response.
     pub async fn send_pong(&mut self, timestamp: u64) -> Result<()> {
         self.control.send(&Message::Pong(timestamp)).await
+    }
+
+    /// Send a shutdown message to the client.
+    pub async fn send_shutdown(
+        &mut self,
+        reason: ShutdownReason,
+        message: Option<String>,
+    ) -> Result<()> {
+        let payload = ShutdownPayload { reason, message };
+        self.control.send(&Message::Shutdown(payload)).await
     }
 
     /// Process incoming control messages.

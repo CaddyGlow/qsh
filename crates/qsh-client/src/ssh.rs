@@ -155,6 +155,7 @@ async fn bootstrap_via_ssh_cli(
 
     cmd.arg(remote);
     cmd.arg("qsh-server").arg("--bootstrap");
+    cmd.stdin(Stdio::null());  // Don't inherit stdin - we need it for terminal input
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
