@@ -21,5 +21,5 @@ pub mod terminal;
 pub use cli::Cli;
 pub use connection::{ClientConnection, ConnectionConfig};
 pub use forward::{LocalForwarder, Socks5Proxy};
-pub use ssh::{BootstrapMode, SshConfig, bootstrap};
+pub use ssh::{BootstrapHandle, BootstrapMode, SshConfig, bootstrap};
 pub use terminal::{RawModeGuard, StdinReader, StdoutWriter, get_terminal_size, restore_terminal};

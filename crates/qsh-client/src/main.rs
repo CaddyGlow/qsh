@@ -80,8 +80,10 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
         },
     };
 
-    let server_info = match bootstrap(host, cli.port, user, &ssh_config).await {
-        Ok(info) => info,
+    // Bootstrap returns a handle that keeps the SSH process alive
+    // We need to hold onto it until after QUIC connection is established
+    let bootstrap_handle = match bootstrap(host, cli.port, user, &ssh_config).await {
+        Ok(handle) => Some(handle),
         Err(e) => {
             // For now, fall back to direct QUIC connection attempt
             warn!(error = %e, "SSH bootstrap failed, attempting direct QUIC connection");
@@ -122,6 +124,8 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
         }
     };
 
+    let server_info = &bootstrap_handle.as_ref().unwrap().server_info;
+
     // Use bootstrap info to connect
     let addr = format!("{}:{}", server_info.address, server_info.port)
         .to_socket_addrs()
@@ -148,6 +152,10 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
 
     let conn = ClientConnection::connect(config).await?;
     info!(rtt = ?conn.rtt(), "Connected to server");
+
+    // Drop the bootstrap handle now that QUIC connection is established
+    // This will terminate the SSH process / russh session
+    drop(bootstrap_handle);
 
     run_session(conn, cli).await
 }

@@ -136,8 +136,9 @@ impl Pty {
                 })?;
 
                 // Set controlling terminal
+                // TIOCSCTTY request type varies by platform (c_ulong on glibc/macOS, c_int on musl)
                 unsafe {
-                    libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0);
+                    libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0);
                 }
 
                 // Duplicate slave to stdin/stdout/stderr
