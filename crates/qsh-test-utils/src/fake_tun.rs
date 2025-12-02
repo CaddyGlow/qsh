@@ -104,9 +104,9 @@ impl FakeTun {
         }
 
         let mut incoming = self.incoming.lock().unwrap();
-        incoming.pop_front().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::WouldBlock, "No packets available")
-        })
+        incoming
+            .pop_front()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "No packets available"))
     }
 
     /// Write a packet to the device.

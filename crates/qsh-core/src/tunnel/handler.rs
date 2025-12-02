@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use super::types::{TunnelConfig, TunnelState, TunnelStateError};
 use super::TunDevice;
+use super::types::{TunnelConfig, TunnelState, TunnelStateError};
 
 /// Statistics tracked by the tunnel handler.
 #[derive(Debug, Clone, Default)]
@@ -76,10 +76,7 @@ impl<T: TunDevice> TunnelHandler<T> {
     }
 
     /// Start configuring the tunnel with the given config.
-    pub async fn start_configuring(
-        &self,
-        config: TunnelConfig,
-    ) -> Result<(), TunnelStateError> {
+    pub async fn start_configuring(&self, config: TunnelConfig) -> Result<(), TunnelStateError> {
         let mut state = self.state.lock().await;
         state.start_configuring(config)
     }
@@ -226,9 +223,9 @@ mod tests {
     impl TunDevice for TestTun {
         async fn read_packet(&mut self) -> io::Result<Vec<u8>> {
             let mut incoming = self.incoming.lock().await;
-            incoming.pop_front().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::WouldBlock, "No packets available")
-            })
+            incoming
+                .pop_front()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "No packets available"))
         }
 
         async fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {

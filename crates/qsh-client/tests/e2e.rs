@@ -110,7 +110,10 @@ fn server_version() {
         .output()
         .expect("Failed to run qsh-server --version");
 
-    assert!(output.status.success(), "qsh-server --version should succeed");
+    assert!(
+        output.status.success(),
+        "qsh-server --version should succeed"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("qsh-server"));
 }

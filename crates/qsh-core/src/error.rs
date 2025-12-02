@@ -44,6 +44,10 @@ pub enum Error {
     /// Invalid forward specification.
     #[error("invalid forward spec: {message}")]
     InvalidForwardSpec { message: String },
+
+    /// Transport layer error.
+    #[error("transport error: {message}")]
+    Transport { message: String },
 }
 
 /// Convenience result type for qsh operations.

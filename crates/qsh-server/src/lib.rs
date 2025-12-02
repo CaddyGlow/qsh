@@ -9,5 +9,7 @@
 
 pub mod cli;
 pub mod forward;
+pub mod session;
 
 pub use cli::Cli;
+pub use session::{ServerSession, SessionConfig};

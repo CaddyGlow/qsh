@@ -11,6 +11,10 @@
 //! - Tunnel: client-bidi 4 (reserved)
 //! - Forwards: server-bidi 1/5/9..., client-bidi 8/12/...
 
+mod quic;
+
+pub use quic::{QuicConnection, QuicStream, client_crypto_config, server_crypto_config};
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;

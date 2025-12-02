@@ -2,9 +2,9 @@
 //!
 //! Provides command-line argument parsing using clap.
 
-use std::{borrow::Cow, path::PathBuf};
 #[cfg(feature = "tunnel")]
 use std::str::FromStr;
+use std::{borrow::Cow, path::PathBuf};
 
 use clap::{ArgAction, Parser, ValueEnum};
 
@@ -63,7 +63,11 @@ impl FromStr for TunnelArg {
 
 /// Modern roaming-capable remote terminal.
 #[derive(Debug, Parser)]
-#[command(name = "qsh", version, about = "Modern roaming-capable remote terminal")]
+#[command(
+    name = "qsh",
+    version,
+    about = "Modern roaming-capable remote terminal"
+)]
 pub struct Cli {
     /// Remote host (user@host or host)
     #[arg(required_unless_present = "version")]
@@ -175,7 +179,11 @@ pub struct Cli {
     pub no_overlay: bool,
 
     /// Custom overlay toggle key
-    #[arg(long = "overlay-key", default_value = "ctrl+shift+s", value_name = "KEY")]
+    #[arg(
+        long = "overlay-key",
+        default_value = "ctrl+shift+s",
+        value_name = "KEY"
+    )]
     pub overlay_key: String,
 }
 
@@ -249,10 +257,7 @@ mod tests {
     #[test]
     fn parse_user_at_host() {
         let cli = Cli::try_parse_from(["qsh", "user@example.com"]).unwrap();
-        assert_eq!(
-            cli.parse_destination(),
-            Some((Some("user"), "example.com"))
-        );
+        assert_eq!(cli.parse_destination(), Some((Some("user"), "example.com")));
         assert_eq!(cli.effective_user(), Some("user"));
         assert_eq!(cli.host(), Some("example.com"));
     }
@@ -271,8 +276,7 @@ mod tests {
 
     #[test]
     fn parse_local_forward() {
-        let cli =
-            Cli::try_parse_from(["qsh", "-L", "8080:localhost:80", "example.com"]).unwrap();
+        let cli = Cli::try_parse_from(["qsh", "-L", "8080:localhost:80", "example.com"]).unwrap();
         assert_eq!(cli.local_forward, vec!["8080:localhost:80"]);
     }
 
@@ -309,9 +313,8 @@ mod tests {
     #[cfg(feature = "tunnel")]
     #[test]
     fn parse_tunnel_with_ip() {
-        let cli =
-            Cli::try_parse_from(["qsh", "--tun=10.0.0.2/24", "--route", "0.0.0.0/0", "host"])
-                .unwrap();
+        let cli = Cli::try_parse_from(["qsh", "--tun=10.0.0.2/24", "--route", "0.0.0.0/0", "host"])
+            .unwrap();
         assert!(matches!(
             cli.tunnel,
             Some(TunnelArg::Address(ref s)) if s == "10.0.0.2/24"
@@ -336,10 +339,7 @@ mod tests {
     #[test]
     fn command_string_preserves_spaces_with_escaping() {
         let cli = Cli::try_parse_from(["qsh", "example.com", "echo", "hi there"]).unwrap();
-        assert_eq!(
-            cli.command_string(),
-            Some("echo 'hi there'".to_string())
-        );
+        assert_eq!(cli.command_string(), Some("echo 'hi there'".to_string()));
     }
 
     #[test]

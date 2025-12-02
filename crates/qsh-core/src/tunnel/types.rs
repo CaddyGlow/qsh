@@ -138,7 +138,6 @@ pub enum TunnelState {
     },
 }
 
-
 impl TunnelState {
     /// Check if tunnel is active.
     pub fn is_active(&self) -> bool {
@@ -266,10 +265,7 @@ mod tests {
     }
 
     fn sample_v6_config() -> TunnelConfig {
-        TunnelConfig::new(
-            "fd00::2/64".parse().unwrap(),
-            "fd00::1/64".parse().unwrap(),
-        )
+        TunnelConfig::new("fd00::2/64".parse().unwrap(), "fd00::1/64".parse().unwrap())
     }
 
     // -------------------------------------------------------------------------
