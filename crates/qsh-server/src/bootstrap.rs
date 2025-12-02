@@ -49,11 +49,12 @@ impl BootstrapServer {
         debug!("Generated session key");
 
         // Generate self-signed certificate
-        let cert = rcgen::generate_simple_self_signed(vec!["qsh-server".to_string()]).map_err(
-            |e| Error::Transport {
-                message: format!("failed to generate certificate: {}", e),
-            },
-        )?;
+        let cert =
+            rcgen::generate_simple_self_signed(vec!["qsh-server".to_string()]).map_err(|e| {
+                Error::Transport {
+                    message: format!("failed to generate certificate: {}", e),
+                }
+            })?;
 
         let cert_der = cert.cert.der().to_vec();
         let key_der = cert.key_pair.serialize_der();
@@ -79,11 +80,10 @@ impl BootstrapServer {
         } else {
             // Use specified port
             let addr = SocketAddr::new(bind_ip, port);
-            let endpoint = Endpoint::server(server_config.clone(), addr).map_err(|e| {
-                Error::Transport {
+            let endpoint =
+                Endpoint::server(server_config.clone(), addr).map_err(|e| Error::Transport {
                     message: format!("failed to bind to {}: {}", addr, e),
-                }
-            })?;
+                })?;
             return Ok(Self {
                 session_key,
                 cert_der,
@@ -97,9 +97,10 @@ impl BootstrapServer {
         };
 
         // Create endpoint with found port
-        let endpoint = Endpoint::server(server_config, bind_addr).map_err(|e| Error::Transport {
-            message: format!("failed to bind to {}: {}", bind_addr, e),
-        })?;
+        let endpoint =
+            Endpoint::server(server_config, bind_addr).map_err(|e| Error::Transport {
+                message: format!("failed to bind to {}: {}", bind_addr, e),
+            })?;
 
         let actual_addr = endpoint.local_addr().map_err(|e| Error::Transport {
             message: format!("failed to get local address: {}", e),

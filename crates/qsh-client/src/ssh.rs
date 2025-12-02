@@ -6,14 +6,25 @@
 //! 3. Parse JSON response to get QUIC endpoint info
 
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use russh::client;
+use tokio::process::Command;
 use tracing::{debug, info, warn};
 
 use qsh_core::bootstrap::{BootstrapResponse, ServerInfo};
 use qsh_core::error::{Error, Result};
+
+/// Which SSH implementation to use for bootstrap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapMode {
+    /// Use the system `ssh` binary.
+    SshCli,
+    /// Use the embedded `russh` client.
+    Russh,
+}
 
 /// SSH client configuration.
 #[derive(Debug, Clone)]
@@ -24,6 +35,8 @@ pub struct SshConfig {
     pub identity_file: Option<PathBuf>,
     /// Skip host key verification (insecure).
     pub skip_host_key_check: bool,
+    /// SSH implementation to use for bootstrap.
+    pub mode: BootstrapMode,
 }
 
 impl Default for SshConfig {
@@ -32,6 +45,7 @@ impl Default for SshConfig {
             connect_timeout: Duration::from_secs(30),
             identity_file: None,
             skip_host_key_check: false,
+            mode: BootstrapMode::SshCli,
         }
     }
 }
@@ -73,8 +87,109 @@ pub async fn bootstrap(
     config: &SshConfig,
 ) -> Result<ServerInfo> {
     let addr = format!("{}:{}", host, port);
-    info!(addr = %addr, user = ?user, "Bootstrapping via SSH");
+    info!(addr = %addr, user = ?user, mode = ?config.mode, "Bootstrapping via SSH");
 
+    let output = match config.mode {
+        BootstrapMode::SshCli => bootstrap_via_ssh_cli(host, port, user, config).await?,
+        BootstrapMode::Russh => bootstrap_via_russh(&addr, user, config).await?,
+    };
+
+    let server_info = parse_bootstrap_response(output)?;
+    info!(
+        address = %server_info.address,
+        port = server_info.port,
+        mode = ?config.mode,
+        "Bootstrap successful"
+    );
+
+    Ok(server_info)
+}
+
+/// Bootstrap using the system `ssh` client.
+async fn bootstrap_via_ssh_cli(
+    host: &str,
+    port: u16,
+    user: Option<&str>,
+    config: &SshConfig,
+) -> Result<Vec<u8>> {
+    let remote = user
+        .map(|u| format!("{}@{}", u, host))
+        .unwrap_or_else(|| host.to_string());
+
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-p").arg(port.to_string());
+    cmd.arg("-o").arg("BatchMode=yes");
+
+    let timeout_secs = config.connect_timeout.as_secs().max(1);
+    cmd.arg("-o")
+        .arg(format!("ConnectTimeout={}", timeout_secs));
+
+    if let Some(identity) = &config.identity_file {
+        cmd.arg("-i").arg(identity);
+    }
+
+    if config.skip_host_key_check {
+        cmd.arg("-o").arg("StrictHostKeyChecking=no");
+        cmd.arg("-o").arg("UserKnownHostsFile=/dev/null");
+    }
+
+    cmd.arg(remote);
+    cmd.arg("qsh-server").arg("--bootstrap");
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    debug!(
+        port = port,
+        skip_host_key_check = config.skip_host_key_check,
+        identity = config
+            .identity_file
+            .as_ref()
+            .map(|p| p.display().to_string()),
+        "Executing ssh bootstrap via CLI"
+    );
+
+    let child = cmd.spawn().map_err(|e| Error::Transport {
+        message: format!("failed to spawn ssh: {}", e),
+    })?;
+
+    let output = tokio::time::timeout(config.connect_timeout, child.wait_with_output())
+        .await
+        .map_err(|_| Error::Timeout)?
+        .map_err(|e| Error::Transport {
+            message: format!("ssh command failed: {}", e),
+        })?;
+
+    if !output.status.success() {
+        let code = output
+            .status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "terminated by signal".to_string());
+        return Err(Error::Transport {
+            message: format!(
+                "ssh bootstrap failed with code {}: {}",
+                code,
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        });
+    }
+
+    if !output.stderr.is_empty() {
+        debug!(
+            stderr = %String::from_utf8_lossy(&output.stderr),
+            "ssh bootstrap command stderr"
+        );
+    }
+
+    Ok(output.stdout)
+}
+
+/// Bootstrap using the embedded `russh` client.
+async fn bootstrap_via_russh(
+    addr: &str,
+    user: Option<&str>,
+    config: &SshConfig,
+) -> Result<Vec<u8>> {
     // Create SSH config
     let ssh_config = client::Config {
         inactivity_timeout: Some(config.connect_timeout),
@@ -90,7 +205,7 @@ pub async fn bootstrap(
 
     // Connect to SSH server
     let mut session = tokio::time::timeout(config.connect_timeout, async {
-        client::connect(ssh_config, &addr, handler).await
+        client::connect(ssh_config, addr, handler).await
     })
     .await
     .map_err(|_| Error::Timeout)?
@@ -133,11 +248,12 @@ pub async fn bootstrap(
     info!("SSH authentication successful");
 
     // Open a channel and execute bootstrap command
-    let mut channel = session.channel_open_session().await.map_err(|e| {
-        Error::Transport {
+    let mut channel = session
+        .channel_open_session()
+        .await
+        .map_err(|e| Error::Transport {
             message: format!("failed to open SSH channel: {}", e),
-        }
-    })?;
+        })?;
 
     // Execute qsh-server --bootstrap
     channel
@@ -150,20 +266,19 @@ pub async fn bootstrap(
     debug!("Bootstrap command executed");
 
     // Read output
-    let mut output = Vec::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
     let mut exit_code = None;
 
     loop {
         let msg = channel.wait().await;
         match msg {
-            Some(russh::ChannelMsg::Data { data }) => {
-                output.extend_from_slice(&data);
-            }
+            Some(russh::ChannelMsg::Data { data }) => stdout.extend_from_slice(&data),
             Some(russh::ChannelMsg::ExtendedData { data, ext: 1 }) => {
-                // stderr - log it
-                if let Ok(stderr) = std::str::from_utf8(&data) {
-                    debug!(stderr = %stderr, "Bootstrap stderr");
+                if let Ok(stderr_str) = std::str::from_utf8(&data) {
+                    debug!(stderr = %stderr_str, "Bootstrap stderr");
                 }
+                stderr.extend_from_slice(&data);
             }
             Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
                 exit_code = Some(exit_status);
@@ -179,13 +294,24 @@ pub async fn bootstrap(
     if let Some(code) = exit_code
         && code != 0
     {
-        let stderr = String::from_utf8_lossy(&output);
         return Err(Error::Transport {
-            message: format!("bootstrap command failed with code {}: {}", code, stderr),
+            message: format!(
+                "bootstrap command failed with code {}: {}",
+                code,
+                String::from_utf8_lossy(&stderr)
+            ),
         });
     }
 
-    // Parse JSON response
+    // Close SSH connection
+    let _ = session
+        .disconnect(russh::Disconnect::ByApplication, "", "")
+        .await;
+
+    Ok(stdout)
+}
+
+fn parse_bootstrap_response(output: Vec<u8>) -> Result<ServerInfo> {
     let json = String::from_utf8(output).map_err(|e| Error::Protocol {
         message: format!("invalid UTF-8 in bootstrap response: {}", e),
     })?;
@@ -194,17 +320,6 @@ pub async fn bootstrap(
 
     let response = BootstrapResponse::parse(&json)?;
     let server_info = response.get_server_info()?.clone();
-
-    info!(
-        address = %server_info.address,
-        port = server_info.port,
-        "Bootstrap successful"
-    );
-
-    // Close SSH connection
-    let _ = session
-        .disconnect(russh::Disconnect::ByApplication, "", "")
-        .await;
 
     Ok(server_info)
 }
@@ -293,6 +408,7 @@ mod tests {
         assert_eq!(config.connect_timeout, Duration::from_secs(30));
         assert!(config.identity_file.is_none());
         assert!(!config.skip_host_key_check);
+        assert!(matches!(config.mode, BootstrapMode::SshCli));
     }
 
     #[test]

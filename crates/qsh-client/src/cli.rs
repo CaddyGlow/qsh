@@ -38,6 +38,17 @@ pub enum OverlayPosition {
     None,
 }
 
+/// SSH bootstrap implementation to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SshBootstrapMode {
+    /// Use the system `ssh` client.
+    #[clap(name = "ssh")]
+    Ssh,
+    /// Use the Rust `russh` client.
+    #[clap(name = "russh")]
+    Russh,
+}
+
 /// Tunnel argument with optional IP assignment (feature-gated).
 #[cfg(feature = "tunnel")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +91,10 @@ pub struct Cli {
     /// SSH port to connect to
     #[arg(short = 'p', long, default_value_t = 22)]
     pub port: u16,
+
+    /// SSH bootstrap implementation to use
+    #[arg(long = "ssh-bootstrap-mode", default_value = "ssh", value_enum)]
+    pub ssh_bootstrap_mode: SshBootstrapMode,
 
     /// Login user name (overrides user@ in destination)
     #[arg(short = 'l', long, value_name = "USER")]
@@ -420,9 +435,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_ssh_bootstrap_mode() {
+        let cli =
+            Cli::try_parse_from(["qsh", "--ssh-bootstrap-mode", "russh", "example.com"]).unwrap();
+        assert_eq!(cli.ssh_bootstrap_mode, SshBootstrapMode::Russh);
+    }
+
+    #[test]
     fn default_values() {
         let cli = Cli::try_parse_from(["qsh", "example.com"]).unwrap();
         assert_eq!(cli.port, 22);
+        assert_eq!(cli.ssh_bootstrap_mode, SshBootstrapMode::Ssh);
         assert_eq!(cli.verbose, 0);
         assert!(!cli.no_pty);
         assert!(!cli.background);

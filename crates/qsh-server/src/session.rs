@@ -14,8 +14,8 @@ use tracing::{debug, info};
 
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
-    Capabilities, HelloAckPayload, Message, StateDiff, StateUpdatePayload,
-    TerminalOutputPayload, TerminalState as ProtoTermState,
+    Capabilities, HelloAckPayload, Message, StateDiff, StateUpdatePayload, TerminalOutputPayload,
+    TerminalState as ProtoTermState,
 };
 use qsh_core::session::SessionState;
 use qsh_core::terminal::TerminalParser;
@@ -52,8 +52,8 @@ impl Default for SessionConfig {
 
 /// An active server session.
 pub struct ServerSession {
-    /// QUIC connection.
-    quic: QuicConnection,
+    /// QUIC connection (shared for forward handling).
+    quic: Arc<QuicConnection>,
     /// Control stream.
     control: QuicStream,
     /// Session state.
@@ -64,7 +64,6 @@ pub struct ServerSession {
     /// Last confirmed input sequence.
     confirmed_input_seq: u64,
     /// Server configuration.
-    #[allow(dead_code)] // Will be used for session management
     config: SessionConfig,
     /// Terminal size (cols, rows).
     term_size: (u16, u16),
@@ -169,7 +168,7 @@ impl ServerSession {
         );
 
         Ok(Self {
-            quic,
+            quic: Arc::new(quic),
             control,
             session_state,
             parser: Arc::new(Mutex::new(parser)),
@@ -194,9 +193,28 @@ impl ServerSession {
         self.term_size
     }
 
+    /// Maximum number of forwards allowed for this session.
+    pub fn max_forwards(&self) -> u16 {
+        self.config.max_forwards
+    }
+
     /// Get the current RTT.
     pub fn rtt(&self) -> Duration {
         self.quic.rtt()
+    }
+
+    /// Get a shared reference to the underlying QUIC connection.
+    ///
+    /// Used by forward handlers to accept streams.
+    pub fn quic_connection(&self) -> Arc<QuicConnection> {
+        Arc::clone(&self.quic)
+    }
+
+    /// Accept an incoming stream from the client.
+    ///
+    /// Returns the stream type and the stream itself.
+    pub async fn accept_stream(&self) -> Result<(StreamType, QuicStream)> {
+        self.quic.accept_stream().await
     }
 
     /// Send raw terminal output to the client.

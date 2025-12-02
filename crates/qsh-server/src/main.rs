@@ -10,8 +10,10 @@ use quinn::{Endpoint, ServerConfig};
 use tracing::{error, info, warn};
 
 use qsh_core::protocol::{Capabilities, Message, ResizePayload};
-use qsh_core::transport::server_crypto_config;
-use qsh_server::{BootstrapServer, Cli, Pty, PtyRelay, ServerSession, SessionConfig};
+use qsh_core::transport::{Connection, StreamType, server_crypto_config};
+use qsh_server::{
+    BootstrapServer, Cli, ForwardHandler, Pty, PtyRelay, ServerSession, SessionConfig,
+};
 
 fn main() {
     // Parse CLI arguments
@@ -143,7 +145,7 @@ async fn run_bootstrap(cli: &Cli) -> qsh_core::Result<()> {
     let session = ServerSession::accept(quic, Some(session_key), session_config).await?;
 
     // Handle the session
-    handle_session(session, cli).await?;
+    handle_session(session).await?;
 
     // Clean up
     bootstrap.close();
@@ -255,13 +257,12 @@ async fn handle_connection(
     // Accept session (no expected key for now - would come from bootstrap)
     let session = ServerSession::accept(quic, None, config).await?;
 
-    // Handle the session with a dummy CLI for shell config
-    let cli = Cli::default();
-    handle_session(session, &cli).await
+    // Handle the session
+    handle_session(session).await
 }
 
 /// Handle an established session (shared between bootstrap and normal modes).
-async fn handle_session(mut session: ServerSession, _cli: &Cli) -> qsh_core::Result<()> {
+async fn handle_session(mut session: ServerSession) -> qsh_core::Result<()> {
     info!(
         addr = %session.remote_addr(),
         rtt = ?session.rtt(),
@@ -286,6 +287,40 @@ async fn handle_session(mut session: ServerSession, _cli: &Cli) -> qsh_core::Res
     // Start PTY relay
     let mut relay = PtyRelay::start(pty.clone());
 
+    // Create forward handler with shared connection
+    let quic_conn = session.quic_connection();
+    let forward_handler = Arc::new(ForwardHandler::new(
+        quic_conn.clone(),
+        session.max_forwards(),
+    ));
+
+    // Spawn a task to accept forward streams
+    let accept_quic = quic_conn.clone();
+    let accept_handler = Arc::clone(&forward_handler);
+    let accept_task = tokio::spawn(async move {
+        loop {
+            match accept_quic.accept_stream().await {
+                Ok((stream_type, stream)) => {
+                    if matches!(stream_type, StreamType::Forward(_)) {
+                        let handler = Arc::clone(&accept_handler);
+                        tokio::spawn(async move {
+                            handler.handle_stream(stream_type, stream).await;
+                        });
+                    } else {
+                        warn!(stream_type = ?stream_type, "Unexpected stream type from accept");
+                    }
+                }
+                Err(e) => {
+                    // Stream accept error - might be connection closing
+                    if !matches!(e, qsh_core::Error::ConnectionClosed) {
+                        warn!(error = %e, "Failed to accept stream");
+                    }
+                    break;
+                }
+            }
+        }
+    });
+
     // Track input sequence for confirmation
     let mut last_input_seq = 0u64;
 
@@ -306,7 +341,11 @@ async fn handle_session(mut session: ServerSession, _cli: &Cli) -> qsh_core::Res
                     }
                     None => {
                         // PTY closed
-                        info!("PTY closed");
+                        if let Ok(Some(code)) = pty.try_wait() {
+                            info!(exit_code = code, "PTY closed");
+                        } else {
+                            info!("PTY closed");
+                        }
                         break;
                     }
                 }
@@ -353,7 +392,7 @@ async fn handle_session(mut session: ServerSession, _cli: &Cli) -> qsh_core::Res
 
             // Check if PTY child exited
             _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                if let Ok(Some(code)) = pty.try_wait().await {
+                if let Ok(Some(code)) = pty.try_wait() {
                     info!(exit_code = code, "Shell exited");
                     break;
                 }
@@ -361,9 +400,12 @@ async fn handle_session(mut session: ServerSession, _cli: &Cli) -> qsh_core::Res
         }
     }
 
+    // Stop the accept task
+    accept_task.abort();
+
     // Clean up
-    relay.stop();
-    let _ = pty.kill().await;
+    drop(relay); // Stop relay tasks by dropping it
+    let _ = pty.kill();
     session.close();
 
     Ok(())

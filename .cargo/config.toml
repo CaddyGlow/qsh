@@ -1,0 +1,44 @@
+# Cross-compilation configuration for qsh
+# Linkers are set via environment variables in flake.nix
+
+# Linux musl targets (static linking)
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.armv7-unknown-linux-musleabihf]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# Windows targets (static linking)
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-static"]
+
+[target.i686-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-static"]
+
+# macOS targets
+[target.x86_64-apple-darwin]
+# Native or cross-compile from aarch64-apple-darwin
+
+[target.aarch64-apple-darwin]
+# Native or cross-compile from x86_64-apple-darwin
+
+# Android targets (linkers set via env vars)
+[target.aarch64-linux-android]
+
+[target.armv7-linux-androideabi]
+
+[target.x86_64-linux-android]
+
+[target.i686-linux-android]
+
+[build]
+# Uncomment to set a default target
+# target = "x86_64-unknown-linux-musl"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

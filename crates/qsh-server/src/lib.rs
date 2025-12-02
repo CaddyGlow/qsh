@@ -16,5 +16,6 @@ pub mod session;
 
 pub use bootstrap::BootstrapServer;
 pub use cli::Cli;
+pub use forward::ForwardHandler;
 pub use pty::{Pty, PtyRelay};
 pub use session::{ServerSession, SessionConfig};

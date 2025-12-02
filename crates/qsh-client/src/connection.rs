@@ -61,8 +61,8 @@ impl Default for ConnectionConfig {
 
 /// Active client connection.
 pub struct ClientConnection {
-    /// QUIC connection wrapper.
-    quic: QuicConnection,
+    /// QUIC connection wrapper (shared for forwarders).
+    quic: Arc<QuicConnection>,
     /// Control stream for protocol messages.
     control: QuicStream,
     /// Session state.
@@ -113,7 +113,7 @@ impl ClientConnection {
             })?;
 
         info!("QUIC connection established");
-        let quic = QuicConnection::new(conn);
+        let quic = Arc::new(QuicConnection::new(conn));
 
         // Open control stream (client-initiated bidi 0)
         let mut control = quic
@@ -191,6 +191,13 @@ impl ClientConnection {
         self.quic.rtt()
     }
 
+    /// Get a shared reference to the underlying QUIC connection.
+    ///
+    /// Used by forwarders to open additional streams.
+    pub fn quic_connection(&self) -> Arc<QuicConnection> {
+        Arc::clone(&self.quic)
+    }
+
     /// Send terminal input to the server.
     pub async fn send_input(&mut self, data: &[u8]) -> Result<()> {
         // Track for reliable delivery
@@ -258,7 +265,6 @@ impl ClientConnection {
         Ok(())
     }
 }
-
 
 #[cfg(test)]
 mod tests {

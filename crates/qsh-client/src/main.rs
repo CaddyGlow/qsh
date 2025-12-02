@@ -7,10 +7,13 @@ use std::net::ToSocketAddrs;
 use clap::Parser;
 use tracing::{debug, error, info, warn};
 
+use qsh_client::cli::SshBootstrapMode;
 use qsh_client::{
-    bootstrap, get_terminal_size, restore_terminal, Cli, ClientConnection, ConnectionConfig,
-    RawModeGuard, SshConfig, StdinReader, StdoutWriter,
+    BootstrapMode, Cli, ClientConnection, ConnectionConfig, LocalForwarder, RawModeGuard,
+    Socks5Proxy, SshConfig, StdinReader, StdoutWriter, bootstrap, get_terminal_size,
+    restore_terminal,
 };
+use qsh_core::forward::ForwardSpec;
 use qsh_core::protocol::{Message, TermSize};
 
 fn main() {
@@ -71,6 +74,10 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
         connect_timeout: std::time::Duration::from_secs(30),
         identity_file: cli.identity.first().cloned(),
         skip_host_key_check: false,
+        mode: match cli.ssh_bootstrap_mode {
+            SshBootstrapMode::Ssh => BootstrapMode::SshCli,
+            SshBootstrapMode::Russh => BootstrapMode::Russh,
+        },
     };
 
     let server_info = match bootstrap(host, cli.port, user, &ssh_config).await {
@@ -145,7 +152,7 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
     run_session(conn, cli).await
 }
 
-async fn run_session(mut conn: ClientConnection, _cli: &Cli) -> qsh_core::Result<()> {
+async fn run_session(mut conn: ClientConnection, cli: &Cli) -> qsh_core::Result<()> {
     info!(
         predictive_echo = conn.server_capabilities().predictive_echo,
         compression = conn.server_capabilities().compression,
@@ -153,13 +160,67 @@ async fn run_session(mut conn: ClientConnection, _cli: &Cli) -> qsh_core::Result
         "Server capabilities"
     );
 
+    // Start port forwarders
+    let quic_conn = conn.quic_connection();
+    let mut forward_handles = Vec::new();
+
+    // Start local forwarders (-L)
+    for spec_str in &cli.local_forward {
+        match ForwardSpec::parse_local(spec_str) {
+            Ok(spec) => match LocalForwarder::new(spec, quic_conn.clone()).await {
+                Ok(mut forwarder) => {
+                    info!(spec = spec_str.as_str(), "Local forward started");
+                    forward_handles.push(tokio::spawn(async move {
+                        if let Err(e) = forwarder.run().await {
+                            error!(error = %e, "Local forwarder error");
+                        }
+                    }));
+                }
+                Err(e) => {
+                    warn!(spec = spec_str.as_str(), error = %e, "Failed to start local forward");
+                }
+            },
+            Err(e) => {
+                warn!(spec = spec_str.as_str(), error = %e, "Invalid local forward spec");
+            }
+        }
+    }
+
+    // Start dynamic forwarders (-D)
+    for spec_str in &cli.dynamic_forward {
+        match ForwardSpec::parse_dynamic(spec_str) {
+            Ok(spec) => {
+                let bind_addr = spec.bind_addr();
+                match Socks5Proxy::new(bind_addr, quic_conn.clone()).await {
+                    Ok(mut proxy) => {
+                        info!(addr = %bind_addr, "SOCKS5 proxy started");
+                        forward_handles.push(tokio::spawn(async move {
+                            if let Err(e) = proxy.run().await {
+                                error!(error = %e, "SOCKS5 proxy error");
+                            }
+                        }));
+                    }
+                    Err(e) => {
+                        warn!(spec = spec_str.as_str(), error = %e, "Failed to start SOCKS5 proxy");
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(spec = spec_str.as_str(), error = %e, "Invalid dynamic forward spec");
+            }
+        }
+    }
+
+    // Note: Remote forwards (-R) are server-initiated and handled differently
+    // They would be sent as ForwardSetup messages during handshake
+
     // Enter raw terminal mode
     let _raw_guard = match RawModeGuard::enter() {
         Ok(guard) => guard,
         Err(e) => {
             warn!(error = %e, "Failed to enter raw mode, continuing with cooked mode");
             // Continue without raw mode - useful for debugging
-            return run_session_cooked(conn).await;
+            return run_session_cooked(conn, forward_handles).await;
         }
     };
 
@@ -169,8 +230,20 @@ async fn run_session(mut conn: ClientConnection, _cli: &Cli) -> qsh_core::Result
     let mut stdin = StdinReader::new();
     let mut stdout = StdoutWriter::new();
 
+    // Set up SIGWINCH signal handler for terminal resize
+    #[cfg(unix)]
+    let mut sigwinch =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+            .map_err(qsh_core::Error::Io)?;
+
     // Main session loop
     loop {
+        // Platform-specific select with SIGWINCH handling
+        #[cfg(unix)]
+        let resize_event = sigwinch.recv();
+        #[cfg(not(unix))]
+        let resize_event = std::future::pending::<Option<()>>();
+
         tokio::select! {
             // Handle stdin -> server
             input = stdin.read() => {
@@ -239,11 +312,25 @@ async fn run_session(mut conn: ClientConnection, _cli: &Cli) -> qsh_core::Result
                 info!("Received interrupt, shutting down...");
                 break;
             }
+
+            // Handle SIGWINCH (terminal resize)
+            _ = resize_event => {
+                let size = get_term_size();
+                debug!(cols = size.cols, rows = size.rows, "Terminal resized");
+                if let Err(e) = conn.send_resize(size.cols, size.rows).await {
+                    warn!(error = %e, "Failed to send resize");
+                }
+            }
         }
     }
 
     // Restore terminal before closing
     restore_terminal();
+
+    // Abort any running forwarders
+    for handle in forward_handles {
+        handle.abort();
+    }
 
     info!("Shutting down connection...");
     conn.close().await?;
@@ -252,7 +339,10 @@ async fn run_session(mut conn: ClientConnection, _cli: &Cli) -> qsh_core::Result
 }
 
 /// Fallback session for when raw mode isn't available.
-async fn run_session_cooked(conn: ClientConnection) -> qsh_core::Result<()> {
+async fn run_session_cooked(
+    conn: ClientConnection,
+    mut forward_handles: Vec<tokio::task::JoinHandle<()>>,
+) -> qsh_core::Result<()> {
     eprintln!("Running in cooked mode (raw terminal unavailable).");
     eprintln!("Press Ctrl+C to exit.");
 
@@ -260,6 +350,12 @@ async fn run_session_cooked(conn: ClientConnection) -> qsh_core::Result<()> {
     tokio::signal::ctrl_c().await.ok();
 
     info!("Shutting down...");
+
+    // Abort any running forwarders
+    for handle in forward_handles.drain(..) {
+        handle.abort();
+    }
+
     conn.close().await?;
 
     Ok(())

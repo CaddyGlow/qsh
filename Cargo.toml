@@ -15,15 +15,15 @@ tokio = { version = "1.40", features = ["full"] }
 
 # QUIC/TLS
 quinn = "0.11"
-rustls = "0.23"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "logging", "tls12"] }
 
 # SSH
 russh = "0.45"
 russh-keys = "0.45"
 async-trait = "0.1"
 
-# PTY
-portable-pty = "0.8"
+# PTY (using nix for cross-platform Unix support including Android)
+nix = { version = "0.29", features = ["term", "process", "fs", "signal"] }
 
 # Terminal parsing
 vte = "0.13"

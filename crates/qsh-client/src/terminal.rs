@@ -7,8 +7,8 @@
 
 use std::io::{self, Read};
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
@@ -54,8 +54,7 @@ impl RawModeGuard {
 
         // Input flags: disable break signal, CR->NL mapping, parity checking,
         // 8th bit stripping, and XON/XOFF flow control
-        raw.c_iflag &=
-            !(libc::BRKINT | libc::ICRNL | libc::INPCK | libc::ISTRIP | libc::IXON);
+        raw.c_iflag &= !(libc::BRKINT | libc::ICRNL | libc::INPCK | libc::ISTRIP | libc::IXON);
 
         // Output flags: disable output processing
         raw.c_oflag &= !libc::OPOST;
