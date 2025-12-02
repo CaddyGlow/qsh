@@ -6,6 +6,9 @@ authors.workspace = true
 license.workspace = true
 description = "qsh client binary - modern roaming-capable remote terminal"
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "qsh"
 path = "src/main.rs"
