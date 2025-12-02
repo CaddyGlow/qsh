@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(git -C /home/rick/projects-caddy/qsh/main diff --stat HEAD)",
+      "Bash(git -C /home/rick/projects-caddy/qsh/main status --porcelain)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$(cat <<''EOF''\nPhase 1 complete\n\nImplements core protocol, terminal, transport, and test infrastructure:\n\n- Protocol: Message types, length-prefixed bincode codec, proptest roundtrip\n- Terminal: Cell/Screen/TerminalState, VTE-based ANSI parser\n- Transport: StreamType enum, Connection/StreamPair traits\n- Bootstrap: ServerInfo discovery response types\n- Session: SessionState, SessionStatus, InputTracker for reliable delivery\n- Test utils: MockStream/MockConnection, FakePty, TestKeys\n\n116 tests passing across workspace.\nEOF\n)\")"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

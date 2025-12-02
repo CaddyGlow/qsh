@@ -1,0 +1,234 @@
+//! Property-based tests for the protocol codec.
+//!
+//! These tests use proptest to verify:
+//! - Codec roundtrip for arbitrary messages
+//! - Codec never panics on arbitrary input
+//! - Length prefix correctness
+
+#![cfg(test)]
+
+use bytes::BytesMut;
+use proptest::prelude::*;
+
+use crate::protocol::{
+    Capabilities, Codec, ForwardAcceptPayload, ForwardClosePayload, ForwardDataPayload,
+    ForwardEofPayload, ForwardRejectPayload, ForwardRequestPayload, ForwardSpec, HelloPayload,
+    Message, ResizePayload, ShutdownPayload, ShutdownReason, StateAckPayload, TermSize,
+    TerminalInputPayload,
+};
+
+// =============================================================================
+// Arbitrary Generators
+// =============================================================================
+
+prop_compose! {
+    fn arb_capabilities()(
+        predictive_echo in any::<bool>(),
+        compression in any::<bool>(),
+        max_forwards in any::<u16>(),
+        tunnel in any::<bool>(),
+    ) -> Capabilities {
+        Capabilities {
+            predictive_echo,
+            compression,
+            max_forwards,
+            tunnel,
+        }
+    }
+}
+
+prop_compose! {
+    fn arb_term_size()(
+        cols in 1u16..=500,
+        rows in 1u16..=200,
+    ) -> TermSize {
+        TermSize { cols, rows }
+    }
+}
+
+prop_compose! {
+    fn arb_hello()(
+        protocol_version in any::<u32>(),
+        session_key in any::<[u8; 32]>(),
+        client_nonce in any::<u64>(),
+        capabilities in arb_capabilities(),
+        term_size in arb_term_size(),
+        term_type in "[a-z0-9-]{1,32}",
+        last_generation in any::<u64>(),
+        last_input_seq in any::<u64>(),
+    ) -> HelloPayload {
+        HelloPayload {
+            protocol_version,
+            session_key,
+            client_nonce,
+            capabilities,
+            term_size,
+            term_type,
+            last_generation,
+            last_input_seq,
+        }
+    }
+}
+
+prop_compose! {
+    fn arb_terminal_input()(
+        sequence in any::<u64>(),
+        data in prop::collection::vec(any::<u8>(), 0..1024),
+        predictable in any::<bool>(),
+    ) -> TerminalInputPayload {
+        TerminalInputPayload {
+            sequence,
+            data,
+            predictable,
+        }
+    }
+}
+
+fn arb_shutdown_reason() -> impl Strategy<Value = ShutdownReason> {
+    prop_oneof![
+        Just(ShutdownReason::UserRequested),
+        Just(ShutdownReason::IdleTimeout),
+        Just(ShutdownReason::ServerShutdown),
+        Just(ShutdownReason::ProtocolError),
+        Just(ShutdownReason::AuthFailure),
+    ]
+}
+
+prop_compose! {
+    fn arb_forward_spec()(variant in 0u8..3, port in any::<u16>()) -> ForwardSpec {
+        match variant {
+            0 => ForwardSpec::Local { bind_port: port },
+            1 => ForwardSpec::Remote { bind_port: port },
+            _ => ForwardSpec::Dynamic,
+        }
+    }
+}
+
+/// Generate an arbitrary Message
+fn arb_message() -> impl Strategy<Value = Message> {
+    prop_oneof![
+        // Control messages
+        arb_hello().prop_map(Message::Hello),
+        any::<u64>().prop_map(Message::Ping),
+        any::<u64>().prop_map(Message::Pong),
+        (any::<u16>(), any::<u16>())
+            .prop_map(|(cols, rows)| Message::Resize(ResizePayload { cols, rows })),
+        (arb_shutdown_reason(), any::<Option<String>>())
+            .prop_map(|(reason, message)| Message::Shutdown(ShutdownPayload { reason, message })),
+
+        // Terminal messages
+        arb_terminal_input().prop_map(Message::TerminalInput),
+        any::<u64>().prop_map(|g| Message::StateAck(StateAckPayload { generation: g })),
+
+        // Forward messages
+        (any::<u64>(), arb_forward_spec(), "[a-z.]{1,32}", any::<u16>())
+            .prop_map(|(id, spec, target, port)| {
+                Message::ForwardRequest(ForwardRequestPayload {
+                    forward_id: id,
+                    spec,
+                    target,
+                    target_port: port,
+                })
+            }),
+        any::<u64>().prop_map(|id| Message::ForwardAccept(ForwardAcceptPayload { forward_id: id })),
+        (any::<u64>(), "[a-z ]{0,64}")
+            .prop_map(|(id, reason)| Message::ForwardReject(ForwardRejectPayload {
+                forward_id: id,
+                reason,
+            })),
+        (any::<u64>(), prop::collection::vec(any::<u8>(), 0..1024))
+            .prop_map(|(id, data)| Message::ForwardData(ForwardDataPayload {
+                forward_id: id,
+                data,
+            })),
+        any::<u64>().prop_map(|id| Message::ForwardEof(ForwardEofPayload { forward_id: id })),
+        (any::<u64>(), any::<Option<String>>())
+            .prop_map(|(id, reason)| Message::ForwardClose(ForwardClosePayload {
+                forward_id: id,
+                reason,
+            })),
+    ]
+}
+
+// =============================================================================
+// Property Tests
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1000))]
+
+    #[test]
+    fn roundtrip_arbitrary_message(msg in arb_message()) {
+        let encoded = Codec::encode(&msg).unwrap();
+        let decoded = Codec::decode_slice(&encoded).unwrap().unwrap();
+        prop_assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn roundtrip_terminal_input(
+        seq in any::<u64>(),
+        data in prop::collection::vec(any::<u8>(), 0..4096),
+        predictable in any::<bool>(),
+    ) {
+        let msg = Message::TerminalInput(TerminalInputPayload {
+            sequence: seq,
+            data,
+            predictable,
+        });
+
+        let encoded = Codec::encode(&msg).unwrap();
+        let decoded = Codec::decode_slice(&encoded).unwrap().unwrap();
+        prop_assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn codec_never_panics_on_arbitrary_input(data in prop::collection::vec(any::<u8>(), 0..10000)) {
+        let mut buf = BytesMut::from(&data[..]);
+        // Should not panic, may return Ok(None) or Err
+        let _ = Codec::decode(&mut buf);
+    }
+
+    #[test]
+    fn encoded_length_prefix_matches_payload(msg in arb_message()) {
+        let encoded = Codec::encode(&msg).unwrap();
+
+        // First 4 bytes should be little-endian length
+        let len = u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]) as usize;
+
+        // Length should match actual payload
+        prop_assert_eq!(len, encoded.len() - 4);
+    }
+
+    #[test]
+    fn partial_buffer_returns_none(msg in arb_message(), cut_at in 0usize..=3) {
+        let encoded = Codec::encode(&msg).unwrap();
+
+        // Cut at different points to ensure partial always returns None
+        if cut_at < encoded.len() {
+            let partial = &encoded[..cut_at];
+            let result = Codec::decode_slice(partial);
+            prop_assert!(result.is_ok());
+            prop_assert!(result.unwrap().is_none());
+        }
+    }
+}
+
+// Extended tests (run with --ignored)
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(10000))]
+
+    #[test]
+    #[ignore = "extended property test - run with --ignored"]
+    fn extended_roundtrip(msg in arb_message()) {
+        let encoded = Codec::encode(&msg).unwrap();
+        let decoded = Codec::decode_slice(&encoded).unwrap().unwrap();
+        prop_assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    #[ignore = "extended property test - run with --ignored"]
+    fn extended_fuzz_decode(data in prop::collection::vec(any::<u8>(), 0..100000)) {
+        let mut buf = BytesMut::from(&data[..]);
+        let _ = Codec::decode(&mut buf);
+    }
+}

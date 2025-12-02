@@ -1,0 +1,36 @@
+[package]
+name = "qsh-client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "qsh client binary - modern roaming-capable remote terminal"
+
+[[bin]]
+name = "qsh"
+path = "src/main.rs"
+
+[features]
+default = []
+tunnel = ["qsh-core/tunnel"]
+
+[dependencies]
+qsh-core = { workspace = true }
+tokio = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+russh = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+bytes = { workspace = true }
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+proptest = { workspace = true }
+test-case = { workspace = true }
+assert_matches = { workspace = true }
+qsh-test-utils = { workspace = true }

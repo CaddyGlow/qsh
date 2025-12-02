@@ -1,0 +1,30 @@
+[package]
+name = "qsh-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Core library for qsh - protocol, types, terminal state"
+
+[features]
+default = []
+tunnel = []
+
+[dependencies]
+tokio = { workspace = true }
+bytes = { workspace = true }
+bincode = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+vte = { workspace = true }
+unicode-width = { workspace = true }
+ipnet = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+proptest = { workspace = true }
+test-case = { workspace = true }
+assert_matches = { workspace = true }

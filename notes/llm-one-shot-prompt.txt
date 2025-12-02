@@ -1,0 +1,17 @@
+You are generating a full implementation for the qsh project in one shot. Follow these rules strictly:
+
+- Read context from docs/qsh-PRD.md, docs/qsh-PROTOCOL.md, docs/qsh-IMPL-SPEC.md, docs/qsh-TDD-SPEC.md. Treat them as source of truth; resolve conflicts in favor of PROTOCOL for wire, PRD for product scope, IMPL-SPEC/TDD for structure/tests.
+- Target workspace layout described in IMPL-SPEC Phase 0 (workspace with crates/qsh-core, crates/qsh-client, crates/qsh-server, crates/qsh-test-utils, tests/).
+- Language: Rust 2024. Use workspace deps as listed in IMPL-SPEC/TDD.
+- Stream mapping: control = client-bidi 0, terminal out = server-uni 3, terminal in = client-uni 2, forwards on proper bidi IDs (server bidi 1/5…, client bidi 8/12…), tunnel uses client-bidi 4 reserved.
+- Message enums per PROTOCOL (Hello/HelloAck with capabilities, StateAck, ForwardAccept/Reject/Eof, tunnel messages) and Capabilities fields: predictive_echo, compression, max_forwards, tunnel.
+- SSH agent forwarding is future scope (do not implement).
+- Implement all tasks through Phase 1.25 in IMPL-SPEC, satisfying TDD specs; add TODO stubs for later phases.
+- Produce a single unified diff (no prose) touching only the necessary files; keep ASCII; derive Debug/Clone/PartialEq/Serialize/Deserialize where specified.
+- Ensure code compiles (cargo check) and tests from TDD/IMPL specs are satisfied; if you add tests, keep them minimal and aligned to specs.
+- Avoid external network calls; do not include generated binaries.
+- Be concise; prefer small, composable modules; add brief comments only where logic is non-obvious.
+- After completing each phase (0, 1, 2, 3, 4, 5, 6), make a git commit before starting the next phase. Commit message format: "Phase X complete". Do not mix changes from multiple phases into one commit.
+- After each phase commit, have a code reviewer verify the phase plan is fully implemented before proceeding. If no reviewer is available, perform a self-review using the plan checklist and note the sign-off in the progress log.
+
+Output: the diff only (use apply_patch style), nothing else.

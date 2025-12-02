@@ -1,0 +1,39 @@
+[package]
+name = "qsh-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "qsh server binary - PTY management and QUIC endpoint"
+
+[[bin]]
+name = "qsh-server"
+path = "src/main.rs"
+
+[features]
+default = []
+tunnel = ["qsh-core/tunnel"]
+
+[dependencies]
+qsh-core = { workspace = true }
+tokio = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+portable-pty = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+bytes = { workspace = true }
+rcgen = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+proptest = { workspace = true }
+test-case = { workspace = true }
+assert_matches = { workspace = true }
+qsh-test-utils = { workspace = true }

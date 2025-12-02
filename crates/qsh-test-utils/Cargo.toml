@@ -1,0 +1,22 @@
+[package]
+name = "qsh-test-utils"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Test utilities for qsh - mocks, fakes, and test helpers"
+
+[features]
+default = []
+tunnel = ["qsh-core/tunnel"]
+
+[dependencies]
+qsh-core = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+rcgen = { workspace = true }
+rand = { workspace = true }
+ipnet = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }

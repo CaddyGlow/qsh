@@ -1,0 +1,26 @@
+# Build output
+/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Test artifacts
+*.profraw
+lcov.info
+
+# Credentials (never commit)
+*.pem
+*.key
+credentials.json
