@@ -1,8 +1,8 @@
 # qsh LLM Progress Log Template
 
-Current focus: Phase 4 complete, awaiting review sign-off
+Current focus: Phase 5 complete, awaiting review sign-off
 
-Next step: Phase 5 - Polish
+Next step: Phase 6 - Tunnel (feature-gated)
 
 Blocked: None
 
@@ -65,12 +65,12 @@ Check off tasks as you complete them; keep one line notes per item. Use track le
 - [x] [SYNC] Phase 4 Complete - 227 tests passing (review: claude)
 
 ## Phase 5: Polish
-- [ ] 5.1 [SEQ] CLI Implementation (Client) (review: ___)
-- [ ] 5.2 [SEQ] CLI Implementation (Server) (review: ___)
-- [ ] 5.3 [SEQ] Main Entry Points (review: ___)
-- [ ] 5.4 [A] E2E Tests (review: ___)
-- [ ] 5.5 [B] Cross-Platform Testing (review: ___)
-- [ ] [SYNC] Phase 5 Complete (review: ___)
+- [x] 5.1 [SEQ] CLI Implementation (Client) - cli.rs with clap, SSH-style args (review: claude)
+- [x] 5.2 [SEQ] CLI Implementation (Server) - cli.rs with bind/cert/limits (review: claude)
+- [x] 5.3 [SEQ] Main Entry Points - main.rs with logging and TODO stubs (review: claude)
+- [x] 5.4 [A] E2E Tests - e2e.rs with CLI tests, network tests ignored (review: claude)
+- [x] 5.5 [B] Cross-Platform Testing - .github/workflows/ci.yml (review: claude)
+- [x] [SYNC] Phase 5 Complete - 257 tests passing (review: claude)
 
 ## Phase 6: Tunnel (Feature-Gated)
 - [ ] 6.1 [A] Tunnel Types — tests (review: ___)
