@@ -8,7 +8,7 @@ description = "Core library for qsh - protocol, types, terminal state"
 
 [features]
 default = []
-tunnel = []
+tunnel = ["tun"]
 
 [dependencies]
 tokio = { workspace = true }
@@ -23,6 +23,7 @@ tracing-subscriber = { workspace = true }
 vte = { workspace = true }
 unicode-width = { workspace = true }
 ipnet = { workspace = true }
+tun = { workspace = true, optional = true }
 quinn = { workspace = true }
 rustls = { workspace = true }
 sha2 = "0.10"

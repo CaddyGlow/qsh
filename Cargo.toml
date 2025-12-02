@@ -53,6 +53,9 @@ base64 = "0.22"
 # IP networking
 ipnet = { version = "2.9", features = ["serde"] }
 
+# TUN device
+tun = { version = "0.7", features = ["async"] }
+
 # Utilities
 uuid = { version = "1.10", features = ["v4"] }
 shell-escape = "0.1"
