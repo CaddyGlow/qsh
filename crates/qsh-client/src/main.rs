@@ -13,6 +13,7 @@ use qsh_client::{
     Socks5Proxy, SshConfig, StdinReader, StdoutWriter, bootstrap, get_terminal_size,
     restore_terminal,
 };
+use qsh_core::constants::DEFAULT_QUIC_PORT_RANGE;
 use qsh_core::forward::ForwardSpec;
 use qsh_core::protocol::{Message, TermSize};
 
@@ -74,6 +75,7 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
         connect_timeout: std::time::Duration::from_secs(30),
         identity_file: cli.identity.first().cloned(),
         skip_host_key_check: false,
+        port_range: cli.bootstrap_port_range,
         mode: match cli.ssh_bootstrap_mode {
             SshBootstrapMode::Ssh => BootstrapMode::SshCli,
             SshBootstrapMode::Russh => BootstrapMode::Russh,
@@ -89,8 +91,8 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
             warn!(error = %e, "SSH bootstrap failed, attempting direct QUIC connection");
 
             // Try to resolve the address directly
-            // Default QUIC port is 4500
-            let quic_port = 4500;
+            let (default_port, _) = cli.bootstrap_port_range.unwrap_or(DEFAULT_QUIC_PORT_RANGE);
+            let quic_port = default_port;
             let addr = format!("{}:{}", host, quic_port)
                 .to_socket_addrs()
                 .map_err(|e| qsh_core::Error::Transport {

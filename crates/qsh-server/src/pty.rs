@@ -14,9 +14,9 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
-use nix::pty::{openpty, Winsize};
-use nix::sys::signal::{kill, Signal};
-use nix::unistd::{close, dup2, execvp, fork, setsid, ForkResult, Pid};
+use nix::pty::{Winsize, openpty};
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::{ForkResult, Pid, close, dup2, execvp, fork, setsid};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -280,7 +280,7 @@ impl Pty {
 
     /// Check if the child process has exited.
     pub fn try_wait(&self) -> Result<Option<i32>> {
-        use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+        use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 
         match waitpid(self.child_pid, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::Exited(_, code)) => {
@@ -333,7 +333,7 @@ impl Drop for Pty {
 
 /// Set a file descriptor to non-blocking mode.
 fn set_nonblocking(fd: RawFd) -> Result<()> {
-    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
 
     let flags = fcntl(fd, FcntlArg::F_GETFL).map_err(|e| Error::Pty {
         message: format!("fcntl F_GETFL failed: {}", e),

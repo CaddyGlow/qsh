@@ -116,7 +116,7 @@ async fn run_bootstrap(cli: &Cli) -> qsh_core::Result<()> {
     let port = if cli.port == 4433 { 0 } else { cli.port };
 
     // Create bootstrap server
-    let bootstrap = BootstrapServer::new(cli.bind_addr, port).await?;
+    let bootstrap = BootstrapServer::new(cli.bind_addr, port, cli.port_range).await?;
 
     // Output connection info to stdout
     bootstrap.print_response(None)?;

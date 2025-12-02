@@ -177,6 +177,14 @@ pub struct Cli {
     #[arg(short = 'C', long = "compress")]
     pub compress: bool,
 
+    /// Port range to request for bootstrap QUIC listener (START-END)
+    #[arg(
+        long = "bootstrap-port-range",
+        value_parser = parse_port_range,
+        value_name = "START-END"
+    )]
+    pub bootstrap_port_range: Option<(u16, u16)>,
+
     /// Force predictive echo off (safer for password prompts)
     #[arg(long = "no-prediction")]
     pub no_prediction: bool,
@@ -245,6 +253,27 @@ impl Cli {
     }
 }
 
+fn parse_port_range(s: &str) -> Result<(u16, u16), String> {
+    let (start_str, end_str) = s
+        .split_once('-')
+        .ok_or_else(|| "port range must be in START-END form".to_string())?;
+
+    let start: u16 = start_str
+        .parse()
+        .map_err(|e| format!("invalid start port: {}", e))?;
+    let end: u16 = end_str
+        .parse()
+        .map_err(|e| format!("invalid end port: {}", e))?;
+
+    if start == 0 || end == 0 {
+        return Err("ports must be greater than 0".to_string());
+    }
+    if start > end {
+        return Err("start port must be <= end port".to_string());
+    }
+    Ok((start, end))
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -287,6 +316,35 @@ mod tests {
     fn parse_port() {
         let cli = Cli::try_parse_from(["qsh", "-p", "2222", "example.com"]).unwrap();
         assert_eq!(cli.port, 2222);
+    }
+
+    #[test]
+    fn parse_bootstrap_port_range_flag() {
+        let cli = Cli::try_parse_from([
+            "qsh",
+            "--bootstrap-port-range",
+            "15000-15100",
+            "example.com",
+        ])
+        .unwrap();
+        assert_eq!(cli.bootstrap_port_range, Some((15000, 15100)));
+    }
+
+    #[test]
+    fn parse_bootstrap_port_range_invalid() {
+        assert!(
+            Cli::try_parse_from(["qsh", "--bootstrap-port-range", "150-100", "example.com"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "qsh",
+                "--bootstrap-port-range",
+                "not-a-range",
+                "example.com"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

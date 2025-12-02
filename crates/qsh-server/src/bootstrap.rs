@@ -18,7 +18,7 @@ use ring::digest::{self, SHA256};
 use tracing::{debug, info};
 
 use qsh_core::bootstrap::{BootstrapResponse, ServerInfo};
-use qsh_core::constants::{DEFAULT_QUIC_PORT_RANGE, SESSION_KEY_LEN};
+use qsh_core::constants::SESSION_KEY_LEN;
 use qsh_core::error::{Error, Result};
 use qsh_core::transport::server_crypto_config;
 
@@ -43,7 +43,7 @@ impl BootstrapServer {
     ///
     /// Generates a session key and self-signed certificate, then binds to
     /// an available port in the specified range.
-    pub async fn new(bind_ip: IpAddr, port: u16) -> Result<Self> {
+    pub async fn new(bind_ip: IpAddr, port: u16, port_range: (u16, u16)) -> Result<Self> {
         // Generate random session key
         let mut session_key = [0u8; SESSION_KEY_LEN];
         rand::thread_rng().fill(&mut session_key);
@@ -77,7 +77,7 @@ impl BootstrapServer {
         // Find an available port and create endpoint
         let endpoint = if port == 0 {
             // Auto-select from port range
-            find_available_endpoint(bind_ip, DEFAULT_QUIC_PORT_RANGE, server_config)?
+            find_available_endpoint(bind_ip, port_range, server_config)?
         } else {
             // Use specified port
             let addr = SocketAddr::new(bind_ip, port);

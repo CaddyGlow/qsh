@@ -77,14 +77,8 @@ impl LatencyTracker {
             let latency = sent_at.elapsed();
 
             // Update min/max
-            self.min_latency = Some(
-                self.min_latency
-                    .map_or(latency, |min| min.min(latency)),
-            );
-            self.max_latency = Some(
-                self.max_latency
-                    .map_or(latency, |max| max.max(latency)),
-            );
+            self.min_latency = Some(self.min_latency.map_or(latency, |min| min.min(latency)));
+            self.max_latency = Some(self.max_latency.map_or(latency, |max| max.max(latency)));
 
             // Add to samples
             if self.samples.len() < self.max_samples {
@@ -304,8 +298,7 @@ impl ClientConnection {
         let latency_tracker = LatencyTracker::new();
 
         // Create a channel for outgoing messages and spawn a sender task
-        let (outgoing_tx, mut outgoing_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Message>();
+        let (outgoing_tx, mut outgoing_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
         let sender = control.sender();
         let sender_task = tokio::spawn(async move {
             while let Some(msg) = outgoing_rx.recv().await {

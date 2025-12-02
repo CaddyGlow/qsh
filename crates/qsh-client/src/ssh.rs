@@ -50,6 +50,8 @@ pub struct SshConfig {
     pub identity_file: Option<PathBuf>,
     /// Skip host key verification (insecure).
     pub skip_host_key_check: bool,
+    /// Requested bootstrap QUIC port range.
+    pub port_range: Option<(u16, u16)>,
     /// SSH implementation to use for bootstrap.
     pub mode: BootstrapMode,
 }
@@ -60,6 +62,7 @@ impl Default for SshConfig {
             connect_timeout: Duration::from_secs(30),
             identity_file: None,
             skip_host_key_check: false,
+            port_range: None,
             mode: BootstrapMode::SshCli,
         }
     }
@@ -155,7 +158,10 @@ async fn bootstrap_via_ssh_cli(
 
     cmd.arg(remote);
     cmd.arg("qsh-server").arg("--bootstrap");
-    cmd.stdin(Stdio::null());  // Don't inherit stdin - we need it for terminal input
+    if let Some((start, end)) = config.port_range {
+        cmd.arg("--port-range").arg(format!("{}-{}", start, end));
+    }
+    cmd.stdin(Stdio::null()); // Don't inherit stdin - we need it for terminal input
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -204,7 +210,10 @@ async fn bootstrap_via_ssh_cli(
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "terminated by signal".to_string());
             return Err(Error::Transport {
-                message: format!("ssh bootstrap failed with code {}: no output received", code),
+                message: format!(
+                    "ssh bootstrap failed with code {}: no output received",
+                    code
+                ),
             });
         }
 
@@ -300,8 +309,13 @@ async fn bootstrap_via_russh(
         })?;
 
     // Execute qsh-server --bootstrap
+    let mut bootstrap_cmd = "qsh-server --bootstrap".to_string();
+    if let Some((start, end)) = config.port_range {
+        bootstrap_cmd.push_str(&format!(" --port-range {}-{}", start, end));
+    }
+
     channel
-        .exec(true, "qsh-server --bootstrap")
+        .exec(true, bootstrap_cmd.as_str())
         .await
         .map_err(|e| Error::Transport {
             message: format!("failed to execute bootstrap command: {}", e),
@@ -472,6 +486,7 @@ mod tests {
         assert_eq!(config.connect_timeout, Duration::from_secs(30));
         assert!(config.identity_file.is_none());
         assert!(!config.skip_host_key_check);
+        assert!(config.port_range.is_none());
         assert!(matches!(config.mode, BootstrapMode::SshCli));
     }
 

@@ -6,6 +6,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, ValueEnum};
+use qsh_core::constants::DEFAULT_QUIC_PORT_RANGE;
 
 /// Log output format for CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
@@ -45,6 +46,15 @@ pub struct Cli {
     /// Port to listen on (0 = auto-select from range 4500-4600 in bootstrap mode)
     #[arg(short = 'p', long = "port", default_value = "4433")]
     pub port: u16,
+
+    /// Port range to use in bootstrap mode (START-END, inclusive)
+    #[arg(
+        long = "port-range",
+        value_parser = parse_port_range,
+        default_value = "4500-4600",
+        value_name = "START-END"
+    )]
+    pub port_range: (u16, u16),
 
     /// TLS certificate file (PEM format)
     #[arg(short = 'c', long = "cert", value_name = "FILE")]
@@ -152,12 +162,34 @@ impl Cli {
     }
 }
 
+fn parse_port_range(s: &str) -> Result<(u16, u16), String> {
+    let (start_str, end_str) = s
+        .split_once('-')
+        .ok_or_else(|| "port range must be in START-END form".to_string())?;
+
+    let start: u16 = start_str
+        .parse()
+        .map_err(|e| format!("invalid start port: {}", e))?;
+    let end: u16 = end_str
+        .parse()
+        .map_err(|e| format!("invalid end port: {}", e))?;
+
+    if start == 0 || end == 0 {
+        return Err("ports must be greater than 0".to_string());
+    }
+    if start > end {
+        return Err("start port must be <= end port".to_string());
+    }
+    Ok((start, end))
+}
+
 impl Default for Cli {
     fn default() -> Self {
         Self {
             bootstrap: false,
             bind_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             port: 4433,
+            port_range: DEFAULT_QUIC_PORT_RANGE,
             cert_file: None,
             key_file: None,
             self_signed: false,
@@ -202,6 +234,7 @@ mod tests {
         assert!(!cli.bootstrap);
         assert_eq!(cli.bind_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(cli.port, 4433);
+        assert_eq!(cli.port_range, DEFAULT_QUIC_PORT_RANGE);
         assert_eq!(cli.max_connections, 100);
         assert_eq!(cli.max_forwards, 10);
         assert!(!cli.allow_remote_forwards);
@@ -226,6 +259,19 @@ mod tests {
             cli.socket_addr(),
             "127.0.0.1:8443".parse::<SocketAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn parse_port_range_flag() {
+        let cli = Cli::try_parse_from(["qsh-server", "--port-range", "15000-15100"]).unwrap();
+        assert_eq!(cli.port_range, (15000, 15100));
+    }
+
+    #[test]
+    fn parse_invalid_port_range() {
+        assert!(Cli::try_parse_from(["qsh-server", "--port-range", "15100-15000"]).is_err());
+        assert!(Cli::try_parse_from(["qsh-server", "--port-range", "0-10"]).is_err());
+        assert!(Cli::try_parse_from(["qsh-server", "--port-range", "not-a-range"]).is_err());
     }
 
     #[test]
