@@ -286,7 +286,8 @@ impl Connection for QuicConnection {
                 let (send, recv) = bi.map_err(|e| Error::Transport {
                     message: format!("failed to accept stream: {}", e),
                 })?;
-                let stream_id = send.id().index();
+                // Use the full QUIC stream ID (includes initiator + direction bits)
+                let stream_id: u64 = send.id().into();
                 let stream_type = map_bidi_stream_type(stream_id, &self.next_forward_id).await;
                 Ok((stream_type, QuicStream::new(send, recv)))
             }
@@ -294,7 +295,8 @@ impl Connection for QuicConnection {
                 let recv = uni.map_err(|e| Error::Transport {
                     message: format!("failed to accept unidirectional stream: {}", e),
                 })?;
-                let stream_id = recv.id().index();
+                // Use the full QUIC stream ID (includes initiator + direction bits)
+                let stream_id: u64 = recv.id().into();
                 let stream_type = map_uni_stream_type(stream_id);
                 Ok((stream_type, QuicStream::from_recv(recv)))
             }

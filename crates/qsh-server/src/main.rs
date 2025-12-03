@@ -10,7 +10,7 @@ use quinn::{Endpoint, ServerConfig};
 use tracing::{debug, error, info, warn};
 
 use qsh_core::protocol::{Capabilities, Message, ResizePayload, ShutdownReason};
-use qsh_core::transport::{Connection, StreamType, server_crypto_config};
+use qsh_core::transport::{Connection, StreamPair, StreamType, server_crypto_config};
 use qsh_server::{
     BootstrapServer, Cli, ForwardHandler, Pty, PtyRelay, ServerSession, SessionConfig,
 };
@@ -287,6 +287,10 @@ async fn handle_session(mut session: ServerSession) -> qsh_core::Result<()> {
     // Start PTY relay
     let mut relay = PtyRelay::start(pty.clone());
 
+    // Channel for terminal input messages (from client -> server)
+    let (input_tx, mut input_rx) =
+        tokio::sync::mpsc::unbounded_channel::<qsh_core::protocol::TerminalInputPayload>();
+
     // Create forward handler with shared connection
     let quic_conn = session.quic_connection();
     let forward_handler = Arc::new(ForwardHandler::new(
@@ -294,22 +298,47 @@ async fn handle_session(mut session: ServerSession) -> qsh_core::Result<()> {
         session.max_forwards(),
     ));
 
-    // Spawn a task to accept forward streams
+    // Spawn a task to accept forward streams and terminal input stream
     let accept_quic = quic_conn.clone();
     let accept_handler = Arc::clone(&forward_handler);
+    let terminal_input_tx = input_tx.clone();
     let accept_task = tokio::spawn(async move {
         loop {
             match accept_quic.accept_stream().await {
-                Ok((stream_type, stream)) => {
-                    if matches!(stream_type, StreamType::Forward(_)) {
+                Ok((stream_type, stream)) => match stream_type {
+                    StreamType::Forward(_) => {
                         let handler = Arc::clone(&accept_handler);
                         tokio::spawn(async move {
                             handler.handle_stream(stream_type, stream).await;
                         });
-                    } else {
-                        warn!(stream_type = ?stream_type, "Unexpected stream type from accept");
                     }
-                }
+                    StreamType::TerminalIn => {
+                        let mut stream = stream;
+                        let tx = terminal_input_tx.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                match stream.recv().await {
+                                    Ok(Message::TerminalInput(input)) => {
+                                        if tx.send(input).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Ok(other) => {
+                                        tracing::warn!(?other, "Unexpected message on terminal input stream");
+                                    }
+                                    Err(qsh_core::Error::ConnectionClosed) => break,
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "Terminal input stream error");
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    other => {
+                        warn!(stream_type = ?other, "Unexpected stream type from accept");
+                    }
+                },
                 Err(e) => {
                     // Stream accept error - might be connection closing
                     if !matches!(e, qsh_core::Error::ConnectionClosed) {
@@ -330,10 +359,10 @@ async fn handle_session(mut session: ServerSession) -> qsh_core::Result<()> {
             // Use biased selection to prioritize client input for low latency
             biased;
 
-            // Handle client messages (highest priority - user input)
-            msg = session.process_control() => {
-                match msg {
-                    Ok(Some(Message::TerminalInput(input))) => {
+            // Handle terminal input stream (client -> server)
+            input = input_rx.recv() => {
+                match input {
+                    Some(input) => {
                         debug!(
                             seq = input.sequence,
                             len = input.data.len(),
@@ -346,6 +375,16 @@ async fn handle_session(mut session: ServerSession) -> qsh_core::Result<()> {
                             break;
                         }
                     }
+                    None => {
+                        info!("Terminal input stream closed");
+                        break;
+                    }
+                }
+            }
+
+            // Handle control messages (resize, ping, shutdown)
+            msg = session.process_control() => {
+                match msg {
                     Ok(Some(Message::Resize(ResizePayload { cols, rows }))) => {
                         debug!(cols, rows, "Terminal resize requested");
                         // TODO: implement PTY resize (needs interior mutability)
@@ -359,8 +398,21 @@ async fn handle_session(mut session: ServerSession) -> qsh_core::Result<()> {
                         info!("Client requested shutdown");
                         break;
                     }
+                    Ok(Some(Message::TerminalInput(input))) => {
+                        debug!(
+                            seq = input.sequence,
+                            len = input.data.len(),
+                            data = ?&input.data[..input.data.len().min(32)],
+                            "Terminal input received on control stream (legacy)"
+                        );
+                        last_input_seq = input.sequence;
+                        if let Err(e) = relay.send_input(input.data).await {
+                            error!(error = %e, "Failed to send input to PTY");
+                            break;
+                        }
+                    }
                     Ok(Some(other)) => {
-                        warn!(msg = ?other, "Unexpected message");
+                        warn!(msg = ?other, "Unexpected control message");
                     }
                     Ok(None) => {
                         // Connection closed
