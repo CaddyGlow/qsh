@@ -1046,6 +1046,12 @@ When run with --bootstrap flag:
 6. Wait for single client connection
 7. Transition to session mode
 
+Runtime guardrails:
+- A per-UID FIFO at `/tmp/qsh-server-$UID` lets additional `--bootstrap` invocations reuse a running instance. New calls write to the pipe, the live server returns fresh JSON (new session key, same port/cert) instead of spawning another daemon.
+- If the pipe is absent or unresponsive, a new bootstrap instance creates it and becomes the owner (stale pipes are removed).
+- Detached sessions linger for 48h by default (override with `--session-linger` or `QSH_SESSION_LINGER_SECS`); a registry keeps PTYs alive, enforces single attachment, and garbage-collects idle entries after the linger window.
+- Registry tracks last activity on input/output/resize/ping, carries terminal state parser, and on PTY exit immediately removes the entry and signals attached clients with Shutdown(ShellExited).
+
 ```rust
 pub struct BootstrapServer {
     session_key: [u8; 32],

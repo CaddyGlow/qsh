@@ -901,6 +901,7 @@ qsh-server [OPTIONS]
 OPTIONS:
     --bootstrap                 Run in bootstrap mode (started via SSH)
     --session-timeout <SECS>    Idle timeout [default: 86400 (24h)]
+    --session-linger <SECS>     Keep detached sessions alive [default: 172800 (48h), env: QSH_SESSION_LINGER_SECS]
     --max-forwards <N>          Maximum concurrent forwards [default: 100]
     
     --allow-tunnel              Enable IP tunnel support (Linux only)
@@ -921,6 +922,8 @@ OPTIONS:
     -h, --help                  Print help
     -V, --version               Print version
 ```
+
+Bootstrap reuse: a running `qsh-server --bootstrap` publishes a FIFO at `/tmp/qsh-server-$UID`. New bootstrap invocations write to the pipe and receive a fresh session key/json from the live instance instead of spawning another daemon; if the pipe is missing or unresponsive, a new server is started.
 
 ### 10.3 Usage Examples
 

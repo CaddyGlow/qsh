@@ -12,7 +12,8 @@ use tracing::{debug, error, info, warn};
 use qsh_core::protocol::{Capabilities, Message, ResizePayload, ShutdownReason};
 use qsh_core::transport::{Connection, StreamPair, StreamType, server_crypto_config};
 use qsh_server::{
-    BootstrapServer, Cli, ForwardHandler, Pty, PtyRelay, ServerSession, SessionConfig,
+    BootstrapServer, Cli, ForwardHandler, PendingSession, RealSessionSpawner, ServerSession,
+    SessionAuthorizer, SessionConfig, SessionRegistry,
 };
 
 fn main() {
@@ -113,21 +114,38 @@ fn main() {
 /// 4. Accepts a single connection
 /// 5. Handles that session then exits
 async fn run_bootstrap(cli: &Cli) -> qsh_core::Result<()> {
+    // First, see if an instance is already running for this user and ask it
+    // for a new session key via the pipe.
+    let pipe_path = qsh_server::bootstrap::bootstrap_pipe_path();
+    if let Some(json) = qsh_server::bootstrap::try_existing_bootstrap(&pipe_path).await? {
+        println!("{}", json);
+        return Ok(());
+    }
+
     // Use port 0 to auto-select from range, or specified port
     let port = if cli.port == 4433 { 0 } else { cli.port };
 
     // Create bootstrap server
-    let bootstrap = BootstrapServer::new(cli.bind_addr, port, cli.port_range).await?;
+    let bootstrap = Arc::new(BootstrapServer::new(cli.bind_addr, port, cli.port_range).await?);
+
+    // Authorize the initial session key and keep registry aligned.
+    let authorizer = Arc::new(SessionAuthorizer::new());
+    authorizer.allow(bootstrap.session_key()).await;
+
+    // Create pipe for subsequent bootstrap requests and start listener.
+    let _pipe_guard = qsh_server::bootstrap::create_pipe(&pipe_path).map_err(|e| {
+        qsh_core::Error::Transport {
+            message: format!("failed to create bootstrap pipe: {}", e),
+        }
+    })?;
+    let _pipe_task =
+        qsh_server::bootstrap::spawn_pipe_listener(pipe_path, bootstrap.clone(), authorizer.clone());
 
     // Output connection info to stdout
     bootstrap.print_response(None)?;
 
-    // Accept single connection
-    let conn = bootstrap.accept().await?;
-    let session_key = bootstrap.session_key();
-
-    // Create QUIC connection wrapper
-    let quic = qsh_core::transport::QuicConnection::new(conn);
+    let endpoint = bootstrap.endpoint();
+    let registry = build_registry(cli);
 
     // Build session config
     let session_config = SessionConfig {
@@ -142,16 +160,7 @@ async fn run_bootstrap(cli: &Cli) -> qsh_core::Result<()> {
         allow_remote_forwards: cli.allow_remote_forwards,
     };
 
-    // Accept session with expected key
-    let session = ServerSession::accept(quic, Some(session_key), session_config).await?;
-
-    // Handle the session
-    handle_session(session).await?;
-
-    // Clean up
-    bootstrap.close();
-
-    Ok(())
+    serve_endpoint(endpoint, session_config, registry, Some(authorizer)).await
 }
 
 async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
@@ -211,8 +220,6 @@ async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
             message: format!("failed to bind server: {}", e),
         })?;
 
-    info!(addr = %bind_addr, "Server listening");
-
     // Build session config
     let session_config = SessionConfig {
         capabilities: Capabilities {
@@ -226,6 +233,33 @@ async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
         allow_remote_forwards: cli.allow_remote_forwards,
     };
 
+    let registry = build_registry(cli);
+
+    serve_endpoint(endpoint, session_config, registry, None).await
+}
+
+fn build_registry(cli: &Cli) -> Arc<SessionRegistry> {
+    let env_vars = cli.parse_env_vars();
+    let shell = cli
+        .shell
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
+    let spawner = Arc::new(RealSessionSpawner { shell, env: env_vars });
+    Arc::new(SessionRegistry::new(
+        cli.session_linger_duration(),
+        spawner,
+    ))
+}
+
+async fn serve_endpoint(
+    endpoint: Endpoint,
+    session_config: SessionConfig,
+    registry: Arc<SessionRegistry>,
+    authorizer: Option<Arc<SessionAuthorizer>>,
+) -> qsh_core::Result<()> {
+    let addr = endpoint.local_addr().ok();
+    info!(?addr, "Server listening");
+
     // Accept connections
     loop {
         let incoming = match endpoint.accept().await {
@@ -237,9 +271,10 @@ async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
         };
 
         let config = session_config.clone();
-
+        let registry = registry.clone();
+        let authorizer = authorizer.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(incoming, config).await {
+            if let Err(e) = handle_connection(incoming, config, registry, authorizer).await {
                 error!(error = %e, "Connection handler error");
             }
         });
@@ -251,6 +286,8 @@ async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
 async fn handle_connection(
     incoming: quinn::Incoming,
     config: SessionConfig,
+    registry: Arc<SessionRegistry>,
+    authorizer: Option<Arc<SessionAuthorizer>>,
 ) -> qsh_core::Result<()> {
     let addr = incoming.remote_address();
     info!(addr = %addr, "Incoming connection");
@@ -261,38 +298,27 @@ async fn handle_connection(
 
     let quic = qsh_core::transport::QuicConnection::new(conn);
 
-    // Accept session (no expected key for now - would come from bootstrap)
-    let session = ServerSession::accept(quic, None, config).await?;
+    let pending = PendingSession::new(quic, authorizer, config).await?;
+    let attach = registry.prepare(pending.hello()).await?;
+    let parser = attach.parser.clone();
+    let initial_state = attach.initial_state.clone();
+    let session = pending.accept(parser, initial_state).await?;
 
     // Handle the session
-    handle_session(session).await
+    handle_session(session, attach, registry).await
 }
 
 /// Handle an established session (shared between bootstrap and normal modes).
-async fn handle_session(mut session: ServerSession) -> qsh_core::Result<()> {
+async fn handle_session(
+    mut session: ServerSession,
+    mut attach: qsh_server::registry::SessionAttach,
+    registry: Arc<SessionRegistry>,
+) -> qsh_core::Result<()> {
     info!(
         addr = %session.remote_addr(),
         rtt = ?session.rtt(),
-        "Session established"
+        "Session attached"
     );
-
-    // Get terminal size from session
-    let (cols, rows) = session.term_size();
-
-    // Spawn PTY with user's shell
-    let pty = match Pty::spawn(cols, rows, None, &[]) {
-        Ok(pty) => Arc::new(pty),
-        Err(e) => {
-            error!(error = %e, "Failed to spawn PTY");
-            session.close();
-            return Err(e);
-        }
-    };
-
-    info!(cols, rows, "PTY spawned");
-
-    // Start PTY relay
-    let mut relay = PtyRelay::start(pty.clone());
 
     // Channel for terminal input messages (from client -> server)
     let (input_tx, mut input_rx) =
@@ -360,8 +386,11 @@ async fn handle_session(mut session: ServerSession) -> qsh_core::Result<()> {
         }
     });
 
-    // Track input sequence for confirmation
-    let mut last_input_seq = 0u64;
+    let mut last_input_seq = attach.last_input_seq;
+    let mut output_rx = attach.output_rx;
+    let entry = attach.entry.clone();
+    let stop_fut = attach.guard.stopped();
+    tokio::pin!(stop_fut);
 
     // Main session loop
     loop {
@@ -380,7 +409,8 @@ async fn handle_session(mut session: ServerSession) -> qsh_core::Result<()> {
                             "Received terminal input from client"
                         );
                         last_input_seq = input.sequence;
-                        if let Err(e) = relay.send_input(input.data).await {
+                        entry.record_input_seq(last_input_seq).await;
+                        if let Err(e) = entry.send_input(input.data).await {
                             error!(error = %e, "Failed to send input to PTY");
                             break;
                         }
@@ -397,15 +427,26 @@ async fn handle_session(mut session: ServerSession) -> qsh_core::Result<()> {
                 match msg {
                     Ok(Some(Message::Resize(ResizePayload { cols, rows }))) => {
                         debug!(cols, rows, "Terminal resize requested");
-                        // TODO: implement PTY resize (needs interior mutability)
+                        if let Err(e) = entry.resize(cols, rows) {
+                            warn!(error = %e, "Failed to resize PTY");
+                        } else {
+                            entry.touch().await;
+                        }
                     }
                     Ok(Some(Message::Ping(timestamp))) => {
+                        entry.touch().await;
                         if let Err(e) = session.send_pong(timestamp).await {
                             warn!(error = %e, "Failed to send pong");
                         }
                     }
-                    Ok(Some(Message::Shutdown(_))) => {
-                        info!("Client requested shutdown");
+                    Ok(Some(Message::Shutdown(payload))) => {
+                        info!(reason = ?payload.reason, "Client requested shutdown");
+                        if matches!(payload.reason, ShutdownReason::UserRequested) {
+                            entry.touch().await;
+                        } else {
+                            let key = entry.key();
+                            registry.close_entry(&key).await;
+                        }
                         break;
                     }
                     Ok(Some(Message::TerminalInput(input))) => {
@@ -416,7 +457,8 @@ async fn handle_session(mut session: ServerSession) -> qsh_core::Result<()> {
                             "Terminal input received on control stream (legacy)"
                         );
                         last_input_seq = input.sequence;
-                        if let Err(e) = relay.send_input(input.data).await {
+                        entry.record_input_seq(last_input_seq).await;
+                        if let Err(e) = entry.send_input(input.data).await {
                             error!(error = %e, "Failed to send input to PTY");
                             break;
                         }
@@ -437,9 +479,9 @@ async fn handle_session(mut session: ServerSession) -> qsh_core::Result<()> {
             }
 
             // Handle PTY output -> send to client
-            output = relay.recv_output() => {
+            output = output_rx.recv() => {
                 match output {
-                    Some(data) if !data.is_empty() => {
+                    Ok(data) if !data.is_empty() => {
                         debug!(
                             len = data.len(),
                             data = ?&data[..data.len().min(32)],
@@ -451,37 +493,41 @@ async fn handle_session(mut session: ServerSession) -> qsh_core::Result<()> {
                             break;
                         }
                     }
-                    Some(_) => {
-                        // Empty data, continue
-                    }
-                    None => {
-                        // PTY closed - shell exited
-                        let exit_code = pty.try_wait().ok().flatten();
-                        info!(exit_code = exit_code, "PTY closed, sending shutdown to client");
-
-                        // Send shutdown message to client
-                        let msg = format!("shell exited{}",
-                            exit_code.map(|c| format!(" with code {}", c)).unwrap_or_default());
-                        if let Err(e) = session.send_shutdown(ShutdownReason::ShellExited, Some(msg)).await {
-                            warn!(error = %e, "Failed to send shutdown message");
-                        }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        info!("Output stream closed");
                         break;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(skipped, "Terminal output lagged");
                     }
                 }
             }
 
-            // Check if PTY child exited
-            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                if let Ok(Some(code)) = pty.try_wait() {
-                    info!(exit_code = code, "Shell exited, sending shutdown to client");
-
-                    // Send shutdown message to client
-                    let msg = format!("shell exited with code {}", code);
-                    if let Err(e) = session.send_shutdown(ShutdownReason::ShellExited, Some(msg)).await {
-                        warn!(error = %e, "Failed to send shutdown message");
+            stop_reason = &mut stop_fut => {
+                if let Some(reason) = stop_reason {
+                    match reason {
+                        qsh_server::registry::AttachmentStopReason::PtyExited => {
+                            if let Err(e) = session.send_shutdown(ShutdownReason::ShellExited, Some("shell exited".to_string())).await {
+                                warn!(error = %e, "Failed to send shutdown message");
+                            }
+                        }
+                        qsh_server::registry::AttachmentStopReason::Replaced => {
+                            let _ = session.send_shutdown(
+                                ShutdownReason::ServerShutdown,
+                                Some("Session replaced by another client".to_string()),
+                            ).await;
+                        }
+                        qsh_server::registry::AttachmentStopReason::RegistryShutdown |
+                        qsh_server::registry::AttachmentStopReason::ExplicitClose => {
+                            let _ = session.send_shutdown(
+                                ShutdownReason::ServerShutdown,
+                                Some("Session closed".to_string()),
+                            ).await;
+                        }
                     }
-                    break;
                 }
+                break;
             }
         }
     }
@@ -489,9 +535,7 @@ async fn handle_session(mut session: ServerSession) -> qsh_core::Result<()> {
     // Stop the accept task
     accept_task.abort();
 
-    // Clean up
-    drop(relay); // Stop relay tasks by dropping it
-    let _ = pty.kill();
+    entry.touch().await;
     session.close();
 
     Ok(())

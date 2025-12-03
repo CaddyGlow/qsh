@@ -410,7 +410,9 @@ async fn attempt_reconnect(
         handle.abort();
     }
 
+    overlay.set_visible(true);
     overlay.set_status(ConnectionStatus::Reconnecting);
+    overlay.set_message(Some("connection lost, attempting reconnect...".to_string()));
     render_overlay_if_visible(overlay, stdout).await;
 
     if let Err(e) = conn
@@ -424,6 +426,7 @@ async fn attempt_reconnect(
         .await
     {
         overlay.set_status(ConnectionStatus::Disconnected);
+        overlay.set_message(Some(format!("reconnect failed: {}", e)));
         render_overlay_if_visible(overlay, stdout).await;
         return Err(e);
     }
@@ -431,6 +434,7 @@ async fn attempt_reconnect(
     overlay.metrics_mut().record_reconnect();
     overlay.metrics_mut().update_rtt(conn.rtt());
     overlay.set_status(ConnectionStatus::Connected);
+    overlay.clear_message();
 
     *forward_handles = spawn_forwarders(cli, conn.quic_connection()).await;
     render_overlay_if_visible(overlay, stdout).await;

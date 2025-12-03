@@ -135,6 +135,10 @@ Client executes on server via SSH:
 qsh-server --bootstrap [--port-range 4500-4600]
 ```
 
+If a bootstrap instance is already running for the same UID, new `--bootstrap`
+invocations write to the FIFO `/tmp/qsh-server-$UID` and receive a fresh
+response (new session key, same listener) without spawning another daemon.
+
 #### Bootstrap Response
 
 Server writes to stdout (JSON, single line):
@@ -168,6 +172,19 @@ After bootstrap, client connects via QUIC:
 5. Server validates session key
 6. Server sends `HelloAck` with initial terminal state
 7. Session is established
+
+### 2.3.1 Reattach / Session Persistence
+
+- The server keeps PTYs alive in a session registry keyed by `session_key`.
+- Only one attachment is active per session; a new attach with the same key
+  replaces the prior client.
+- `Hello` with a known `session_key` reuses the existing PTY and sends the
+  current terminal state; no respawn occurs.
+- Detached sessions linger for 48h by default (configurable via
+  `--session-linger` or `QSH_SESSION_LINGER_SECS`); if idle longer with no
+  attachment, the entry is destroyed.
+- PTY exit immediately tears down the registry entry and notifies any attached
+  client with `Shutdown(ShellExited)`.
 
 ### 2.4 Session Termination
 

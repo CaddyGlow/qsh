@@ -4,6 +4,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::{ArgAction, Parser, ValueEnum};
 use qsh_core::constants::DEFAULT_QUIC_PORT_RANGE;
@@ -125,6 +126,15 @@ pub struct Cli {
     #[cfg(feature = "tunnel")]
     #[arg(long = "allow-tunnel")]
     pub allow_tunnel: bool,
+
+    /// Linger duration for detached sessions (seconds).
+    #[arg(
+        long = "session-linger",
+        default_value = "172800",
+        value_name = "SECONDS",
+        env = "QSH_SESSION_LINGER_SECS"
+    )]
+    pub session_linger_secs: u64,
 }
 
 impl Cli {
@@ -159,6 +169,11 @@ impl Cli {
     /// Check if TLS credentials are provided or should be generated.
     pub fn has_tls_config(&self) -> bool {
         self.cert_file.is_some() && self.key_file.is_some()
+    }
+
+    /// Get the session linger as a [`Duration`].
+    pub fn session_linger_duration(&self) -> Duration {
+        Duration::from_secs(self.session_linger_secs)
     }
 }
 
@@ -209,6 +224,7 @@ impl Default for Cli {
             tunnel_config: None,
             #[cfg(feature = "tunnel")]
             allow_tunnel: false,
+            session_linger_secs: 172_800,
         }
     }
 }
@@ -242,6 +258,7 @@ mod tests {
         assert!(!cli.foreground);
         assert!(!cli.compress);
         assert!(!cli.ipv6);
+        assert_eq!(cli.session_linger_secs, 172_800);
     }
 
     #[test]

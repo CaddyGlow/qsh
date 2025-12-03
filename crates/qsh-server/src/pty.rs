@@ -12,7 +12,7 @@ use std::ffi::CString;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use nix::pty::{Winsize, openpty};
 use nix::sys::signal::{Signal, kill};
@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use qsh_core::error::{Error, Result};
+use std::time::{Duration, Instant};
 
 /// PTY handle for async I/O.
 ///
@@ -33,8 +34,7 @@ pub struct Pty {
     /// Child process PID.
     child_pid: Pid,
     /// Terminal size.
-    cols: u16,
-    rows: u16,
+    size: Mutex<(u16, u16)>,
     /// Raw master fd for ioctl operations.
     master_fd: RawFd,
 }
@@ -128,8 +128,7 @@ impl Pty {
                 Ok(Self {
                     master: Arc::new(async_fd),
                     child_pid: child,
-                    cols,
-                    rows,
+                    size: Mutex::new((cols, rows)),
                     master_fd,
                 })
             }
@@ -191,9 +190,9 @@ impl Pty {
     }
 
     /// Resize the PTY.
-    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
-        self.cols = cols;
-        self.rows = rows;
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        let mut size = self.size.lock().unwrap();
+        *size = (cols, rows);
 
         let winsize = Winsize {
             ws_row: rows,
@@ -303,7 +302,7 @@ impl Pty {
         }
     }
 
-    /// Kill the child process.
+    /// Kill the child process and return immediately.
     pub fn kill(&self) -> Result<()> {
         kill(self.child_pid, Signal::SIGTERM).map_err(|e| Error::Pty {
             message: format!("failed to kill child: {}", e),
@@ -311,9 +310,23 @@ impl Pty {
         Ok(())
     }
 
+    /// Wait for the child to exit (best-effort, bounded by timeout).
+    pub fn wait_reap(&self, timeout: Duration) -> Result<Option<i32>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(code) = self.try_wait()? {
+                return Ok(Some(code));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Get the current terminal size.
     pub fn size(&self) -> (u16, u16) {
-        (self.cols, self.rows)
+        *self.size.lock().unwrap()
     }
 
     /// Get the child process PID.
@@ -327,6 +340,7 @@ impl Drop for Pty {
         // Try to kill the child process if still running
         if self.try_wait().ok().flatten().is_none() {
             let _ = self.kill();
+            let _ = self.wait_reap(Duration::from_secs(1));
         }
     }
 }
@@ -431,6 +445,22 @@ impl PtyRelay {
     pub async fn recv_output(&mut self) -> Option<Vec<u8>> {
         self.output_rx.recv().await
     }
+
+    /// Get a clone of the input sender for integration with external
+    /// session management (e.g., registries).
+    pub fn input_sender(&self) -> mpsc::Sender<Vec<u8>> {
+        self.input_tx.clone()
+    }
+
+    /// Consume the relay and return the output receiver.
+    pub fn into_output_receiver(self) -> mpsc::Receiver<Vec<u8>> {
+        self.output_rx
+    }
+
+    /// Split the relay into an input sender and output receiver.
+    pub fn split(self) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+        (self.input_tx, self.output_rx)
+    }
 }
 
 // =============================================================================
@@ -456,7 +486,7 @@ mod tests {
 
     #[tokio::test]
     async fn pty_size_tracking() {
-        if let Ok(mut pty) = Pty::spawn(80, 24, Some("/bin/sh"), &[]) {
+        if let Ok(pty) = Pty::spawn(80, 24, Some("/bin/sh"), &[]) {
             assert_eq!(pty.size(), (80, 24));
             let _ = pty.resize(120, 40);
             assert_eq!(pty.size(), (120, 40));

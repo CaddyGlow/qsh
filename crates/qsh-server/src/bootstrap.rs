@@ -10,17 +10,26 @@
 
 use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use quinn::{Endpoint, IdleTimeout, ServerConfig, TransportConfig};
 use rand::Rng;
 use ring::digest::{self, SHA256};
+use tokio::fs::OpenOptions;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::task::JoinHandle;
 use tracing::{debug, info};
 
 use qsh_core::bootstrap::{BootstrapResponse, ServerInfo};
 use qsh_core::constants::SESSION_KEY_LEN;
 use qsh_core::error::{Error, Result};
 use qsh_core::transport::server_crypto_config;
+use crate::session::SessionAuthorizer;
+use nix::sys::stat::Mode;
+use nix::unistd::mkfifo;
+use libc;
 
 /// Bootstrap server that handles single-connection bootstrap mode.
 pub struct BootstrapServer {
@@ -138,13 +147,27 @@ impl BootstrapServer {
         self.bind_addr.port()
     }
 
+    /// Clone the endpoint (keeps the listener alive while self is held).
+    pub fn endpoint(&self) -> Endpoint {
+        self.endpoint.clone()
+    }
+
     /// Generate the bootstrap response JSON.
     pub fn response(&self, external_addr: Option<&str>) -> BootstrapResponse {
+        self.response_for_key(self.session_key, external_addr)
+    }
+
+    /// Build a response for a specific session key (used for additional bootstrap requests).
+    pub fn response_for_key(
+        &self,
+        session_key: [u8; SESSION_KEY_LEN],
+        external_addr: Option<&str>,
+    ) -> BootstrapResponse {
         let address = external_addr
             .map(|s| s.to_string())
             .unwrap_or_else(|| self.bind_addr.ip().to_string());
 
-        let server_info = ServerInfo::new(address, self.port(), self.session_key, &self.cert_hash);
+        let server_info = ServerInfo::new(address, self.port(), session_key, &self.cert_hash);
 
         BootstrapResponse::ok(server_info)
     }
@@ -181,6 +204,145 @@ impl BootstrapServer {
         self.endpoint
             .close(quinn::VarInt::from_u32(0), b"bootstrap complete");
     }
+}
+
+/// Compute the per-UID bootstrap pipe path.
+pub fn bootstrap_pipe_path() -> PathBuf {
+    let uid = unsafe { libc::geteuid() as u32 };
+    PathBuf::from(format!("/tmp/qsh-server-{}.pipe", uid))
+}
+
+/// Try to use an existing bootstrap instance by sending a request down the pipe.
+/// Returns the JSON response if successful.
+pub async fn try_existing_bootstrap(pipe_path: &Path) -> Result<Option<String>> {
+    if !pipe_path.exists() {
+        return Ok(None);
+    }
+
+    let open_result = tokio::time::timeout(
+        Duration::from_secs(1),
+        OpenOptions::new().read(true).write(true).open(pipe_path),
+    )
+    .await;
+
+    let file = match open_result {
+        Ok(Ok(f)) => f,
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, "Failed to open existing bootstrap pipe");
+            return Ok(None);
+        }
+        Err(_) => {
+            tracing::debug!("Timed out opening existing bootstrap pipe");
+            return Ok(None);
+        }
+    };
+
+    let (reader, mut writer) = tokio::io::split(file);
+    let mut reader = BufReader::new(reader);
+
+    if let Err(e) = writer.write_all(b"new\n").await {
+        tracing::debug!(error = %e, "Failed to write request to bootstrap pipe");
+        return Ok(None);
+    }
+
+    let mut line = String::new();
+    match tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line)).await {
+        Ok(Ok(0)) => Ok(None),
+        Ok(Ok(_)) => {
+            let trimmed = line.trim_end();
+            // Ignore self-echoes or garbage; only accept valid JSON.
+            if trimmed.is_empty()
+                || serde_json::from_str::<BootstrapResponse>(trimmed).is_err()
+            {
+                tracing::debug!("Bootstrap pipe returned non-JSON response, ignoring");
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, "Failed to read bootstrap response");
+            Ok(None)
+        }
+        Err(_) => {
+            tracing::debug!("Timed out waiting for bootstrap response");
+            Ok(None)
+        }
+    }
+}
+
+/// Ensure the pipe exists for the current server instance.
+pub fn create_pipe(path: &Path) -> io::Result<PipeGuard> {
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    mkfifo(path, Mode::from_bits_truncate(0o600))
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    Ok(PipeGuard {
+        path: path.to_path_buf(),
+    })
+}
+
+/// RAII guard that cleans up the pipe on drop.
+pub struct PipeGuard {
+    path: PathBuf,
+}
+
+impl Drop for PipeGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Spawn a background task to serve bootstrap requests via the named pipe.
+pub fn spawn_pipe_listener(
+    pipe_path: PathBuf,
+    bootstrap: Arc<BootstrapServer>,
+    authorizer: Arc<SessionAuthorizer>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let file = match OpenOptions::new().read(true).write(true).open(&pipe_path).await {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Bootstrap pipe open failed");
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+            };
+
+            let (reader, mut writer) = tokio::io::split(file);
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+
+            match reader.read_line(&mut line).await {
+                Ok(0) => {
+                    // Writer closed
+                    continue;
+                }
+                Ok(_) => {
+                    let key = authorizer.allow_random().await;
+                    let response = bootstrap.response_for_key(key, None);
+                    match response.to_json() {
+                        Ok(json) => {
+                            if let Err(e) = writer.write_all(json.as_bytes()).await {
+                                tracing::warn!(error = %e, "Failed to write pipe response");
+                            } else {
+                                let _ = writer.write_all(b"\n").await;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Failed to serialize bootstrap response");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to read bootstrap pipe request");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    })
 }
 
 /// Find an available port in the given range and return a bound endpoint.

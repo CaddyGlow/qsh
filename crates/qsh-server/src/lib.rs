@@ -12,10 +12,12 @@ pub mod bootstrap;
 pub mod cli;
 pub mod forward;
 pub mod pty;
+pub mod registry;
 pub mod session;
 
 pub use bootstrap::BootstrapServer;
 pub use cli::Cli;
 pub use forward::ForwardHandler;
 pub use pty::{Pty, PtyRelay};
-pub use session::{ServerSession, SessionConfig};
+pub use registry::{RealSessionSpawner, SessionRegistry};
+pub use session::{PendingSession, ServerSession, SessionAuthorizer, SessionConfig};

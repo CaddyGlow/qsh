@@ -6,20 +6,24 @@
 //! - State tracking and updates
 //! - Reconnection handling
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
-    Capabilities, HelloAckPayload, Message, ShutdownPayload, ShutdownReason, StateDiff,
-    StateUpdatePayload, TerminalOutputPayload,
+    Capabilities, HelloAckPayload, HelloPayload, Message, ShutdownPayload, ShutdownReason,
+    StateDiff, StateUpdatePayload, TerminalOutputPayload,
 };
+use qsh_core::constants::SESSION_KEY_LEN;
 use qsh_core::session::SessionState;
 use qsh_core::terminal::{TerminalParser, TerminalState};
 use qsh_core::transport::{Connection, QuicConnection, QuicStream, StreamPair, StreamType};
+use rand::Rng;
 
 /// Server session configuration.
 #[derive(Debug, Clone)]
@@ -71,11 +75,52 @@ pub struct ServerSession {
     term_size: (u16, u16),
 }
 
-impl ServerSession {
-    /// Accept a new session from an incoming connection.
-    pub async fn accept(
+/// Controls which session keys may attach.
+#[derive(Debug, Default)]
+pub struct SessionAuthorizer {
+    allowed: RwLock<HashSet<[u8; SESSION_KEY_LEN]>>,
+}
+
+impl SessionAuthorizer {
+    /// Create a new authorizer.
+    pub fn new() -> Self {
+        Self {
+            allowed: RwLock::new(HashSet::new()),
+        }
+    }
+
+    /// Allow a specific session key.
+    pub async fn allow(&self, key: [u8; SESSION_KEY_LEN]) {
+        self.allowed.write().await.insert(key);
+    }
+
+    /// Generate and allow a new random session key.
+    pub async fn allow_random(&self) -> [u8; SESSION_KEY_LEN] {
+        let mut key = [0u8; SESSION_KEY_LEN];
+        rand::thread_rng().fill(&mut key);
+        self.allow(key).await;
+        key
+    }
+
+    /// Check whether a key is allowed.
+    pub async fn is_allowed(&self, key: &[u8; SESSION_KEY_LEN]) -> bool {
+        self.allowed.read().await.contains(key)
+    }
+}
+
+/// Pending session handshake (Hello received, not yet Acked).
+pub struct PendingSession {
+    quic: QuicConnection,
+    control: QuicStream,
+    hello: HelloPayload,
+    config: SessionConfig,
+}
+
+impl PendingSession {
+    /// Receive Hello and validate the incoming connection.
+    pub async fn new(
         quic: QuicConnection,
-        expected_key: Option<[u8; 32]>,
+        authorizer: Option<Arc<SessionAuthorizer>>,
         config: SessionConfig,
     ) -> Result<Self> {
         info!(addr = %quic.remote_addr(), "New connection");
@@ -124,9 +169,9 @@ impl ServerSession {
             });
         }
 
-        // Validate session key if expected
-        if let Some(expected) = expected_key
-            && hello.session_key != expected
+        // Validate session key if required
+        if let Some(auth) = &authorizer
+            && !auth.is_allowed(&hello.session_key).await
         {
             let ack = HelloAckPayload {
                 protocol_version: 1,
@@ -134,57 +179,91 @@ impl ServerSession {
                 reject_reason: Some("invalid session key".to_string()),
                 capabilities: config.capabilities.clone(),
                 initial_state: None,
-                zero_rtt_available: false,
-            };
-            control.send(&Message::HelloAck(ack)).await?;
-            return Err(Error::AuthenticationFailed);
-        }
+            zero_rtt_available: false,
+        };
+        control.send(&Message::HelloAck(ack)).await?;
+        return Err(Error::AuthenticationFailed);
+    }
 
-        // Create terminal parser (owns state)
-        let parser = TerminalParser::new(hello.term_size.cols, hello.term_size.rows);
+        Ok(Self {
+            quic,
+            control,
+            hello,
+            config,
+        })
+    }
 
-        // Build initial state for client (simplified - just dimensions)
-        let mut initial_state = TerminalState::new(hello.term_size.cols, hello.term_size.rows);
-        initial_state.generation = 1;
+    /// Get the received Hello payload.
+    pub fn hello(&self) -> &HelloPayload {
+        &self.hello
+    }
+
+    /// Reject the session with a reason.
+    pub async fn reject(mut self, reason: String) -> Result<()> {
+        let ack = HelloAckPayload {
+            protocol_version: 1,
+            accepted: false,
+            reject_reason: Some(reason),
+            capabilities: self.config.capabilities.clone(),
+            initial_state: None,
+            zero_rtt_available: false,
+        };
+        self.control.send(&Message::HelloAck(ack)).await?;
+        Ok(())
+    }
+
+    /// Finalize the handshake and build a [`ServerSession`].
+    pub async fn accept(
+        mut self,
+        parser: Arc<Mutex<TerminalParser>>,
+        mut initial_state: TerminalState,
+    ) -> Result<ServerSession> {
+        initial_state.generation = initial_state.generation.max(1);
 
         // Send HelloAck
         let ack = HelloAckPayload {
             protocol_version: 1,
             accepted: true,
             reject_reason: None,
-            capabilities: config.capabilities.clone(),
-            initial_state: Some(initial_state),
+            capabilities: self.config.capabilities.clone(),
+            initial_state: Some(initial_state.clone()),
             zero_rtt_available: true,
         };
-        control.send(&Message::HelloAck(ack)).await?;
+        self.control.send(&Message::HelloAck(ack)).await?;
 
-        let session_state = SessionState::new(hello.session_key);
+        let session_state = SessionState::new(self.hello.session_key);
 
         // Open terminal output stream (server uni to client)
-        let terminal_out = quic
+        let terminal_out = self
+            .quic
             .open_stream(StreamType::TerminalOut)
             .await
             .map_err(|e| Error::Transport {
                 message: format!("failed to open terminal output stream: {}", e),
             })?;
 
+        let actual_size = initial_state.size();
+
         info!(
-            term_size = %format!("{}x{}", hello.term_size.cols, hello.term_size.rows),
-            term_type = hello.term_type,
+            term_size = %format!("{}x{}", actual_size.0, actual_size.1),
+            term_type = self.hello.term_type,
             "Session established"
         );
 
-        Ok(Self {
-            quic: Arc::new(quic),
-            control,
+        Ok(ServerSession {
+            quic: Arc::new(self.quic),
+            control: self.control,
             terminal_out,
             session_state,
-            parser: Arc::new(Mutex::new(parser)),
+            parser,
             confirmed_input_seq: 0,
-            config,
-            term_size: (hello.term_size.cols, hello.term_size.rows),
+            config: self.config,
+            term_size: actual_size,
         })
     }
+}
+
+impl ServerSession {
 
     /// Get the session state.
     pub fn state(&self) -> &SessionState {
@@ -315,5 +394,16 @@ mod tests {
         let config = SessionConfig::default();
         assert!(config.capabilities.predictive_echo);
         assert_eq!(config.max_forwards, 10);
+    }
+
+    #[tokio::test]
+    async fn session_authorizer_allows_known_keys() {
+        let auth = SessionAuthorizer::new();
+        let key = [0xAA; SESSION_KEY_LEN];
+        auth.allow(key).await;
+        assert!(auth.is_allowed(&key).await);
+
+        let unknown = [0xBB; SESSION_KEY_LEN];
+        assert!(!auth.is_allowed(&unknown).await);
     }
 }

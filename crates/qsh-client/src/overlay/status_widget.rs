@@ -140,6 +140,8 @@ pub struct StatusOverlay {
     metrics: ConnectionMetrics,
     /// User@host string.
     user_host: Option<String>,
+    /// Optional status message to display.
+    message: Option<String>,
 }
 
 impl Default for StatusOverlay {
@@ -157,6 +159,7 @@ impl StatusOverlay {
             status: ConnectionStatus::Disconnected,
             metrics: ConnectionMetrics::new(),
             user_host: None,
+            message: None,
         }
     }
 
@@ -183,6 +186,16 @@ impl StatusOverlay {
     /// Set position.
     pub fn set_position(&mut self, position: OverlayPosition) {
         self.position = position;
+    }
+
+    /// Set an optional status message.
+    pub fn set_message(&mut self, message: Option<String>) {
+        self.message = message;
+    }
+
+    /// Clear any message.
+    pub fn clear_message(&mut self) {
+        self.message = None;
     }
 
     /// Update connection status.
@@ -228,6 +241,11 @@ impl StatusOverlay {
             .unwrap_or_else(|| "-".to_string());
 
         let bar_content = format!(" qsh | {} | RTT: {} | {} ", user_host, rtt_str, status_char);
+        let bar_content = if let Some(msg) = &self.message {
+            format!("{bar_content}| {msg} ")
+        } else {
+            bar_content
+        };
 
         // Pad or truncate to fit width
         let bar_width = cols as usize;
