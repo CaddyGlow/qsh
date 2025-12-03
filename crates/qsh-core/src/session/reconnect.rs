@@ -8,7 +8,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::constants::{RECONNECT_TIMEOUT, SESSION_KEY_LEN};
+use crate::constants::SESSION_KEY_LEN;
 use crate::error::{Error, Result};
 
 use super::state::{InputTracker, SessionState, SessionStatus};
@@ -62,9 +62,11 @@ impl Default for ReconnectionHandler {
 
 impl ReconnectionHandler {
     /// Create a new reconnection handler with default settings.
+    ///
+    /// Like mosh, retries indefinitely until server session expires or user cancels.
     pub fn new() -> Self {
         Self {
-            max_attempts: 10,
+            max_attempts: u32::MAX, // Retry forever like mosh
             current_attempt: 0,
             base_delay: Duration::from_millis(100),
             max_delay: Duration::from_secs(10),
@@ -99,19 +101,13 @@ impl ReconnectionHandler {
     }
 
     /// Check if we should attempt another reconnection.
+    ///
+    /// Like mosh, returns true indefinitely - reconnection only stops when:
+    /// - Server returns SessionExpired or AuthenticationFailed
+    /// - User cancels (ctrl+c)
     pub fn should_retry(&self) -> bool {
-        if self.current_attempt >= self.max_attempts {
-            return false;
-        }
-
-        // Check overall timeout
-        if let Some(started) = self.started_at
-            && started.elapsed() > RECONNECT_TIMEOUT
-        {
-            return false;
-        }
-
-        true
+        // Only stop if we've hit the max attempts (which is u32::MAX by default)
+        self.current_attempt < self.max_attempts
     }
 
     /// Get the delay before the next reconnection attempt.
@@ -278,6 +274,8 @@ mod tests {
         let handler = ReconnectionHandler::new();
         assert_eq!(handler.attempt(), 0);
         assert!(handler.should_retry());
+        // Default is infinite retries (like mosh)
+        assert_eq!(handler.max_attempts, u32::MAX);
     }
 
     #[test]

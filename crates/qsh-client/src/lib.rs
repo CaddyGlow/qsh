@@ -15,6 +15,7 @@ pub mod connection;
 pub mod forward;
 pub mod overlay;
 pub mod prediction;
+pub mod render;
 pub mod ssh;
 pub mod terminal;
 

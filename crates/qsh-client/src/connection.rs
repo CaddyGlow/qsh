@@ -169,6 +169,10 @@ pub struct ConnectionConfig {
     pub connect_timeout: Duration,
     /// Whether 0-RTT resumption is available.
     pub zero_rtt_available: bool,
+    /// QUIC keep-alive interval (None disables).
+    pub keep_alive_interval: Option<Duration>,
+    /// QUIC max idle timeout.
+    pub max_idle_timeout: Duration,
 }
 
 impl Default for ConnectionConfig {
@@ -180,8 +184,11 @@ impl Default for ConnectionConfig {
             term_size: TermSize { cols: 80, rows: 24 },
             term_type: "xterm-256color".to_string(),
             predictive_echo: true,
-            connect_timeout: Duration::from_secs(10),
+            connect_timeout: Duration::from_secs(5),
             zero_rtt_available: false,
+            // Aggressive keepalive (500ms) for fast disconnection detection (mosh uses RTT/2)
+            keep_alive_interval: Some(Duration::from_millis(500)),
+            max_idle_timeout: Duration::from_secs(15),
         }
     }
 }
@@ -205,8 +212,12 @@ pub struct ClientConnection {
     /// Input sequence tracker.
     input_tracker: InputTracker,
     /// Prediction engine for local echo.
-    #[allow(dead_code)] // Will be used when terminal I/O is implemented
     prediction: PredictionEngine,
+    /// Current cursor position (tracked from server state).
+    cursor_col: u16,
+    cursor_row: u16,
+    /// Initial terminal state from server (for state-based rendering).
+    initial_state: Option<qsh_core::terminal::TerminalState>,
     /// Server capabilities.
     server_caps: Capabilities,
     /// Latency tracker for input-to-output measurement.
@@ -228,10 +239,10 @@ impl ClientConnection {
                 message: format!("failed to create QUIC endpoint: {}", e),
             })?;
 
-        // Configure transport (keepalive + long idle timeout)
+        // Configure transport (keepalive + idle timeout)
         let mut transport = TransportConfig::default();
-        transport.keep_alive_interval(Some(Duration::from_secs(10)));
-        if let Ok(timeout) = IdleTimeout::try_from(Duration::from_secs(30)) {
+        transport.keep_alive_interval(config.keep_alive_interval);
+        if let Ok(timeout) = IdleTimeout::try_from(config.max_idle_timeout) {
             transport.max_idle_timeout(Some(timeout));
         }
 
@@ -358,6 +369,13 @@ impl ClientConnection {
             tracing::debug!("Input sender task ended");
         });
 
+        // Extract cursor position from initial state if available
+        let (cursor_col, cursor_row) = hello_ack
+            .initial_state
+            .as_ref()
+            .map(|s| (s.cursor.col, s.cursor.row))
+            .unwrap_or((0, 0));
+
         Ok(Self {
             quic,
             config,
@@ -368,6 +386,9 @@ impl ClientConnection {
             session,
             input_tracker,
             prediction,
+            cursor_col,
+            cursor_row,
+            initial_state: hello_ack.initial_state,
             server_caps: hello_ack.capabilities,
             latency_tracker,
             _input_task: input_task,
@@ -380,6 +401,13 @@ impl ClientConnection {
         &self.server_caps
     }
 
+    /// Take the initial terminal state from the server.
+    ///
+    /// This can only be called once - subsequent calls return None.
+    pub fn take_initial_state(&mut self) -> Option<qsh_core::terminal::TerminalState> {
+        self.initial_state.take()
+    }
+
     /// Get the session state.
     pub fn session(&self) -> &SessionState {
         &self.session
@@ -388,6 +416,11 @@ impl ClientConnection {
     /// Get the current RTT estimate.
     pub fn rtt(&self) -> Duration {
         self.quic.rtt()
+    }
+
+    /// Get the current packet loss ratio (0.0 - 1.0).
+    pub fn packet_loss(&self) -> f64 {
+        self.quic.packet_loss()
     }
 
     /// Get a shared reference to the underlying QUIC connection.
@@ -474,6 +507,36 @@ impl ClientConnection {
         self.latency_tracker.stats()
     }
 
+    /// Get mutable access to the prediction engine.
+    pub fn prediction_mut(&mut self) -> &mut PredictionEngine {
+        &mut self.prediction
+    }
+
+    /// Get the prediction engine state.
+    pub fn prediction(&self) -> &PredictionEngine {
+        &self.prediction
+    }
+
+    /// Get the current cursor position.
+    pub fn cursor(&self) -> (u16, u16) {
+        (self.cursor_col, self.cursor_row)
+    }
+
+    /// Update cursor position from server state.
+    pub fn set_cursor(&mut self, col: u16, row: u16) {
+        self.cursor_col = col;
+        self.cursor_row = row;
+    }
+
+    /// Advance cursor after predicting a character.
+    /// Returns the new cursor position.
+    pub fn advance_cursor(&mut self) -> (u16, u16) {
+        // Simple advancement - just move right
+        // Real implementation would need to know terminal width for wrapping
+        self.cursor_col = self.cursor_col.saturating_add(1);
+        (self.cursor_col, self.cursor_row)
+    }
+
     /// Send a ping for latency measurement.
     pub async fn ping(&mut self) -> Result<Duration> {
         let timestamp = std::time::SystemTime::now()
@@ -527,6 +590,16 @@ impl ClientConnection {
             .await
     }
 
+    /// Send a keepalive ping (non-blocking) and return the timestamp used.
+    pub async fn send_ping(&mut self) -> Result<u64> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64;
+        self.control.send(&Message::Ping(timestamp)).await?;
+        Ok(timestamp)
+    }
+
     /// Close the connection gracefully.
     pub async fn close(mut self) -> Result<()> {
         self.control
@@ -543,6 +616,7 @@ impl ClientConnection {
     /// Attempt to reconnect using stored session state.
     pub async fn reconnect(&mut self) -> Result<()> {
         // Mark reconnecting
+        info!("Starting reconnection attempt");
         self.session
             .set_status(qsh_core::session::SessionStatus::Reconnecting);
 
@@ -553,8 +627,8 @@ impl ClientConnection {
             })?;
 
         let mut transport = TransportConfig::default();
-        transport.keep_alive_interval(Some(Duration::from_secs(15)));
-        if let Ok(timeout) = IdleTimeout::try_from(Duration::from_secs(60 * 60 * 24 * 7)) {
+        transport.keep_alive_interval(self.config.keep_alive_interval);
+        if let Ok(timeout) = IdleTimeout::try_from(self.config.max_idle_timeout) {
             transport.max_idle_timeout(Some(timeout));
         }
 
@@ -626,21 +700,28 @@ impl ClientConnection {
             return Err(Error::AuthenticationFailed);
         }
 
+        info!(zero_rtt = hello_ack.zero_rtt_available, "Reconnect HelloAck received");
+
         // Update zero-RTT availability
         self.config.zero_rtt_available = hello_ack.zero_rtt_available;
         self.session
             .set_status(qsh_core::session::SessionStatus::Connected);
 
         // Open terminal in/out streams
+        info!("Opening terminal input stream");
         let terminal_in_stream = quic
             .open_stream(qsh_core::transport::StreamType::TerminalIn)
             .await?;
         let terminal_in_sender = terminal_in_stream.sender();
 
+        info!("Waiting for terminal output stream from server");
         let terminal_out = loop {
             let (ty, stream) = quic.accept_stream().await?;
             if matches!(ty, qsh_core::transport::StreamType::TerminalOut) {
+                info!("Terminal output stream received");
                 break stream;
+            } else {
+                debug!(?ty, "Ignoring non-terminal stream during reconnect");
             }
         };
 
@@ -698,21 +779,51 @@ impl ClientConnection {
             self.config.zero_rtt_available,
         );
 
+        info!("Reconnection complete");
         Ok(())
+    }
+
+    /// Reset the reconnection handler state using the latest confirmed state.
+    pub fn reset_reconnect_backoff(&mut self) {
+        self.reconnect.start(
+            self.session.last_confirmed_generation(),
+            self.session.last_confirmed_input_seq(),
+            self.config.zero_rtt_available,
+        );
+    }
+
+    /// Check if we should attempt another reconnection.
+    pub fn should_retry_reconnect(&self) -> bool {
+        self.reconnect.should_retry()
+    }
+
+    /// Get the delay before the next reconnection attempt and advance the counter.
+    pub fn next_reconnect_delay(&mut self) -> Duration {
+        self.reconnect.next_delay()
+    }
+
+    /// Get the current reconnection attempt number.
+    pub fn reconnect_attempt(&self) -> u32 {
+        self.reconnect.attempt()
     }
 
     /// Attempt to reconnect with exponential backoff until success or exhaustion.
     ///
     /// `on_attempt` is invoked before each attempt with (attempt_number, delay_before_attempt).
-    pub async fn reconnect_with_backoff(
+    /// The callback is async to allow updating UI during reconnection.
+    pub async fn reconnect_with_backoff<F, Fut>(
         &mut self,
-        mut on_attempt: impl FnMut(u32, Duration),
-    ) -> Result<()> {
+        mut on_attempt: F,
+    ) -> Result<()>
+    where
+        F: FnMut(u32, Duration) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         let mut last_err: Option<Error> = None;
 
         while self.reconnect.should_retry() {
             let delay = self.reconnect.next_delay();
-            on_attempt(self.reconnect.attempt(), delay);
+            on_attempt(self.reconnect.attempt(), delay).await;
             tokio::time::sleep(delay).await;
 
             match self.reconnect().await {

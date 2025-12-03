@@ -1535,6 +1535,7 @@ dependencies = [
  "base64",
  "bytes",
  "clap",
+ "futures",
  "libc",
  "nix 0.29.0",
  "proptest",

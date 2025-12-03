@@ -6,4 +6,6 @@
 
 mod engine;
 
-pub use engine::{PredictedEcho, PredictedStyle, Prediction, PredictionEngine, PredictionState};
+pub use engine::{
+    DisplayPreference, PredictedEcho, PredictedStyle, Prediction, PredictionEngine, PredictionState,
+};

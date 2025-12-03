@@ -6,16 +6,20 @@ use std::net::ToSocketAddrs;
 use std::sync::Arc;
 
 use clap::Parser;
+use std::time::Duration;
 use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
 
 use qsh_client::cli::{OverlayPosition as CliOverlayPosition, SshBootstrapMode};
-use qsh_client::overlay::{ConnectionStatus, OverlayPosition, StatusOverlay};
+use qsh_client::overlay::{ConnectionStatus, OverlayPosition, PredictionOverlay, StatusOverlay};
+use qsh_client::render::StateRenderer;
 use qsh_client::{
     BootstrapMode, Cli, ClientConnection, ConnectionConfig, LocalForwarder, RawModeGuard,
     Socks5Proxy, SshConfig, StdinReader, StdoutWriter, bootstrap, get_terminal_size,
     restore_terminal,
 };
+use qsh_core::terminal::TerminalState;
 use qsh_core::constants::DEFAULT_QUIC_PORT_RANGE;
 use qsh_core::forward::ForwardSpec;
 use qsh_core::protocol::{Message, StateDiff, TermSize};
@@ -78,6 +82,15 @@ fn extract_generation(diff: &StateDiff) -> Option<u64> {
     }
 }
 
+/// Extract cursor position from a state diff.
+fn extract_cursor(diff: &StateDiff) -> Option<(u16, u16)> {
+    match diff {
+        StateDiff::Full(state) => Some((state.cursor.col, state.cursor.row)),
+        StateDiff::Incremental { cursor, .. } => cursor.as_ref().map(|c| (c.col, c.row)),
+        StateDiff::CursorOnly { cursor, .. } => Some((cursor.col, cursor.row)),
+    }
+}
+
 async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Result<()> {
     // Step 1: Bootstrap via SSH to get QUIC endpoint info
     info!("Bootstrapping via SSH...");
@@ -126,8 +139,10 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
                 term_size: get_term_size(),
                 term_type: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
                 predictive_echo: !cli.no_prediction,
-                connect_timeout: std::time::Duration::from_secs(10),
+                connect_timeout: cli.connect_timeout(),
                 zero_rtt_available: false,
+                keep_alive_interval: cli.keep_alive_interval(),
+                max_idle_timeout: cli.max_idle_timeout(),
             };
 
             // Try to connect
@@ -174,8 +189,10 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
         term_size: get_term_size(),
         term_type: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
         predictive_echo: !cli.no_prediction,
-        connect_timeout: std::time::Duration::from_secs(10),
+        connect_timeout: cli.connect_timeout(),
         zero_rtt_available: false, // updated after HelloAck inside connect
+        keep_alive_interval: cli.keep_alive_interval(),
+        max_idle_timeout: cli.max_idle_timeout(),
     })
     .await?;
     info!(rtt = ?conn.rtt(), "Connected to server");
@@ -204,10 +221,51 @@ async fn run_session(
     let mut overlay = create_status_overlay(cli, user_host);
     overlay.set_status(ConnectionStatus::Connected);
 
-    // Initialize RTT from connection
-    overlay.metrics_mut().update_rtt(conn.rtt());
+    // Create prediction overlay for local echo display
+    let mut pred_overlay = PredictionOverlay::new();
 
-    // Parse toggle key (default ctrl+o = 0x0f)
+    // Client-side terminal state (for mosh-style state-based rendering)
+    // Use initial state from server if available, otherwise create empty
+    let term_size = get_terminal_size().unwrap_or(TermSize { cols: 80, rows: 24 });
+    let mut local_state = conn
+        .take_initial_state()
+        .unwrap_or_else(|| TerminalState::new(term_size.cols, term_size.rows));
+    let mut renderer = StateRenderer::new();
+    // Don't enable state rendering until we've received at least one StateUpdate
+    // This ensures local_state is synchronized with what's actually on screen
+    let mut use_state_rendering = false;
+    let state_rendering_available = conn.server_capabilities().predictive_echo;
+
+    // Initialize RTT and packet loss from connection
+    overlay.metrics_mut().update_rtt(conn.rtt());
+    overlay.metrics_mut().update_packet_loss(conn.packet_loss());
+
+    // Overlay refresh interval (2 seconds) - also updates metrics from QUIC
+    let mut overlay_refresh = tokio::time::interval(Duration::from_secs(2));
+    overlay_refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    // Fast stale detection interval (100ms) - like mosh's 250ms "Connecting..." threshold
+    // Checks if we haven't heard from the server in a while
+    let mut stale_check = tokio::time::interval(Duration::from_millis(100));
+    stale_check.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    // Application-level keepalive pings (every 200ms, like mosh's RTT/2 approach)
+    // This ensures we get regular Pong responses to detect connection issues
+    let mut ping_interval = tokio::time::interval(Duration::from_millis(200));
+    ping_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    // Initialize last_heard to now
+    overlay.metrics_mut().record_heard();
+
+    // Track if overlay was auto-shown due to stale connection (to auto-hide on recovery)
+    let mut overlay_auto_shown = false;
+
+    // Hysteresis for stale detection - require stable connection for 1s before hiding overlay
+    // This prevents jitter when connection is flaky
+    let mut stable_since: Option<std::time::Instant> = Some(std::time::Instant::now());
+    const STABLE_THRESHOLD: Duration = Duration::from_secs(1);
+
+    // Parse toggle key (default ctrl+shift+o, parsed as ctrl+o = 0x0f)
     let toggle_key = parse_toggle_key(&cli.overlay_key);
 
     // Start port forwarders
@@ -247,11 +305,9 @@ async fn run_session(
         let resize_event = std::future::pending::<Option<()>>();
 
         tokio::select! {
-            // Use biased selection to prioritize input handling for low latency
             biased;
 
-            // Handle stdin -> server (highest priority for responsiveness)
-            // Use spawn to avoid blocking the select loop on QUIC send
+            // Handle stdin -> server
             input = stdin.read() => {
                 match input {
                     Some(data) if !data.is_empty() => {
@@ -259,11 +315,17 @@ async fn run_session(
                         if let Some(key) = toggle_key {
                             if data.len() == 1 && data[0] == key {
                                 overlay.toggle();
+                                // User manually toggled, so don't auto-hide anymore
+                                overlay_auto_shown = false;
                                 // Re-render overlay after toggle
-                                let term_size = get_term_size();
-                                let overlay_output = overlay.render(term_size.cols);
-                                if !overlay_output.is_empty() {
-                                    let _ = stdout.write(overlay_output.as_bytes()).await;
+                                if overlay.is_visible() {
+                                    let term_size = get_term_size();
+                                    let overlay_output = overlay.render(term_size.cols);
+                                    if !overlay_output.is_empty() {
+                                        let _ = stdout.write(overlay_output.as_bytes()).await;
+                                    }
+                                } else {
+                                    clear_overlay(&mut stdout, overlay.position()).await;
                                 }
                                 continue;
                             }
@@ -272,11 +334,37 @@ async fn run_session(
                         debug!(len = data.len(), "Sending input to server");
                         // Queue the send without waiting - don't block on network I/O
                         match conn.queue_input(&data) {
-                            Ok(_seq) => {
-                                // Input queued successfully
+                            Ok(seq) => {
+                                // Only predict after we've synced state from server
+                                // (cursor position in initial_state may be stale)
+                                if use_state_rendering && conn.server_capabilities().predictive_echo {
+                                    let mut made_predictions = false;
+                                    for &byte in &data {
+                                        let c = byte as char;
+                                        let (col, row) = conn.cursor();
+                                        if let Some(echo) = conn.prediction_mut().predict(c, col, row, seq) {
+                                            // Only add to overlay if we should display predictions
+                                            // (mosh-style adaptive: only when RTT > 30ms)
+                                            if conn.prediction().should_display() {
+                                                if let Some(pred) = conn.prediction().pending().back() {
+                                                    pred_overlay.add(pred, echo.style);
+                                                }
+                                                made_predictions = true;
+                                            }
+                                            conn.advance_cursor();
+                                        }
+                                    }
+                                    // Re-render with predictions composited (mosh-style)
+                                    if made_predictions {
+                                        let rendered = renderer.render(&local_state, &pred_overlay);
+                                        if !rendered.is_empty() {
+                                            let _ = stdout.write(rendered.as_bytes()).await;
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
-                                error!(error = %e, "Failed to queue input");
+                                debug!(error = %e, "Failed to queue input");
                                 attempt_reconnect(&mut conn, cli, &mut overlay, &mut stdout, &mut forward_handles).await?;
                                 continue;
                             }
@@ -297,6 +385,8 @@ async fn run_session(
             msg = conn.recv_any() => {
                 match msg {
                     Ok(Message::StateUpdate(update)) => {
+                        // Record that we heard from the server (for stale detection)
+                        overlay.metrics_mut().record_heard();
                         if let Some(latency) = conn.record_confirmation(update.confirmed_input_seq) {
                             debug!(
                                 latency_ms = latency.as_secs_f64() * 1000.0,
@@ -304,6 +394,82 @@ async fn run_session(
                                 "Input latency"
                             );
                             overlay.metrics_mut().update_rtt(latency);
+                            // Update prediction engine RTT for adaptive display
+                            conn.prediction_mut().update_rtt(latency);
+                        }
+
+                        // Update cursor from state diff
+                        if let Some((col, row)) = extract_cursor(&update.diff) {
+                            conn.set_cursor(col, row);
+                        }
+
+                        // Handle prediction confirmation/reset based on diff type
+                        match &update.diff {
+                            StateDiff::Full(_) => {
+                                // Full state sync - reset prediction engine and overlay
+                                conn.prediction_mut().reset();
+                                pred_overlay.clear_all();
+                                renderer.invalidate(); // Force full redraw
+                                debug!("Prediction engine reset on full state sync");
+                            }
+                            StateDiff::Incremental { changes, .. } => {
+                                // Check for mispredictions by comparing cell changes to predictions
+                                let mut mispredicted = false;
+                                for change in changes {
+                                    for pred in pred_overlay.iter() {
+                                        if pred.col == change.col && pred.row == change.row
+                                            && pred.char != change.cell.ch
+                                        {
+                                            debug!(
+                                                col = change.col, row = change.row,
+                                                predicted = %pred.char, actual = %change.cell.ch,
+                                                "Misprediction detected"
+                                            );
+                                            mispredicted = true;
+                                            break;
+                                        }
+                                    }
+                                    if mispredicted { break; }
+                                }
+
+                                if mispredicted {
+                                    conn.prediction_mut().misprediction();
+                                    pred_overlay.clear_all();
+                                } else {
+                                    conn.prediction_mut().confirm(update.confirmed_input_seq);
+                                    pred_overlay.clear_confirmed(update.confirmed_input_seq);
+                                }
+                            }
+                            StateDiff::CursorOnly { .. } => {
+                                // Cursor-only change, just confirm predictions
+                                conn.prediction_mut().confirm(update.confirmed_input_seq);
+                                pred_overlay.clear_confirmed(update.confirmed_input_seq);
+                            }
+                        }
+
+                        // Apply diff to local terminal state
+                        // Enable state rendering on first StateUpdate from server
+                        if state_rendering_available && !use_state_rendering {
+                            use_state_rendering = true;
+                            debug!("State-based rendering enabled");
+                        }
+
+                        if use_state_rendering {
+                            match local_state.apply_diff(&update.diff) {
+                                Ok(new_state) => {
+                                    local_state = new_state;
+                                    // Render with predictions composited
+                                    let rendered = renderer.render(&local_state, &pred_overlay);
+                                    if !rendered.is_empty() {
+                                        let _ = stdout.write(rendered.as_bytes()).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!(error = %e, "Failed to apply diff, falling back to raw mode");
+                                    use_state_rendering = false;
+                                    renderer.invalidate();
+                                }
+                            }
                         }
 
                         if let Some(r#gen) = extract_generation(&update.diff) {
@@ -311,6 +477,7 @@ async fn run_session(
                         }
                     }
                     Ok(Message::TerminalOutput(output)) => {
+                        overlay.metrics_mut().record_heard();
                         if let Some(latency) = conn.record_confirmation(output.confirmed_input_seq) {
                             debug!(
                                 latency_ms = latency.as_secs_f64() * 1000.0,
@@ -320,8 +487,12 @@ async fn run_session(
                             overlay.metrics_mut().update_rtt(latency);
                         }
 
+                        // Confirm predictions for this input sequence
+                        conn.prediction_mut().confirm(output.confirmed_input_seq);
+                        pred_overlay.clear_confirmed(output.confirmed_input_seq);
+
                         if let Err(e) = stdout.write(&output.data).await {
-                            error!(error = %e, "Failed to write output");
+                            debug!(error = %e, "Failed to write output");
                             break;
                         }
 
@@ -333,8 +504,12 @@ async fn run_session(
                             }
                         }
                     }
-                    Ok(Message::Pong(_)) => {}
+                    Ok(Message::Pong(_)) => {
+                        overlay.metrics_mut().record_heard();
+                        debug!("Pong received");
+                    }
                     Ok(Message::Shutdown(shutdown)) => {
+                        overlay.metrics_mut().record_heard();
                         info!(reason = ?shutdown.reason, msg = ?shutdown.message, "Server initiated shutdown");
                         if let Some(msg) = &shutdown.message {
                             eprintln!("\r\n{}", msg);
@@ -342,6 +517,7 @@ async fn run_session(
                         break;
                     }
                     Ok(other) => {
+                        overlay.metrics_mut().record_heard();
                         debug!(msg = ?other, "Unexpected message");
                     }
                     Err(qsh_core::Error::ConnectionClosed) => {
@@ -350,13 +526,83 @@ async fn run_session(
                         continue;
                     }
                     Err(e) => {
-                        error!(error = %e, "Error receiving from server");
+                        // Use debug instead of error to avoid breaking raw terminal output
+                        // The overlay already shows the error state to the user
+                        debug!(error = %e, "Error receiving from server");
                         if should_attempt_reconnect(&e) {
                             attempt_reconnect(&mut conn, cli, &mut overlay, &mut stdout, &mut forward_handles).await?;
                             continue;
                         } else {
                             break;
                         }
+                    }
+                }
+            }
+
+            // Periodic overlay refresh (update RTT/loss display)
+            _ = overlay_refresh.tick() => {
+                if overlay.is_visible() {
+                    // Refresh metrics from connection
+                    overlay.metrics_mut().update_rtt(conn.rtt());
+                    overlay.metrics_mut().update_packet_loss(conn.packet_loss());
+                    render_overlay_if_visible(&overlay, &mut stdout).await;
+                }
+            }
+
+            // Application-level keepalive pings (like mosh's timestamp echo)
+            _ = ping_interval.tick() => {
+                if let Err(e) = conn.send_ping().await {
+                    debug!(error = %e, "Failed to send keepalive ping");
+                }
+            }
+
+            // Fast stale detection (like mosh's 250ms "Connecting..." threshold)
+            _ = stale_check.tick() => {
+                let (is_stale, time_since) = {
+                    let metrics = overlay.metrics_mut();
+                    (metrics.is_stale(), metrics.time_since_heard())
+                };
+                let current_status = overlay.status();
+
+                // Update hysteresis tracking
+                if is_stale {
+                    // Connection is stale, reset stable timer
+                    stable_since = None;
+                } else if stable_since.is_none() {
+                    // Connection just became stable, start timer
+                    stable_since = Some(std::time::Instant::now());
+                }
+
+                // Check if stable long enough (hysteresis to prevent jitter)
+                let is_stable_enough = stable_since
+                    .map(|t| t.elapsed() >= STABLE_THRESHOLD)
+                    .unwrap_or(false);
+
+                // Update status based on staleness
+                if is_stale && current_status == ConnectionStatus::Connected {
+                    // Connection appears stale - show waiting indicator immediately
+                    debug!(time_since_heard_ms = ?time_since.map(|d| d.as_millis()), "Connection stale, showing waiting status");
+                    overlay.set_status(ConnectionStatus::Waiting);
+                    // Force overlay visible when connection is stale
+                    if !overlay.is_visible() {
+                        overlay.set_visible(true);
+                        overlay_auto_shown = true;
+                    }
+                    render_overlay_if_visible(&overlay, &mut stdout).await;
+                } else if is_stale && current_status == ConnectionStatus::Waiting {
+                    // Still stale - refresh overlay to update elapsed time display
+                    render_overlay_if_visible(&overlay, &mut stdout).await;
+                } else if is_stable_enough && current_status == ConnectionStatus::Waiting {
+                    // Connection has been stable for STABLE_THRESHOLD - back to connected
+                    debug!("Connection stable for {:?}, hiding waiting status", STABLE_THRESHOLD);
+                    overlay.set_status(ConnectionStatus::Connected);
+                    // Auto-hide overlay if we auto-showed it
+                    if overlay_auto_shown {
+                        overlay.set_visible(false);
+                        overlay_auto_shown = false;
+                        clear_overlay(&mut stdout, overlay.position()).await;
+                    } else {
+                        render_overlay_if_visible(&overlay, &mut stdout).await;
                     }
                 }
             }
@@ -410,31 +656,76 @@ async fn attempt_reconnect(
         handle.abort();
     }
 
+    let overlay_was_visible = overlay.is_visible();
     overlay.set_visible(true);
     overlay.set_status(ConnectionStatus::Reconnecting);
-    overlay.set_message(Some("connection lost, attempting reconnect...".to_string()));
     render_overlay_if_visible(overlay, stdout).await;
 
-    if let Err(e) = conn
-        .reconnect_with_backoff(|attempt, delay| {
-            info!(
-                attempt,
-                delay_ms = delay.as_millis(),
-                "Attempting reconnection after transport loss"
-            );
-        })
-        .await
-    {
-        overlay.set_status(ConnectionStatus::Disconnected);
-        overlay.set_message(Some(format!("reconnect failed: {}", e)));
+    // Reset backoff window relative to this loss event.
+    conn.reset_reconnect_backoff();
+
+    // Reconnect loop with overlay updates
+    loop {
+        if !conn.should_retry_reconnect() {
+            overlay.set_status(ConnectionStatus::Disconnected);
+            overlay.set_message(Some("reconnect attempts exhausted".to_string()));
+            render_overlay_if_visible(overlay, stdout).await;
+            return Err(qsh_core::Error::Transport {
+                message: "reconnection attempts exhausted".to_string(),
+            });
+        }
+
+        let delay = conn.next_reconnect_delay();
+        let attempt = conn.reconnect_attempt();
+
+        // Update overlay with attempt info
+        overlay.set_message(Some(format!("attempt {} (waiting {}ms)...", attempt, delay.as_millis())));
         render_overlay_if_visible(overlay, stdout).await;
-        return Err(e);
+
+        info!(
+            attempt,
+            delay_ms = delay.as_millis(),
+            "Attempting reconnection after transport loss"
+        );
+
+        tokio::time::sleep(delay).await;
+
+        match conn.reconnect().await {
+            Ok(()) => {
+                // Reset reconnect state for next time
+                conn.reset_reconnect_backoff();
+                break;
+            }
+            Err(qsh_core::Error::AuthenticationFailed) => {
+                overlay.set_status(ConnectionStatus::Disconnected);
+                overlay.set_message(Some("authentication failed".to_string()));
+                render_overlay_if_visible(overlay, stdout).await;
+                return Err(qsh_core::Error::AuthenticationFailed);
+            }
+            Err(qsh_core::Error::SessionExpired) => {
+                overlay.set_status(ConnectionStatus::Disconnected);
+                overlay.set_message(Some("session expired".to_string()));
+                render_overlay_if_visible(overlay, stdout).await;
+                return Err(qsh_core::Error::SessionExpired);
+            }
+            Err(e) => {
+                warn!(error = %e, attempt, "Reconnect attempt failed");
+                // Continue to next attempt
+            }
+        }
     }
 
+    // Record successful reconnection
+    overlay.metrics_mut().record_heard(); // Reset last_heard timer
     overlay.metrics_mut().record_reconnect();
     overlay.metrics_mut().update_rtt(conn.rtt());
+    overlay.metrics_mut().update_packet_loss(conn.packet_loss());
     overlay.set_status(ConnectionStatus::Connected);
     overlay.clear_message();
+    if !overlay_was_visible {
+        overlay.set_visible(false);
+        clear_overlay(stdout, overlay.position()).await;
+    }
 
     *forward_handles = spawn_forwarders(cli, conn.quic_connection()).await;
     render_overlay_if_visible(overlay, stdout).await;
@@ -450,6 +741,12 @@ async fn render_overlay_if_visible(overlay: &StatusOverlay, stdout: &mut StdoutW
             let _ = stdout.write(overlay_output.as_bytes()).await;
         }
     }
+}
+
+/// Clear overlay line from terminal (best-effort).
+async fn clear_overlay(stdout: &mut StdoutWriter, _position: OverlayPosition) {
+    // Overlays draw on first row today; clear that row to hide artifacts.
+    let _ = stdout.write(b"\x1b[s\x1b[1;1H\x1b[2K\x1b[u").await;
 }
 
 fn should_attempt_reconnect(err: &qsh_core::Error) -> bool {

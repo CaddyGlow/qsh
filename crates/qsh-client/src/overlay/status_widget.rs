@@ -21,6 +21,8 @@ pub enum OverlayPosition {
 pub enum ConnectionStatus {
     /// Connected and operational.
     Connected,
+    /// Waiting for server response (stale > 250ms, like mosh "Connecting...").
+    Waiting,
     /// Reconnecting after disconnect.
     Reconnecting,
     /// Degraded (high latency, packet loss).
@@ -48,6 +50,8 @@ pub struct ConnectionMetrics {
     pub reconnect_count: u32,
     /// Session start time.
     pub session_start: Option<Instant>,
+    /// Time of last received data from server (for stale detection like mosh's 250ms threshold).
+    pub last_heard: Option<Instant>,
 }
 
 impl ConnectionMetrics {
@@ -60,32 +64,25 @@ impl ConnectionMetrics {
     }
 
     /// Update RTT with new sample.
+    ///
+    /// Note: When using Quinn's `conn.rtt()`, the value is already smoothed
+    /// by QUIC's internal RTT estimator, so we store it directly.
     pub fn update_rtt(&mut self, sample: Duration) {
+        let prev = self.rtt_smoothed.unwrap_or(sample);
         self.rtt = Some(sample);
+        self.rtt_smoothed = Some(sample);
 
-        // Smoothed RTT: SRTT = 0.875 * SRTT + 0.125 * sample
-        self.rtt_smoothed = Some(match self.rtt_smoothed {
-            Some(srtt) => {
-                let srtt_nanos = srtt.as_nanos() as u64;
-                let sample_nanos = sample.as_nanos() as u64;
-                let new_srtt = (srtt_nanos * 7 + sample_nanos) / 8;
-                Duration::from_nanos(new_srtt)
+        // Jitter: difference from previous sample
+        let diff = Duration::from_nanos(sample.as_nanos().abs_diff(prev.as_nanos()) as u64);
+        self.jitter = Some(match self.jitter {
+            Some(j) => {
+                // EWMA for jitter: 3/4 old + 1/4 new
+                let j_nanos = j.as_nanos() as u64;
+                let diff_nanos = diff.as_nanos() as u64;
+                Duration::from_nanos((j_nanos * 3 + diff_nanos) / 4)
             }
-            None => sample,
+            None => diff,
         });
-
-        // Jitter calculation (simplified)
-        if let Some(srtt) = self.rtt_smoothed {
-            let diff = Duration::from_nanos(sample.as_nanos().abs_diff(srtt.as_nanos()) as u64);
-            self.jitter = Some(match self.jitter {
-                Some(j) => {
-                    let j_nanos = j.as_nanos() as u64;
-                    let diff_nanos = diff.as_nanos() as u64;
-                    Duration::from_nanos((j_nanos * 3 + diff_nanos) / 4)
-                }
-                None => diff,
-            });
-        }
     }
 
     /// Record bytes sent.
@@ -101,6 +98,11 @@ impl ConnectionMetrics {
     /// Record a reconnection event.
     pub fn record_reconnect(&mut self) {
         self.reconnect_count = self.reconnect_count.saturating_add(1);
+    }
+
+    /// Update packet loss ratio (0.0 - 1.0).
+    pub fn update_packet_loss(&mut self, loss: f64) {
+        self.packet_loss = Some(loss.clamp(0.0, 1.0));
     }
 
     /// Get session duration.
@@ -125,6 +127,29 @@ impl ConnectionMetrics {
         }
         false
     }
+
+    /// Record that we received data from the server.
+    pub fn record_heard(&mut self) {
+        self.last_heard = Some(Instant::now());
+    }
+
+    /// Get time since last heard from server.
+    pub fn time_since_heard(&self) -> Option<Duration> {
+        self.last_heard.map(|t| t.elapsed())
+    }
+
+    /// Check if connection appears stale (no data for threshold duration).
+    /// Default threshold is 250ms (like mosh).
+    pub fn is_stale(&self) -> bool {
+        self.is_stale_threshold(Duration::from_millis(250))
+    }
+
+    /// Check if connection appears stale with custom threshold.
+    pub fn is_stale_threshold(&self, threshold: Duration) -> bool {
+        self.time_since_heard()
+            .map(|elapsed| elapsed > threshold)
+            .unwrap_or(false)
+    }
 }
 
 /// Status overlay widget.
@@ -142,6 +167,8 @@ pub struct StatusOverlay {
     user_host: Option<String>,
     /// Optional status message to display.
     message: Option<String>,
+    /// When the current status was set (for elapsed display).
+    status_since: Option<std::time::Instant>,
 }
 
 impl Default for StatusOverlay {
@@ -160,6 +187,7 @@ impl StatusOverlay {
             metrics: ConnectionMetrics::new(),
             user_host: None,
             message: None,
+            status_since: None,
         }
     }
 
@@ -188,6 +216,11 @@ impl StatusOverlay {
         self.position = position;
     }
 
+    /// Get position.
+    pub fn position(&self) -> OverlayPosition {
+        self.position
+    }
+
     /// Set an optional status message.
     pub fn set_message(&mut self, message: Option<String>) {
         self.message = message;
@@ -198,9 +231,15 @@ impl StatusOverlay {
         self.message = None;
     }
 
+    /// Get current connection status.
+    pub fn status(&self) -> ConnectionStatus {
+        self.status
+    }
+
     /// Update connection status.
     pub fn set_status(&mut self, status: ConnectionStatus) {
         self.status = status;
+        self.status_since = Some(std::time::Instant::now());
     }
 
     /// Update metrics.
@@ -227,6 +266,7 @@ impl StatusOverlay {
         // Build the display line
         let status_char = match self.status {
             ConnectionStatus::Connected => "+",    // checkmark substitute
+            ConnectionStatus::Waiting => "?",      // waiting for server
             ConnectionStatus::Reconnecting => "~", // arrows substitute
             ConnectionStatus::Degraded => "!",     // warning substitute
             ConnectionStatus::Disconnected => "x",
@@ -239,8 +279,35 @@ impl StatusOverlay {
             .rtt_smoothed
             .map(|d| format!("{}ms", d.as_millis()))
             .unwrap_or_else(|| "-".to_string());
+        let loss_str = self
+            .metrics
+            .packet_loss
+            .map(|l| format!("{:.1}%", l * 100.0))
+            .unwrap_or_else(|| "-".to_string());
 
-        let bar_content = format!(" qsh | {} | RTT: {} | {} ", user_host, rtt_str, status_char);
+        // Show elapsed time when waiting or reconnecting
+        let status_str = match self.status {
+            ConnectionStatus::Waiting | ConnectionStatus::Reconnecting => {
+                let elapsed = self.metrics.time_since_heard();
+                let symbol = if self.status == ConnectionStatus::Waiting { "?" } else { "~" };
+                if let Some(elapsed) = elapsed {
+                    let secs = elapsed.as_secs_f32();
+                    if secs < 1.0 {
+                        format!("{} {:.0}ms", symbol, elapsed.as_millis())
+                    } else {
+                        format!("{} {:.1}s", symbol, secs)
+                    }
+                } else {
+                    symbol.to_string()
+                }
+            }
+            _ => status_char.to_string(),
+        };
+
+        let bar_content = format!(
+            " qsh | {} | RTT: {} | loss: {} | {} ",
+            user_host, rtt_str, loss_str, status_str
+        );
         let bar_content = if let Some(msg) = &self.message {
             format!("{bar_content}| {msg} ")
         } else {
@@ -285,6 +352,7 @@ impl StatusOverlay {
     fn build_content(&self) -> String {
         let status_str = match self.status {
             ConnectionStatus::Connected => "connected",
+            ConnectionStatus::Waiting => "waiting",
             ConnectionStatus::Reconnecting => "reconnecting",
             ConnectionStatus::Degraded => "degraded",
             ConnectionStatus::Disconnected => "disconnected",
@@ -296,7 +364,12 @@ impl StatusOverlay {
             .map(|d| format!("{}ms", d.as_millis()))
             .unwrap_or_else(|| "?".to_string());
 
-        format!("{} | RTT: {}", status_str, rtt_str)
+        let elapsed_str = self
+            .status_since
+            .map(|t| format!("{}s", t.elapsed().as_secs()))
+            .unwrap_or_else(|| "-s".to_string());
+
+        format!("{} | RTT: {} | {}", status_str, rtt_str, elapsed_str)
     }
 }
 
@@ -324,9 +397,10 @@ mod tests {
         assert_eq!(metrics.rtt_smoothed, Some(Duration::from_millis(100)));
 
         metrics.update_rtt(Duration::from_millis(200));
-        // SRTT should be between 100 and 200
-        let srtt = metrics.rtt_smoothed.unwrap().as_millis();
-        assert!(srtt > 100 && srtt < 200);
+        // No additional smoothing - Quinn's RTT is already smoothed
+        assert_eq!(metrics.rtt_smoothed, Some(Duration::from_millis(200)));
+        // Jitter should reflect the change
+        assert!(metrics.jitter.is_some());
     }
 
     #[test]
@@ -447,5 +521,43 @@ mod tests {
 
         let rendered = overlay.render(80);
         assert!(rendered.contains("50ms"));
+    }
+
+    #[test]
+    fn metrics_last_heard() {
+        let mut metrics = ConnectionMetrics::new();
+
+        // Initially no last_heard
+        assert!(metrics.last_heard.is_none());
+        assert!(metrics.time_since_heard().is_none());
+        assert!(!metrics.is_stale()); // not stale if never heard
+
+        // Record hearing from server
+        metrics.record_heard();
+        assert!(metrics.last_heard.is_some());
+        assert!(metrics.time_since_heard().is_some());
+        assert!(!metrics.is_stale()); // just heard, not stale
+    }
+
+    #[test]
+    fn metrics_stale_detection() {
+        let mut metrics = ConnectionMetrics::new();
+        metrics.record_heard();
+
+        // Not stale immediately
+        assert!(!metrics.is_stale());
+
+        // Stale with very short threshold
+        assert!(metrics.is_stale_threshold(Duration::ZERO));
+    }
+
+    #[test]
+    fn overlay_waiting_status() {
+        let mut overlay = StatusOverlay::new();
+        overlay.set_visible(true);
+
+        overlay.set_status(ConnectionStatus::Waiting);
+        let rendered = overlay.render(80);
+        assert!(rendered.contains('?')); // Waiting indicator
     }
 }

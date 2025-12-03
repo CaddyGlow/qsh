@@ -1051,6 +1051,7 @@ Runtime guardrails:
 - If the pipe is absent or unresponsive, a new bootstrap instance creates it and becomes the owner (stale pipes are removed).
 - Detached sessions linger for 48h by default (override with `--session-linger` or `QSH_SESSION_LINGER_SECS`); a registry keeps PTYs alive, enforces single attachment, and garbage-collects idle entries after the linger window.
 - Registry tracks last activity on input/output/resize/ping, carries terminal state parser, and on PTY exit immediately removes the entry and signals attached clients with Shutdown(ShellExited).
+- Client sends app-level pings (interval configurable via `--ping-interval`, default 5s; 0 disables). Missing Pong within ~2×interval triggers overlay reconnect state and reconnection attempts.
 
 ```rust
 pub struct BootstrapServer {

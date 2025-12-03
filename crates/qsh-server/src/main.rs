@@ -209,8 +209,9 @@ async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
     ));
 
     // Configure transport (keepalive + idle timeout)
+    // Use aggressive keepalive (500ms) for fast disconnection detection (mosh uses RTT/2)
     let mut transport = TransportConfig::default();
-    transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+    transport.keep_alive_interval(Some(std::time::Duration::from_millis(500)));
     transport.max_idle_timeout(IdleTimeout::try_from(std::time::Duration::from_secs(30)).ok());
     server_config.transport_config(Arc::new(transport));
 
@@ -434,6 +435,7 @@ async fn handle_session(
                         }
                     }
                     Ok(Some(Message::Ping(timestamp))) => {
+                        debug!("Ping received, sending pong");
                         entry.touch().await;
                         if let Err(e) = session.send_pong(timestamp).await {
                             warn!(error = %e, "Failed to send pong");
@@ -478,7 +480,7 @@ async fn handle_session(
                 }
             }
 
-            // Handle PTY output -> send to client
+            // Handle PTY output -> send to client (state-based for prediction support)
             output = output_rx.recv() => {
                 match output {
                     Ok(data) if !data.is_empty() => {
@@ -486,16 +488,23 @@ async fn handle_session(
                             len = data.len(),
                             data = ?&data[..data.len().min(32)],
                             confirmed_seq = last_input_seq,
-                            "Sending output to client"
+                            "Sending state update to client"
                         );
-                        if let Err(e) = session.send_output(data, last_input_seq).await {
-                            error!(error = %e, "Failed to send output");
+                        if let Err(e) = session.send_state_update(data, last_input_seq).await {
+                            error!(error = %e, "Failed to send state update");
                             break;
                         }
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        info!("Output stream closed");
+                        info!("Output stream closed (shell exited)");
+                        // Send shutdown before breaking so client knows shell exited
+                        if let Err(e) = session.send_shutdown(
+                            ShutdownReason::ShellExited,
+                            Some("shell exited".to_string()),
+                        ).await {
+                            warn!(error = %e, "Failed to send shutdown message");
+                        }
                         break;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
@@ -536,7 +545,7 @@ async fn handle_session(
     accept_task.abort();
 
     entry.touch().await;
-    session.close();
+    session.close().await;
 
     Ok(())
 }

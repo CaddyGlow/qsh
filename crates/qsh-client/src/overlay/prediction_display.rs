@@ -85,21 +85,26 @@ impl PredictionOverlay {
             // Move to position (1-indexed for ANSI)
             output.push_str(&format!("\x1b[{};{}H", pred.row + 1, pred.col + 1));
 
-            // Apply style
-            match pred.style {
+            // Apply style (only if not Normal)
+            let needs_reset = match pred.style {
                 PredictedStyle::Underline => {
                     output.push_str("\x1b[4m"); // Underline
+                    true
                 }
                 PredictedStyle::Dim => {
                     output.push_str("\x1b[2m"); // Dim
+                    true
                 }
-            }
+                PredictedStyle::Normal => false,
+            };
 
             // Print character
             output.push(pred.char);
 
-            // Reset style
-            output.push_str("\x1b[0m");
+            // Reset style if needed
+            if needs_reset {
+                output.push_str("\x1b[0m");
+            }
         }
 
         // Restore cursor position

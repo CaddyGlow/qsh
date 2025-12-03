@@ -212,10 +212,22 @@ pub struct Cli {
     /// Custom overlay toggle key
     #[arg(
         long = "overlay-key",
-        default_value = "ctrl+shift+s",
+        default_value = "ctrl+shift+o",
         value_name = "KEY"
     )]
     pub overlay_key: String,
+
+    /// QUIC keep-alive interval in seconds (0 disables).
+    #[arg(long = "keep-alive", default_value = "5", value_name = "SECONDS")]
+    pub keep_alive_secs: u64,
+
+    /// QUIC max idle timeout in seconds (connection closes after this).
+    #[arg(long = "max-idle-timeout", default_value = "15", value_name = "SECONDS")]
+    pub max_idle_timeout_secs: u64,
+
+    /// Connection timeout in seconds (per connection attempt).
+    #[arg(long = "connect-timeout", default_value = "5", value_name = "SECONDS")]
+    pub connect_timeout_secs: u64,
 }
 
 impl Cli {
@@ -243,6 +255,25 @@ impl Cli {
     /// Get the host from the destination.
     pub fn host(&self) -> Option<&str> {
         self.parse_destination().map(|(_, host)| host)
+    }
+
+    /// QUIC keep-alive interval (None disables).
+    pub fn keep_alive_interval(&self) -> Option<std::time::Duration> {
+        if self.keep_alive_secs == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_secs(self.keep_alive_secs))
+        }
+    }
+
+    /// QUIC max idle timeout.
+    pub fn max_idle_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.max_idle_timeout_secs)
+    }
+
+    /// Connection timeout (per attempt).
+    pub fn connect_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.connect_timeout_secs)
     }
 
     /// Get the command to execute, if any, shell-escaped for remote execution.
@@ -535,7 +566,7 @@ mod tests {
         assert!(!cli.show_status);
         assert_eq!(cli.log_format, CliLogFormat::Text);
         assert_eq!(cli.overlay_position, OverlayPosition::Top);
-        assert_eq!(cli.overlay_key, "ctrl+shift+s");
+        assert_eq!(cli.overlay_key, "ctrl+shift+o");
         assert!(!cli.no_overlay);
         assert!(!cli.force_pty);
         assert!(!cli.disable_pty);

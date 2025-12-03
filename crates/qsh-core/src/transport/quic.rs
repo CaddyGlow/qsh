@@ -206,6 +206,27 @@ impl StreamPair for QuicStream {
     }
 }
 
+impl QuicStream {
+    /// Gracefully finish the send side of the stream.
+    ///
+    /// This sends a FIN and waits for all data to be acknowledged,
+    /// ensuring the remote peer receives all pending data before the
+    /// stream closes.
+    pub async fn finish(&mut self) -> Result<()> {
+        if let Some(send) = &self.send {
+            let mut guard = send.lock().await;
+            guard.finish().map_err(|e| Error::Transport {
+                message: format!("failed to finish stream: {}", e),
+            })?;
+            // Wait for the stream to be fully closed (all data ACKed)
+            guard.stopped().await.map_err(|e| Error::Transport {
+                message: format!("stream stopped with error: {}", e),
+            })?;
+        }
+        Ok(())
+    }
+}
+
 // =============================================================================
 // Quinn Connection
 // =============================================================================
@@ -317,6 +338,37 @@ impl Connection for QuicConnection {
 
     fn rtt(&self) -> Duration {
         self.inner.rtt()
+    }
+}
+
+impl QuicConnection {
+    /// Get packet loss ratio (0.0 - 1.0).
+    ///
+    /// Calculated as lost_packets / sent_packets from QUIC path stats.
+    pub fn packet_loss(&self) -> f64 {
+        let stats = self.inner.stats();
+        let sent = stats.path.sent_packets;
+        let lost = stats.path.lost_packets;
+        if sent == 0 {
+            0.0
+        } else {
+            (lost as f64 / sent as f64).clamp(0.0, 1.0)
+        }
+    }
+
+    /// Get the number of congestion events.
+    pub fn congestion_events(&self) -> u64 {
+        self.inner.stats().path.congestion_events
+    }
+
+    /// Get total packets sent.
+    pub fn packets_sent(&self) -> u64 {
+        self.inner.stats().path.sent_packets
+    }
+
+    /// Get total packets lost.
+    pub fn packets_lost(&self) -> u64 {
+        self.inner.stats().path.lost_packets
     }
 }
 

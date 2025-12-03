@@ -84,8 +84,9 @@ impl BootstrapServer {
         ));
 
         // Configure transport (keepalive + idle timeout)
+        // Use aggressive keepalive (500ms) for fast disconnection detection (mosh uses RTT/2)
         let mut transport = TransportConfig::default();
-        transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+        transport.keep_alive_interval(Some(std::time::Duration::from_millis(500)));
         transport.max_idle_timeout(IdleTimeout::try_from(std::time::Duration::from_secs(30)).ok());
         server_config.transport_config(Arc::new(transport));
 

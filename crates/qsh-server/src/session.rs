@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
@@ -73,6 +73,8 @@ pub struct ServerSession {
     config: SessionConfig,
     /// Terminal size (cols, rows).
     term_size: (u16, u16),
+    /// Last state sent to client (for computing diffs).
+    last_sent_state: Option<TerminalState>,
 }
 
 /// Controls which session keys may attach.
@@ -234,13 +236,22 @@ impl PendingSession {
         let session_state = SessionState::new(self.hello.session_key);
 
         // Open terminal output stream (server uni to client)
-        let terminal_out = self
+        let mut terminal_out = self
             .quic
             .open_stream(StreamType::TerminalOut)
             .await
             .map_err(|e| Error::Transport {
                 message: format!("failed to open terminal output stream: {}", e),
             })?;
+
+        // Send an initial empty output to materialize the stream on the client side.
+        // QUIC unidirectional streams aren't visible to the peer until data is written.
+        terminal_out
+            .send(&Message::TerminalOutput(TerminalOutputPayload {
+                data: Vec::new(),
+                confirmed_input_seq: 0,
+            }))
+            .await?;
 
         let actual_size = initial_state.size();
 
@@ -259,6 +270,7 @@ impl PendingSession {
             confirmed_input_seq: 0,
             config: self.config,
             term_size: actual_size,
+            last_sent_state: Some(initial_state),
         })
     }
 }
@@ -323,26 +335,39 @@ impl ServerSession {
 
     /// Send a state update to the client.
     ///
-    /// This parses the output through the terminal emulator and sends
-    /// a state diff. Use `send_output` for simpler raw output mode.
-    pub async fn send_state_update(&mut self, data: Vec<u8>, input_seq: u64) -> Result<()> {
-        // Parse output through terminal emulator
-        let state = {
-            let mut parser = self.parser.lock().await;
-            parser.process(&data);
+    /// Gets the current terminal state (already updated by the output task)
+    /// and sends an incremental state diff when possible.
+    ///
+    /// NOTE: The parser is shared with SessionEntry which processes PTY output
+    /// via process_output(). We must NOT call parser.process() here or the
+    /// output would be processed twice, corrupting the terminal state.
+    pub async fn send_state_update(&mut self, _data: Vec<u8>, input_seq: u64) -> Result<()> {
+        // Get current terminal state (already updated by output task)
+        let new_state = {
+            let parser = self.parser.lock().await;
             parser.state().clone()
         };
 
         self.confirmed_input_seq = input_seq;
 
+        // Compute diff from last sent state (incremental when possible)
+        let diff = if let Some(ref last_state) = self.last_sent_state {
+            last_state.diff_to(&new_state)
+        } else {
+            StateDiff::Full(new_state.clone())
+        };
+
         let update = StateUpdatePayload {
-            diff: StateDiff::Full(state.clone()),
+            diff,
             confirmed_input_seq: self.confirmed_input_seq,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_micros() as u64,
         };
+
+        // Update last sent state
+        self.last_sent_state = Some(new_state);
 
         self.terminal_out.send(&Message::StateUpdate(update)).await
     }
@@ -379,8 +404,14 @@ impl ServerSession {
     }
 
     /// Close the session gracefully.
-    pub fn close(mut self) {
-        self.control.close();
+    ///
+    /// This finishes the control stream to ensure any pending messages
+    /// (like Shutdown) are delivered before the connection closes.
+    pub async fn close(mut self) {
+        // Finish the control stream to ensure shutdown message is delivered
+        if let Err(e) = self.control.finish().await {
+            warn!(error = %e, "Failed to finish control stream");
+        }
         info!(addr = %self.quic.remote_addr(), "Session closed");
     }
 }

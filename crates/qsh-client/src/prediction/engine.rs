@@ -1,7 +1,25 @@
 //! Core prediction engine implementation.
+//!
+//! Based on mosh's prediction engine with adaptive display:
+//! - Only show predictions when RTT > SRTT_TRIGGER_HIGH (30ms)
+//! - Only underline when RTT > FLAG_TRIGGER_HIGH (80ms) or glitches occur
+//! - Validate predictions against actual server state
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// RTT threshold below which predictions are hidden (connection is fast enough).
+const SRTT_TRIGGER_LOW: Duration = Duration::from_millis(20);
+/// RTT threshold above which predictions are shown.
+const SRTT_TRIGGER_HIGH: Duration = Duration::from_millis(30);
+/// RTT threshold below which predictions are not underlined.
+const FLAG_TRIGGER_LOW: Duration = Duration::from_millis(50);
+/// RTT threshold above which predictions are underlined.
+const FLAG_TRIGGER_HIGH: Duration = Duration::from_millis(80);
+/// Prediction outstanding this long is considered a glitch.
+const GLITCH_THRESHOLD: Duration = Duration::from_millis(250);
+/// Number of quick confirmations needed to clear glitch trigger.
+const GLITCH_REPAIR_COUNT: u32 = 10;
 
 /// State of the prediction engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,12 +32,26 @@ pub enum PredictionState {
     Disabled,
 }
 
+/// Display preference for predictions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DisplayPreference {
+    /// Always show predictions.
+    Always,
+    /// Never show predictions.
+    Never,
+    /// Show predictions adaptively based on RTT (default, mosh-style).
+    #[default]
+    Adaptive,
+}
+
 /// Style for displaying predicted characters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PredictedStyle {
-    /// Show with underline.
+    /// Show with underline (high latency).
     Underline,
-    /// Show with dim/faded appearance.
+    /// Show without special styling (moderate latency).
+    Normal,
+    /// Show with dim/faded appearance (tentative state).
     Dim,
 }
 
@@ -54,14 +86,22 @@ pub struct PredictedEcho {
 pub struct PredictionEngine {
     /// Pending predictions awaiting confirmation.
     pending: VecDeque<Prediction>,
-    /// Next sequence number to assign.
-    next_sequence: u64,
     /// Last confirmed sequence number.
     confirmed_sequence: u64,
     /// Current prediction state/confidence.
     state: PredictionState,
     /// Count of consecutive mispredictions.
     misprediction_count: u8,
+    /// Display preference.
+    display_preference: DisplayPreference,
+    /// Whether RTT-based trigger is active (show predictions).
+    srtt_trigger: bool,
+    /// Whether flagging (underlining) is active.
+    flagging: bool,
+    /// Glitch trigger count (long-pending predictions).
+    glitch_trigger: u32,
+    /// Current smoothed RTT.
+    current_rtt: Duration,
 }
 
 impl Default for PredictionEngine {
@@ -75,11 +115,61 @@ impl PredictionEngine {
     pub fn new() -> Self {
         Self {
             pending: VecDeque::new(),
-            next_sequence: 0,
             confirmed_sequence: 0,
             state: PredictionState::Confident,
             misprediction_count: 0,
+            display_preference: DisplayPreference::Adaptive,
+            srtt_trigger: false,
+            flagging: false,
+            glitch_trigger: 0,
+            current_rtt: Duration::ZERO,
         }
+    }
+
+    /// Update the current RTT and adjust triggers accordingly.
+    pub fn update_rtt(&mut self, rtt: Duration) {
+        self.current_rtt = rtt;
+
+        // Control srtt_trigger with hysteresis (mosh-style)
+        if rtt > SRTT_TRIGGER_HIGH {
+            self.srtt_trigger = true;
+        } else if self.srtt_trigger && rtt <= SRTT_TRIGGER_LOW && !self.has_active_predictions() {
+            // Only turn off when no predictions are being shown
+            self.srtt_trigger = false;
+        }
+
+        // Control flagging (underlining) with hysteresis
+        if rtt > FLAG_TRIGGER_HIGH {
+            self.flagging = true;
+        } else if rtt <= FLAG_TRIGGER_LOW {
+            self.flagging = false;
+        }
+
+        // High glitch count also activates flagging
+        if self.glitch_trigger > GLITCH_REPAIR_COUNT {
+            self.flagging = true;
+        }
+    }
+
+    /// Set display preference.
+    pub fn set_display_preference(&mut self, pref: DisplayPreference) {
+        self.display_preference = pref;
+    }
+
+    /// Check if predictions should be displayed based on current triggers.
+    pub fn should_display(&self) -> bool {
+        match self.display_preference {
+            DisplayPreference::Never => false,
+            DisplayPreference::Always => true,
+            DisplayPreference::Adaptive => {
+                self.srtt_trigger || self.glitch_trigger > 0
+            }
+        }
+    }
+
+    /// Check if there are any active predictions.
+    fn has_active_predictions(&self) -> bool {
+        !self.pending.is_empty()
     }
 
     /// Check if we should predict echo for this character.
@@ -93,32 +183,39 @@ impl PredictionEngine {
 
     /// Make a prediction for a character at the given position.
     ///
+    /// The `input_seq` should be the input message sequence number from
+    /// the input tracker, allowing confirmation when that input is acknowledged.
+    ///
     /// Returns `Some(PredictedEcho)` if prediction should be displayed,
     /// `None` if prediction was skipped.
-    pub fn predict(&mut self, c: char, col: u16, row: u16) -> Option<PredictedEcho> {
+    pub fn predict(&mut self, c: char, col: u16, row: u16, input_seq: u64) -> Option<PredictedEcho> {
         if !self.should_predict(c) {
             return None;
         }
 
-        let seq = self.next_sequence;
-        self.next_sequence += 1;
-
         self.pending.push_back(Prediction {
-            sequence: seq,
+            sequence: input_seq,
             char: c,
             col,
             row,
             timestamp: Instant::now(),
         });
 
+        // Determine style based on state and flagging
         let style = match self.state {
-            PredictionState::Confident => PredictedStyle::Underline,
+            PredictionState::Confident => {
+                if self.flagging {
+                    PredictedStyle::Underline
+                } else {
+                    PredictedStyle::Normal
+                }
+            }
             PredictionState::Tentative => PredictedStyle::Dim,
             PredictionState::Disabled => unreachable!(),
         };
 
         Some(PredictedEcho {
-            sequence: seq,
+            sequence: input_seq,
             char: c,
             style,
         })
@@ -126,11 +223,16 @@ impl PredictionEngine {
 
     /// Confirm that input up to and including the given sequence was processed correctly.
     pub fn confirm(&mut self, sequence: u64) {
+        let now = Instant::now();
         self.confirmed_sequence = sequence;
 
-        // Remove confirmed predictions
+        // Remove confirmed predictions and check for quick confirmations
         while let Some(p) = self.pending.front() {
             if p.sequence <= sequence {
+                // Quick confirmation reduces glitch trigger
+                if now.duration_since(p.timestamp) < GLITCH_THRESHOLD && self.glitch_trigger > 0 {
+                    self.glitch_trigger = self.glitch_trigger.saturating_sub(1);
+                }
                 self.pending.pop_front();
             } else {
                 break;
@@ -141,6 +243,20 @@ impl PredictionEngine {
         if self.state == PredictionState::Tentative {
             self.misprediction_count = 0;
             self.state = PredictionState::Confident;
+        }
+    }
+
+    /// Check for long-pending predictions (glitches) and update triggers.
+    pub fn check_glitches(&mut self) {
+        let now = Instant::now();
+        for pred in &self.pending {
+            let age = now.duration_since(pred.timestamp);
+            if age >= GLITCH_THRESHOLD {
+                // Long-pending prediction detected
+                if self.glitch_trigger < GLITCH_REPAIR_COUNT {
+                    self.glitch_trigger = GLITCH_REPAIR_COUNT;
+                }
+            }
         }
     }
 
@@ -170,6 +286,7 @@ impl PredictionEngine {
         self.pending.clear();
         self.state = PredictionState::Confident;
         self.misprediction_count = 0;
+        self.glitch_trigger = 0;
     }
 
     /// Get current prediction state.
@@ -182,14 +299,14 @@ impl PredictionEngine {
         &self.pending
     }
 
-    /// Get the next sequence number that will be assigned.
-    pub fn next_sequence(&self) -> u64 {
-        self.next_sequence
-    }
-
     /// Get the last confirmed sequence number.
     pub fn confirmed_sequence(&self) -> u64 {
         self.confirmed_sequence
+    }
+
+    /// Check if flagging (underlining) is active.
+    pub fn is_flagging(&self) -> bool {
+        self.flagging
     }
 }
 
@@ -262,31 +379,39 @@ mod tests {
     fn predict_adds_to_pending() {
         let mut engine = PredictionEngine::new();
 
-        let echo = engine.predict('a', 0, 0).unwrap();
-        assert_eq!(echo.sequence, 0);
+        // Predictions with same input_seq (simulates multiple chars in one input message)
+        let echo = engine.predict('a', 0, 0, 1).unwrap();
+        assert_eq!(echo.sequence, 1);
         assert_eq!(echo.char, 'a');
         assert_eq!(engine.pending().len(), 1);
 
-        let echo = engine.predict('b', 1, 0).unwrap();
+        let echo = engine.predict('b', 1, 0, 1).unwrap();
         assert_eq!(echo.sequence, 1);
         assert_eq!(engine.pending().len(), 2);
+
+        // New input message
+        let echo = engine.predict('c', 2, 0, 2).unwrap();
+        assert_eq!(echo.sequence, 2);
+        assert_eq!(engine.pending().len(), 3);
     }
 
     #[test]
     fn predict_returns_none_for_unpredictable() {
         let mut engine = PredictionEngine::new();
-        assert!(engine.predict('\x03', 0, 0).is_none());
+        assert!(engine.predict('\x03', 0, 0, 1).is_none());
     }
 
     #[test]
     fn confirm_removes_from_pending() {
         let mut engine = PredictionEngine::new();
 
-        engine.predict('a', 0, 0);
-        engine.predict('b', 1, 0);
-        engine.predict('c', 2, 0);
+        // Two chars in seq 1, one char in seq 2
+        engine.predict('a', 0, 0, 1);
+        engine.predict('b', 1, 0, 1);
+        engine.predict('c', 2, 0, 2);
         assert_eq!(engine.pending().len(), 3);
 
+        // Confirm seq 1 removes both 'a' and 'b'
         engine.confirm(1);
         assert_eq!(engine.pending().len(), 1);
 
@@ -299,8 +424,8 @@ mod tests {
     fn misprediction_clears_pending() {
         let mut engine = PredictionEngine::new();
 
-        engine.predict('a', 0, 0);
-        engine.predict('b', 1, 0);
+        engine.predict('a', 0, 0, 1);
+        engine.predict('b', 1, 0, 1);
         assert_eq!(engine.pending().len(), 2);
 
         engine.misprediction();
@@ -353,8 +478,8 @@ mod tests {
         engine.misprediction(); // -> Tentative
         assert_eq!(engine.state(), PredictionState::Tentative);
 
-        engine.predict('a', 0, 0);
-        engine.confirm(0);
+        engine.predict('a', 0, 0, 1);
+        engine.confirm(1);
         assert_eq!(engine.state(), PredictionState::Confident);
     }
 
@@ -376,8 +501,8 @@ mod tests {
     fn prediction_positions_tracked() {
         let mut engine = PredictionEngine::new();
 
-        engine.predict('a', 5, 10);
-        engine.predict('b', 6, 10);
+        engine.predict('a', 5, 10, 1);
+        engine.predict('b', 6, 10, 1);
 
         let pending: Vec<_> = engine.pending().iter().collect();
         assert_eq!(pending[0].col, 5);
@@ -387,17 +512,51 @@ mod tests {
     }
 
     #[test]
-    fn style_varies_by_state() {
+    fn style_varies_by_state_and_flagging() {
         let mut engine = PredictionEngine::new();
 
-        // Confident -> Underline
-        let echo = engine.predict('a', 0, 0).unwrap();
+        // Confident + no flagging -> Normal (fast connection)
+        let echo = engine.predict('a', 0, 0, 1).unwrap();
+        assert_eq!(echo.style, PredictedStyle::Normal);
+
+        // Enable flagging via high RTT
+        engine.update_rtt(Duration::from_millis(100));
+        assert!(engine.is_flagging());
+
+        // Confident + flagging -> Underline
+        let echo = engine.predict('b', 1, 0, 2).unwrap();
         assert_eq!(echo.style, PredictedStyle::Underline);
 
         engine.misprediction(); // -> Tentative
 
-        // Tentative -> Dim
-        let echo = engine.predict('b', 1, 0).unwrap();
+        // Tentative -> Dim (regardless of flagging)
+        let echo = engine.predict('c', 2, 0, 3).unwrap();
         assert_eq!(echo.style, PredictedStyle::Dim);
+    }
+
+    #[test]
+    fn adaptive_display_based_on_rtt() {
+        let mut engine = PredictionEngine::new();
+
+        // Initially no RTT, should not display
+        assert!(!engine.should_display());
+
+        // Low RTT, should not display
+        engine.update_rtt(Duration::from_millis(10));
+        assert!(!engine.should_display());
+
+        // High RTT, should display
+        engine.update_rtt(Duration::from_millis(50));
+        assert!(engine.should_display());
+
+        // With Always preference, always display
+        engine.set_display_preference(DisplayPreference::Always);
+        engine.update_rtt(Duration::from_millis(5));
+        assert!(engine.should_display());
+
+        // With Never preference, never display
+        engine.set_display_preference(DisplayPreference::Never);
+        engine.update_rtt(Duration::from_millis(100));
+        assert!(!engine.should_display());
     }
 }

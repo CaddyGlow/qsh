@@ -540,58 +540,44 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use futures::FutureExt;
     use qsh_test_utils::FakePty;
 
     use super::*;
 
     struct FakePtyControl {
-        pty: Arc<AsyncMutex<FakePty>>,
+        pty: Arc<std::sync::Mutex<FakePty>>,
     }
 
     impl PtyControl for FakePtyControl {
         fn size(&self) -> (u16, u16) {
-            tokio::runtime::Handle::current().block_on(async {
-                let guard = self.pty.lock().await;
-                guard.size()
-            })
+            self.pty.lock().unwrap().size()
         }
 
         fn resize(&self, cols: u16, rows: u16) -> Result<()> {
-            tokio::runtime::Handle::current().block_on(async {
-                let mut guard = self.pty.lock().await;
-                guard.resize(cols, rows);
-                Ok(())
-            })
+            self.pty.lock().unwrap().resize(cols, rows);
+            Ok(())
         }
 
         fn try_wait(&self) -> Result<Option<i32>> {
-            tokio::runtime::Handle::current().block_on(async {
-                let guard = self.pty.lock().await;
-                if guard.is_closed() {
-                    Ok(Some(0))
-                } else {
-                    Ok(None)
-                }
-            })
+            if self.pty.lock().unwrap().is_closed() {
+                Ok(Some(0))
+            } else {
+                Ok(None)
+            }
         }
 
         fn kill(&self) -> Result<()> {
-            tokio::runtime::Handle::current().block_on(async {
-                let mut guard = self.pty.lock().await;
-                guard.close();
-                Ok(())
-            })
+            self.pty.lock().unwrap().close();
+            Ok(())
         }
 
         fn wait_reap(&self, _timeout: Duration) -> Result<Option<i32>> {
-            tokio::runtime::Handle::current().block_on(async {
-                let guard = self.pty.lock().await;
-                if guard.is_closed() {
-                    Ok(Some(0))
-                } else {
-                    Ok(None)
-                }
-            })
+            if self.pty.lock().unwrap().is_closed() {
+                Ok(Some(0))
+            } else {
+                Ok(None)
+            }
         }
     }
 
@@ -609,14 +595,13 @@ mod tests {
                 .take_output_receiver()
                 .expect("output receiver should be present");
 
-            let pty = Arc::new(AsyncMutex::new(fake));
+            let pty = Arc::new(std::sync::Mutex::new(fake));
             let input_pty = pty.clone();
 
             let (input_tx, mut input_rx) = mpsc::channel::<Vec<u8>>(32);
             tokio::spawn(async move {
                 while let Some(data) = input_rx.recv().await {
-                    let guard = input_pty.lock().await;
-                    guard.write_input(&data);
+                    input_pty.lock().unwrap().write_input(&data);
                 }
             });
 
