@@ -25,7 +25,7 @@ use super::{Connection, StreamPair, StreamType};
 pub struct QuicStream {
     send: Option<Arc<Mutex<SendStream>>>,
     recv: Option<Arc<Mutex<RecvStream>>>,
-    recv_buf: BytesMut,
+    recv_buf: Arc<Mutex<BytesMut>>,
 }
 
 /// Map a bidirectional stream ID to StreamType.
@@ -59,7 +59,7 @@ impl QuicStream {
         Self {
             send: Some(Arc::new(Mutex::new(send))),
             recv: Some(Arc::new(Mutex::new(recv))),
-            recv_buf: BytesMut::with_capacity(8192),
+            recv_buf: Arc::new(Mutex::new(BytesMut::with_capacity(8192))),
         }
     }
 
@@ -73,7 +73,7 @@ impl QuicStream {
         Self {
             send: Some(Arc::new(Mutex::new(send))),
             recv: None,
-            recv_buf: BytesMut::with_capacity(8192),
+            recv_buf: Arc::new(Mutex::new(BytesMut::with_capacity(8192))),
         }
     }
 
@@ -82,7 +82,7 @@ impl QuicStream {
         Self {
             send: None,
             recv: Some(Arc::new(Mutex::new(recv))),
-            recv_buf: BytesMut::with_capacity(8192),
+            recv_buf: Arc::new(Mutex::new(BytesMut::with_capacity(8192))),
         }
     }
 
@@ -157,7 +157,7 @@ impl StreamPair for QuicStream {
 
     fn recv(&mut self) -> impl std::future::Future<Output = Result<Message>> + Send {
         let recv_opt = self.recv.as_ref().map(Arc::clone);
-        let mut recv_buf = std::mem::take(&mut self.recv_buf);
+        let recv_buf = Arc::clone(&self.recv_buf);
 
         let fut = async move {
             let Some(recv) = recv_opt else {
@@ -167,6 +167,7 @@ impl StreamPair for QuicStream {
             };
 
             let mut recv = recv.lock().await;
+            let mut recv_buf = recv_buf.lock().await;
 
             loop {
                 if let Some(msg) = Codec::decode(&mut recv_buf)? {
@@ -196,8 +197,6 @@ impl StreamPair for QuicStream {
 
         async move {
             let result = fut.await;
-            // Note: recv_buf is consumed; if buffering across calls is needed,
-            // refactor QuicStream to store the buffer via interior mutability.
             result
         }
     }
