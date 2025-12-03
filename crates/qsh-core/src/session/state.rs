@@ -5,22 +5,22 @@ use std::time::{Duration, Instant};
 
 use crate::constants::{MAX_PENDING_PREDICTIONS, SESSION_KEY_LEN, SESSION_TIMEOUT};
 
-/// Session connection status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionStatus {
-    /// Not yet connected.
-    Disconnected,
-    /// Initial handshake in progress.
-    Connecting,
-    /// Fully connected and operational.
-    Connected,
-    /// Lost connection, attempting to reconnect.
-    Reconnecting,
-    /// Session has been explicitly closed.
-    Closed,
-    /// Session has expired due to timeout.
-    Expired,
-}
+    /// Session connection status.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SessionStatus {
+        /// Not yet connected.
+        Disconnected,
+        /// Initial handshake in progress.
+        Connecting,
+        /// Fully connected and operational.
+        Connected,
+        /// Lost connection, attempting to reconnect.
+        Reconnecting,
+        /// Session has been explicitly closed.
+        Closed,
+        /// Session has expired due to timeout.
+        Expired,
+    }
 
 impl SessionStatus {
     /// Check if this status represents an active session.

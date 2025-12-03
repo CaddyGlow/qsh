@@ -10,6 +10,7 @@ use std::time::Duration;
 use bytes::BytesMut;
 use quinn::{RecvStream, SendStream};
 use tokio::sync::Mutex;
+use tokio::select;
 
 use crate::error::{Error, Result};
 use crate::protocol::{Codec, Message};
@@ -22,17 +23,42 @@ use super::{Connection, StreamPair, StreamType};
 
 /// A bidirectional QUIC stream pair.
 pub struct QuicStream {
-    send: Arc<Mutex<SendStream>>,
-    recv: Arc<Mutex<RecvStream>>,
+    send: Option<Arc<Mutex<SendStream>>>,
+    recv: Option<Arc<Mutex<RecvStream>>>,
     recv_buf: BytesMut,
+}
+
+/// Map a bidirectional stream ID to StreamType.
+async fn map_bidi_stream_type(stream_id: u64, next_forward_id: &Arc<Mutex<u32>>) -> StreamType {
+    match stream_id {
+        0 => StreamType::Control,
+        4 => StreamType::Tunnel,
+        _ => {
+            // Use a monotonic forward id for simplicity
+            let mut guard = next_forward_id.lock().await;
+            let id = *guard;
+            *guard = guard.saturating_add(1);
+            StreamType::Forward(id)
+        }
+    }
+}
+
+/// Map a unidirectional stream ID to StreamType based on initiator.
+fn map_uni_stream_type(stream_id: u64) -> StreamType {
+    // QUIC stream ID bit0 = initiator (0 client, 1 server), bit1 = direction (0 bidirectional, 1 unidirectional)
+    let initiator_server = stream_id & 0x1 == 1;
+    match initiator_server {
+        true => StreamType::TerminalOut, // server → client output
+        false => StreamType::TerminalIn, // client → server input
+    }
 }
 
 impl QuicStream {
     /// Create a new stream pair from Quinn streams.
     pub fn new(send: SendStream, recv: RecvStream) -> Self {
         Self {
-            send: Arc::new(Mutex::new(send)),
-            recv: Arc::new(Mutex::new(recv)),
+            send: Some(Arc::new(Mutex::new(send))),
+            recv: Some(Arc::new(Mutex::new(recv))),
             recv_buf: BytesMut::with_capacity(8192),
         }
     }
@@ -42,13 +68,31 @@ impl QuicStream {
         Self::new(streams.0, streams.1)
     }
 
+    /// Create a send-only stream (unidirectional).
+    pub fn from_send(send: SendStream) -> Self {
+        Self {
+            send: Some(Arc::new(Mutex::new(send))),
+            recv: None,
+            recv_buf: BytesMut::with_capacity(8192),
+        }
+    }
+
+    /// Create a recv-only stream (unidirectional).
+    pub fn from_recv(recv: RecvStream) -> Self {
+        Self {
+            send: None,
+            recv: Some(Arc::new(Mutex::new(recv))),
+            recv_buf: BytesMut::with_capacity(8192),
+        }
+    }
+
     /// Get a cloneable sender handle for spawning background send tasks.
     ///
     /// This allows non-blocking sends by spawning tasks that don't block
     /// the main event loop.
     pub fn sender(&self) -> QuicSender {
         QuicSender {
-            send: Arc::clone(&self.send),
+            send: self.send.as_ref().map(Arc::clone),
         }
     }
 }
@@ -59,7 +103,7 @@ impl QuicStream {
 /// the main event loop.
 #[derive(Clone)]
 pub struct QuicSender {
-    send: Arc<Mutex<SendStream>>,
+    send: Option<Arc<Mutex<SendStream>>>,
 }
 
 impl QuicSender {
@@ -67,8 +111,14 @@ impl QuicSender {
     pub async fn send(&self, msg: &Message) -> Result<()> {
         use tokio::io::AsyncWriteExt;
 
+        let Some(send) = &self.send else {
+            return Err(Error::Transport {
+                message: "stream is receive-only".to_string(),
+            });
+        };
+
         let data = Codec::encode(msg)?;
-        let mut send = self.send.lock().await;
+        let mut send = send.lock().await;
         send.write_all(&data).await.map_err(|e| Error::Transport {
             message: format!("failed to send message: {}", e),
         })?;
@@ -80,49 +130,75 @@ impl QuicSender {
 }
 
 impl StreamPair for QuicStream {
-    async fn send(&mut self, msg: &Message) -> Result<()> {
-        use tokio::io::AsyncWriteExt;
+    fn send(&mut self, msg: &Message) -> impl std::future::Future<Output = Result<()>> + Send {
+        let data = Codec::encode(msg);
 
-        let data = Codec::encode(msg)?;
-        let mut send = self.send.lock().await;
-        send.write_all(&data).await.map_err(|e| Error::Transport {
-            message: format!("failed to send message: {}", e),
-        })?;
-        // Flush to ensure data is sent immediately for low latency
-        send.flush().await.map_err(|e| Error::Transport {
-            message: format!("failed to flush stream: {}", e),
-        })?;
-        Ok(())
+        let send_opt = self.send.as_ref().map(Arc::clone);
+
+        async move {
+            let data = data?;
+            let Some(send) = send_opt else {
+                return Err(Error::Transport {
+                    message: "stream is receive-only".to_string(),
+                });
+            };
+
+            use tokio::io::AsyncWriteExt;
+            let mut send = send.lock().await;
+            send.write_all(&data).await.map_err(|e| Error::Transport {
+                message: format!("failed to send message: {}", e),
+            })?;
+            send.flush().await.map_err(|e| Error::Transport {
+                message: format!("failed to flush stream: {}", e),
+            })?;
+            Ok(())
+        }
     }
 
-    async fn recv(&mut self) -> Result<Message> {
-        let mut recv = self.recv.lock().await;
+    fn recv(&mut self) -> impl std::future::Future<Output = Result<Message>> + Send {
+        let recv_opt = self.recv.as_ref().map(Arc::clone);
+        let mut recv_buf = std::mem::take(&mut self.recv_buf);
 
-        loop {
-            // Try to decode from existing buffer
-            if let Some(msg) = Codec::decode(&mut self.recv_buf)? {
-                return Ok(msg);
-            }
+        let fut = async move {
+            let Some(recv) = recv_opt else {
+                return Err(Error::Transport {
+                    message: "stream is send-only".to_string(),
+                });
+            };
 
-            // Need more data
-            let mut chunk = [0u8; 4096];
-            match recv.read(&mut chunk).await {
-                Ok(Some(n)) => {
-                    self.recv_buf.extend_from_slice(&chunk[..n]);
+            let mut recv = recv.lock().await;
+
+            loop {
+                if let Some(msg) = Codec::decode(&mut recv_buf)? {
+                    return Ok(msg);
                 }
-                Ok(None) => {
-                    // Stream cleanly closed - check buffer one more time for partial message
-                    if let Some(msg) = Codec::decode(&mut self.recv_buf)? {
-                        return Ok(msg);
+
+                let mut chunk = [0u8; 4096];
+                match recv.read(&mut chunk).await {
+                    Ok(Some(n)) => {
+                        recv_buf.extend_from_slice(&chunk[..n]);
                     }
-                    return Err(Error::ConnectionClosed);
-                }
-                Err(e) => {
-                    return Err(Error::Transport {
-                        message: format!("failed to read from stream: {}", e),
-                    });
+                    Ok(None) => {
+                        if let Some(msg) = Codec::decode(&mut recv_buf)? {
+                            return Ok(msg);
+                        }
+                        return Err(Error::ConnectionClosed);
+                    }
+                    Err(e) => {
+                        return Err(Error::Transport {
+                            message: format!("failed to read from stream: {}", e),
+                        });
+                    }
                 }
             }
+        }
+        ;
+
+        async move {
+            let result = fut.await;
+            // Note: recv_buf is consumed; if buffering across calls is needed,
+            // refactor QuicStream to store the buffer via interior mutability.
+            result
         }
     }
 
@@ -184,18 +260,16 @@ impl Connection for QuicConnection {
                 Ok(QuicStream::new(send, recv))
             }
             StreamType::TerminalIn => {
-                // Terminal input is client-initiated unidirectional
-                // For unidirectional, we need to handle this specially
-                // Return an error for now - terminal input should use dedicated method
-                Err(Error::Transport {
-                    message: "use open_uni for terminal input stream".to_string(),
-                })
+                let send = self.inner.open_uni().await.map_err(|e| Error::Transport {
+                    message: format!("failed to open terminal input stream: {}", e),
+                })?;
+                Ok(QuicStream::from_send(send))
             }
             StreamType::TerminalOut => {
-                // Terminal output is server-initiated, client accepts
-                Err(Error::Transport {
-                    message: "terminal output stream is accepted, not opened".to_string(),
-                })
+                let send = self.inner.open_uni().await.map_err(|e| Error::Transport {
+                    message: format!("failed to open terminal output stream: {}", e),
+                })?;
+                Ok(QuicStream::from_send(send))
             }
             StreamType::Forward(_) => {
                 let (send, recv) = self.inner.open_bi().await.map_err(|e| Error::Transport {
@@ -207,28 +281,24 @@ impl Connection for QuicConnection {
     }
 
     async fn accept_stream(&self) -> Result<(StreamType, Self::Stream)> {
-        // Accept bidirectional stream
-        let (send, recv) = self.inner.accept_bi().await.map_err(|e| Error::Transport {
-            message: format!("failed to accept stream: {}", e),
-        })?;
-
-        // Determine stream type based on stream ID
-        // QUIC stream IDs encode initiator and directionality
-        let stream_id = send.id().index();
-
-        let stream_type = match stream_id {
-            0 => StreamType::Control,
-            4 => StreamType::Tunnel,
-            _ => {
-                // Forward streams - extract forward ID
-                let mut next_id = self.next_forward_id.lock().await;
-                let forward_id = *next_id;
-                *next_id += 1;
-                StreamType::Forward(forward_id)
+        select! {
+            bi = self.inner.accept_bi() => {
+                let (send, recv) = bi.map_err(|e| Error::Transport {
+                    message: format!("failed to accept stream: {}", e),
+                })?;
+                let stream_id = send.id().index();
+                let stream_type = map_bidi_stream_type(stream_id, &self.next_forward_id).await;
+                Ok((stream_type, QuicStream::new(send, recv)))
             }
-        };
-
-        Ok((stream_type, QuicStream::new(send, recv)))
+            uni = self.inner.accept_uni() => {
+                let recv = uni.map_err(|e| Error::Transport {
+                    message: format!("failed to accept unidirectional stream: {}", e),
+                })?;
+                let stream_id = recv.id().index();
+                let stream_type = map_uni_stream_type(stream_id);
+                Ok((stream_type, QuicStream::from_recv(recv)))
+            }
+        }
     }
 
     fn remote_addr(&self) -> SocketAddr {

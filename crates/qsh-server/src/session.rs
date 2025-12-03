@@ -15,10 +15,10 @@ use tracing::{debug, info};
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
     Capabilities, HelloAckPayload, Message, ShutdownPayload, ShutdownReason, StateDiff,
-    StateUpdatePayload, TerminalOutputPayload, TerminalState as ProtoTermState,
+    StateUpdatePayload, TerminalOutputPayload,
 };
 use qsh_core::session::SessionState;
-use qsh_core::terminal::TerminalParser;
+use qsh_core::terminal::{TerminalParser, TerminalState};
 use qsh_core::transport::{Connection, QuicConnection, QuicStream, StreamPair, StreamType};
 
 /// Server session configuration.
@@ -56,6 +56,8 @@ pub struct ServerSession {
     quic: Arc<QuicConnection>,
     /// Control stream.
     control: QuicStream,
+    /// Terminal output stream (server -> client).
+    terminal_out: QuicStream,
     /// Session state.
     #[allow(dead_code)] // Will be used for reconnection
     session_state: SessionState,
@@ -142,11 +144,8 @@ impl ServerSession {
         let parser = TerminalParser::new(hello.term_size.cols, hello.term_size.rows);
 
         // Build initial state for client (simplified - just dimensions)
-        let initial_state = ProtoTermState {
-            generation: 1,
-            cols: hello.term_size.cols,
-            rows: hello.term_size.rows,
-        };
+        let mut initial_state = TerminalState::new(hello.term_size.cols, hello.term_size.rows);
+        initial_state.generation = 1;
 
         // Send HelloAck
         let ack = HelloAckPayload {
@@ -161,6 +160,14 @@ impl ServerSession {
 
         let session_state = SessionState::new(hello.session_key);
 
+        // Open terminal output stream (server uni to client)
+        let terminal_out = quic
+            .open_stream(StreamType::TerminalOut)
+            .await
+            .map_err(|e| Error::Transport {
+                message: format!("failed to open terminal output stream: {}", e),
+            })?;
+
         info!(
             term_size = %format!("{}x{}", hello.term_size.cols, hello.term_size.rows),
             term_type = hello.term_type,
@@ -170,6 +177,7 @@ impl ServerSession {
         Ok(Self {
             quic: Arc::new(quic),
             control,
+            terminal_out,
             session_state,
             parser: Arc::new(Mutex::new(parser)),
             confirmed_input_seq: 0,
@@ -229,7 +237,7 @@ impl ServerSession {
             confirmed_input_seq: self.confirmed_input_seq,
         };
 
-        self.control.send(&Message::TerminalOutput(output)).await
+        self.terminal_out.send(&Message::TerminalOutput(output)).await
     }
 
     /// Send a state update to the client.
@@ -247,11 +255,7 @@ impl ServerSession {
         self.confirmed_input_seq = input_seq;
 
         let update = StateUpdatePayload {
-            diff: StateDiff::Full(ProtoTermState {
-                generation: state.generation,
-                cols: state.primary.cols(),
-                rows: state.primary.rows(),
-            }),
+            diff: StateDiff::Full(state.clone()),
             confirmed_input_seq: self.confirmed_input_seq,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -259,7 +263,9 @@ impl ServerSession {
                 .as_micros() as u64,
         };
 
-        self.control.send(&Message::StateUpdate(update)).await
+        self.terminal_out
+            .send(&Message::StateUpdate(update))
+            .await
     }
 
     /// Handle a terminal input message.

@@ -16,7 +16,7 @@ use qsh_client::{
 };
 use qsh_core::constants::DEFAULT_QUIC_PORT_RANGE;
 use qsh_core::forward::ForwardSpec;
-use qsh_core::protocol::{Message, TermSize};
+use qsh_core::protocol::{Message, StateDiff, TermSize};
 
 fn main() {
     // Parse CLI arguments
@@ -64,6 +64,14 @@ fn main() {
         error!(error = %e, "Connection failed");
         eprintln!("qsh: {}", e);
         std::process::exit(1);
+    }
+}
+
+fn extract_generation(diff: &StateDiff) -> Option<u64> {
+    match diff {
+        StateDiff::Full(state) => Some(state.generation),
+        StateDiff::Incremental { to_gen, .. } => Some(*to_gen),
+        StateDiff::CursorOnly { generation, .. } => Some(*generation),
     }
 }
 
@@ -115,6 +123,7 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
                 term_type: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
                 predictive_echo: !cli.no_prediction,
                 connect_timeout: std::time::Duration::from_secs(10),
+                zero_rtt_available: false,
             };
 
             // Try to connect
@@ -154,7 +163,7 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
     let session_key = server_info.decode_session_key()?;
     let cert_hash = server_info.decode_cert_hash().ok();
 
-    let config = ConnectionConfig {
+    let conn = ClientConnection::connect(ConnectionConfig {
         server_addr: addr,
         session_key,
         cert_hash,
@@ -162,9 +171,9 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
         term_type: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
         predictive_echo: !cli.no_prediction,
         connect_timeout: std::time::Duration::from_secs(10),
-    };
-
-    let conn = ClientConnection::connect(config).await?;
+        zero_rtt_available: false, // updated after HelloAck inside connect
+    })
+    .await?;
     info!(rtt = ?conn.rtt(), "Connected to server");
 
     // Drop the bootstrap handle now that QUIC connection is established
@@ -327,40 +336,38 @@ async fn run_session(
                 }
             }
 
-            // Handle server -> stdout
-            msg = conn.recv() => {
+            // Handle server -> stdout/control (terminal preferred)
+            msg = conn.recv_any() => {
                 match msg {
                     Ok(Message::StateUpdate(update)) => {
-                        // Record latency from confirmed sequence
                         if let Some(latency) = conn.record_confirmation(update.confirmed_input_seq) {
                             debug!(
                                 latency_ms = latency.as_secs_f64() * 1000.0,
                                 seq = update.confirmed_input_seq,
                                 "Input latency"
                             );
-                            // Update overlay RTT
                             overlay.metrics_mut().update_rtt(latency);
+                        }
+
+                        if let Some(r#gen) = extract_generation(&update.diff) {
+                            conn.record_generation(r#gen);
                         }
                     }
                     Ok(Message::TerminalOutput(output)) => {
-                        // Record latency from confirmed sequence
                         if let Some(latency) = conn.record_confirmation(output.confirmed_input_seq) {
                             debug!(
                                 latency_ms = latency.as_secs_f64() * 1000.0,
                                 seq = output.confirmed_input_seq,
                                 "Input latency"
                             );
-                            // Update overlay RTT
                             overlay.metrics_mut().update_rtt(latency);
                         }
 
-                        // Write terminal output
                         if let Err(e) = stdout.write(&output.data).await {
                             error!(error = %e, "Failed to write output");
                             break;
                         }
 
-                        // Render overlay after terminal output (if visible)
                         if overlay.is_visible() {
                             let term_size = get_term_size();
                             let overlay_output = overlay.render(term_size.cols);
@@ -369,22 +376,19 @@ async fn run_session(
                             }
                         }
                     }
-                    Ok(Message::Pong(_)) => {
-                        // Pong response, ignore
-                    }
+                    Ok(Message::Pong(_)) => {}
                     Ok(Message::Shutdown(shutdown)) => {
                         info!(reason = ?shutdown.reason, msg = ?shutdown.message, "Server initiated shutdown");
                         if let Some(msg) = &shutdown.message {
-                            // Print shutdown message (e.g., "shell exited with code 0")
                             eprintln!("\r\n{}", msg);
                         }
                         break;
                     }
                     Ok(other) => {
-                        debug!(msg = ?other, "Unexpected message from server");
+                        debug!(msg = ?other, "Unexpected message");
                     }
                     Err(qsh_core::Error::ConnectionClosed) => {
-                        info!("Connection closed by server");
+                        info!("Stream closed by server");
                         break;
                     }
                     Err(e) => {

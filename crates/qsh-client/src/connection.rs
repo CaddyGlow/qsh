@@ -22,7 +22,7 @@ use qsh_core::protocol::{
 };
 use qsh_core::session::{InputTracker, SessionState};
 use qsh_core::transport::{
-    Connection, QuicConnection, QuicStream, StreamPair, client_crypto_config,
+    Connection, QuicConnection, QuicSender, QuicStream, StreamPair, client_crypto_config,
 };
 
 use crate::prediction::PredictionEngine;
@@ -167,6 +167,8 @@ pub struct ConnectionConfig {
     pub predictive_echo: bool,
     /// Connection timeout.
     pub connect_timeout: Duration,
+    /// Whether 0-RTT resumption is available.
+    pub zero_rtt_available: bool,
 }
 
 impl Default for ConnectionConfig {
@@ -179,6 +181,7 @@ impl Default for ConnectionConfig {
             term_type: "xterm-256color".to_string(),
             predictive_echo: true,
             connect_timeout: Duration::from_secs(10),
+            zero_rtt_available: false,
         }
     }
 }
@@ -187,10 +190,16 @@ impl Default for ConnectionConfig {
 pub struct ClientConnection {
     /// QUIC connection wrapper (shared for forwarders).
     quic: Arc<QuicConnection>,
+    /// Connection configuration (for reconnect).
+    config: ConnectionConfig,
     /// Control stream for protocol messages.
     control: QuicStream,
-    /// Channel for queueing outgoing messages.
-    outgoing_tx: tokio::sync::mpsc::UnboundedSender<Message>,
+    /// Terminal input stream sender.
+    terminal_in: QuicSender,
+    /// Terminal output stream (server -> client).
+    terminal_out: QuicStream,
+    /// Channel for queueing terminal input messages.
+    input_tx: tokio::sync::mpsc::UnboundedSender<Message>,
     /// Session state.
     session: SessionState,
     /// Input sequence tracker.
@@ -202,13 +211,15 @@ pub struct ClientConnection {
     server_caps: Capabilities,
     /// Latency tracker for input-to-output measurement.
     latency_tracker: LatencyTracker,
-    /// Handle to sender task (kept alive).
-    _sender_task: tokio::task::JoinHandle<()>,
+    /// Handle to input sender task (kept alive).
+    _input_task: tokio::task::JoinHandle<()>,
+    /// Reconnection handler state.
+    reconnect: qsh_core::session::ReconnectionHandler,
 }
 
 impl ClientConnection {
     /// Establish a new connection to the server.
-    pub async fn connect(config: ConnectionConfig) -> Result<Self> {
+    pub async fn connect(mut config: ConnectionConfig) -> Result<Self> {
         info!(addr = %config.server_addr, "Connecting to server");
 
         // Create QUIC endpoint
@@ -245,6 +256,10 @@ impl ClientConnection {
         info!("QUIC connection established");
         let quic = Arc::new(QuicConnection::new(conn));
 
+        // Session state tracker (pre-handshake)
+        let mut session = SessionState::new(config.session_key);
+        session.set_status(qsh_core::session::SessionStatus::Connecting);
+
         // Open control stream (client-initiated bidi 0)
         let mut control = quic
             .open_stream(qsh_core::transport::StreamType::Control)
@@ -266,8 +281,8 @@ impl ClientConnection {
             },
             term_size: config.term_size,
             term_type: config.term_type.clone(),
-            last_generation: 0,
-            last_input_seq: 0,
+            last_generation: session.last_confirmed_generation(),
+            last_input_seq: session.last_confirmed_input_seq(),
         };
 
         control.send(&Message::Hello(hello)).await?;
@@ -292,34 +307,63 @@ impl ClientConnection {
             "Session established"
         );
 
-        let session = SessionState::new(config.session_key);
+        session.set_status(qsh_core::session::SessionStatus::Connected);
+        // Update zero-RTT availability from server.
+        config.zero_rtt_available = hello_ack.zero_rtt_available;
         let input_tracker = InputTracker::new();
         let prediction = PredictionEngine::new();
         let latency_tracker = LatencyTracker::new();
+        let mut reconnect = qsh_core::session::ReconnectionHandler::new();
+        reconnect.start(
+            session.last_confirmed_generation(),
+            session.last_confirmed_input_seq(),
+            config.zero_rtt_available && hello_ack.zero_rtt_available,
+        );
 
-        // Create a channel for outgoing messages and spawn a sender task
-        let (outgoing_tx, mut outgoing_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
-        let sender = control.sender();
-        let sender_task = tokio::spawn(async move {
-            while let Some(msg) = outgoing_rx.recv().await {
-                if let Err(e) = sender.send(&msg).await {
-                    tracing::error!(error = %e, "Sender task failed");
+        // Open terminal input stream (client uni)
+        let terminal_in_stream = quic
+            .open_stream(qsh_core::transport::StreamType::TerminalIn)
+            .await?;
+        let terminal_in_sender = terminal_in_stream.sender();
+
+        // Accept terminal output stream (server uni)
+        let terminal_out = loop {
+            let (ty, stream) = quic.accept_stream().await?;
+            if matches!(ty, qsh_core::transport::StreamType::TerminalOut) {
+                break stream;
+            } else {
+                // Ignore other streams for now (forwards/tunnel handled elsewhere)
+                tracing::debug!(?ty, "Ignoring unexpected stream during handshake");
+            }
+        };
+
+        // Create a channel for terminal input messages and spawn a sender task
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let input_sender = terminal_in_sender.clone();
+        let input_task = tokio::spawn(async move {
+            while let Some(msg) = input_rx.recv().await {
+                if let Err(e) = input_sender.send(&msg).await {
+                    tracing::error!(error = %e, "Input sender task failed");
                     break;
                 }
             }
-            tracing::debug!("Sender task ended");
+            tracing::debug!("Input sender task ended");
         });
 
         Ok(Self {
             quic,
+            config,
             control,
-            outgoing_tx,
+            terminal_in: terminal_in_sender,
+            terminal_out,
+            input_tx,
             session,
             input_tracker,
             prediction,
             server_caps: hello_ack.capabilities,
             latency_tracker,
-            _sender_task: sender_task,
+            _input_task: input_task,
+            reconnect,
         })
     }
 
@@ -364,7 +408,7 @@ impl ClientConnection {
             predictable,
         });
 
-        self.control.send(&msg).await?;
+        self.terminal_in.send(&msg).await?;
         Ok(seq)
     }
 
@@ -388,7 +432,7 @@ impl ClientConnection {
         });
 
         // Queue to the sender task - this is non-blocking (unbounded channel)
-        if self.outgoing_tx.send(msg).is_err() {
+        if self.input_tx.send(msg).is_err() {
             return Err(Error::Transport {
                 message: "sender task closed".to_string(),
             });
@@ -401,7 +445,17 @@ impl ClientConnection {
     ///
     /// Returns the measured latency if the sequence was being tracked.
     pub fn record_confirmation(&mut self, seq: u64) -> Option<Duration> {
+        // Update trackers
+        self.input_tracker.confirm(seq);
+        self.session.confirm_input_seq(seq);
         self.latency_tracker.record_confirm(seq)
+    }
+
+    /// Record a state generation acknowledged by the server.
+    pub fn record_generation(&mut self, generation: u64) {
+        self.session.confirm_generation(generation);
+        self.reconnect
+            .start(self.session.last_confirmed_generation(), self.session.last_confirmed_input_seq(), self.reconnect.can_use_0rtt());
     }
 
     /// Get the current latency statistics.
@@ -436,9 +490,23 @@ impl ClientConnection {
         Ok(Duration::from_micros(now - pong_time))
     }
 
-    /// Receive a message from the server.
+    /// Receive a message from the server control stream.
     pub async fn recv(&mut self) -> Result<Message> {
         self.control.recv().await
+    }
+
+    /// Receive a message from the terminal output stream.
+    pub async fn recv_terminal(&mut self) -> Result<Message> {
+        self.terminal_out.recv().await
+    }
+
+    /// Receive the next message from either terminal or control stream (terminal preferred).
+    pub async fn recv_any(&mut self) -> Result<Message> {
+        tokio::select! {
+            biased;
+            msg = self.terminal_out.recv() => msg,
+            ctrl = self.control.recv() => ctrl,
+        }
     }
 
     /// Send a resize notification to the server.
@@ -458,6 +526,131 @@ impl ClientConnection {
             .await?;
 
         self.control.close();
+        Ok(())
+    }
+
+    /// Attempt to reconnect using stored session state.
+    pub async fn reconnect(&mut self) -> Result<()> {
+        // Mark reconnecting
+        self.session
+            .set_status(qsh_core::session::SessionStatus::Reconnecting);
+
+        // Establish new QUIC connection
+        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).map_err(|e| {
+            Error::Transport {
+                message: format!("failed to create QUIC endpoint: {}", e),
+            }
+        })?;
+
+        let crypto = client_crypto_config(self.config.cert_hash.as_deref())?;
+        let client_config = ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(crypto).map_err(|e| {
+                Error::Transport {
+                    message: format!("failed to create QUIC config: {}", e),
+                }
+            })?,
+        ));
+        endpoint.set_default_client_config(client_config);
+
+        let connecting = endpoint
+            .connect(self.config.server_addr, "qsh-server")
+            .map_err(|e| Error::Transport {
+                message: format!("failed to initiate connection: {}", e),
+            })?;
+
+        let conn = tokio::time::timeout(self.config.connect_timeout, connecting)
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(|e| Error::Transport {
+                message: format!("connection failed: {}", e),
+            })?;
+
+        let quic = Arc::new(QuicConnection::new(conn));
+
+        // Open control stream
+        let mut control = quic
+            .open_stream(qsh_core::transport::StreamType::Control)
+            .await?;
+
+        // Send Hello with last known state
+        let hello = HelloPayload {
+            protocol_version: 1,
+            session_key: *self.session.session_key(),
+            client_nonce: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64,
+            capabilities: Capabilities {
+                predictive_echo: self.config.predictive_echo,
+                compression: false,
+                max_forwards: self.server_caps.max_forwards,
+                tunnel: self.server_caps.tunnel,
+            },
+            term_size: self.config.term_size,
+            term_type: self.config.term_type.clone(),
+            last_generation: self.session.last_confirmed_generation(),
+            last_input_seq: self.session.last_confirmed_input_seq(),
+        };
+        control.send(&Message::Hello(hello)).await?;
+
+        // Await HelloAck
+        let hello_ack = match control.recv().await? {
+            Message::HelloAck(ack) => ack,
+            other => {
+                return Err(Error::Protocol {
+                    message: format!("expected HelloAck on reconnect, got {:?}", other),
+                });
+            }
+        };
+
+        if !hello_ack.accepted {
+            self.session.set_status(qsh_core::session::SessionStatus::Closed);
+            return Err(Error::AuthenticationFailed);
+        }
+
+        // Update zero-RTT availability
+        self.config.zero_rtt_available = hello_ack.zero_rtt_available;
+        self.session.set_status(qsh_core::session::SessionStatus::Connected);
+
+        // Open terminal in/out streams
+        let terminal_in_stream = quic
+            .open_stream(qsh_core::transport::StreamType::TerminalIn)
+            .await?;
+        let terminal_in_sender = terminal_in_stream.sender();
+
+        let terminal_out = loop {
+            let (ty, stream) = quic.accept_stream().await?;
+            if matches!(ty, qsh_core::transport::StreamType::TerminalOut) {
+                break stream;
+            }
+        };
+
+        // Reset trackers to last confirmed values
+        self.input_tracker =
+            qsh_core::session::InputTracker::from_seq(self.session.last_confirmed_input_seq());
+        self.latency_tracker = LatencyTracker::new();
+
+        // Restart input sender task/channel
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let input_sender = terminal_in_sender.clone();
+        let input_task = tokio::spawn(async move {
+            while let Some(msg) = input_rx.recv().await {
+                if let Err(e) = input_sender.send(&msg).await {
+                    tracing::error!(error = %e, "Input sender task failed");
+                    break;
+                }
+            }
+        });
+
+        // Swap in new connection state
+        self.quic = quic;
+        self.control = control;
+        self.terminal_in = terminal_in_sender;
+        self.terminal_out = terminal_out;
+        self.input_tx = input_tx;
+        self._input_task = input_task;
+        self.server_caps = hello_ack.capabilities;
+
         Ok(())
     }
 }

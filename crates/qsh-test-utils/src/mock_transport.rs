@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::Message;
-use qsh_core::transport::StreamType;
+use qsh_core::transport::{Connection, StreamPair, StreamType};
 
 /// A mock bidirectional stream using channels.
 #[derive(Debug)]
@@ -73,6 +73,20 @@ impl MockStream {
     }
 }
 
+impl StreamPair for MockStream {
+    fn send(&mut self, msg: &Message) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move { self.send(msg).await }
+    }
+
+    fn recv(&mut self) -> impl std::future::Future<Output = Result<Message>> + Send {
+        async move { self.recv().await }
+    }
+
+    fn close(&mut self) {
+        self.close()
+    }
+}
+
 /// A mock connection for testing.
 #[derive(Debug)]
 pub struct MockConnection {
@@ -84,7 +98,7 @@ pub struct MockConnection {
     #[allow(dead_code)] // Will be used for stream management in future
     streams: Arc<Mutex<HashMap<StreamType, MockStream>>>,
     /// Pending incoming streams.
-    incoming_rx: mpsc::Receiver<(StreamType, MockStream)>,
+    incoming_rx: Arc<Mutex<mpsc::Receiver<(StreamType, MockStream)>>>,
     /// Channel for peer to send incoming streams.
     incoming_tx: mpsc::Sender<(StreamType, MockStream)>,
     /// Counter for generating forward IDs.
@@ -103,7 +117,7 @@ impl MockConnection {
             local_addr,
             remote_addr,
             streams: Arc::new(Mutex::new(HashMap::new())),
-            incoming_rx,
+            incoming_rx: Arc::new(Mutex::new(incoming_rx)),
             incoming_tx,
             next_forward_id: AtomicU64::new(0),
             rtt: Duration::from_millis(10),
@@ -127,9 +141,14 @@ impl MockConnection {
         (our_half, peer_half)
     }
 
-    /// Accept an incoming stream.
-    pub async fn accept_stream(&mut self) -> Result<(StreamType, MockStream)> {
-        self.incoming_rx.recv().await.ok_or(Error::ConnectionClosed)
+    /// Accept an incoming stream (mutable convenience).
+    pub async fn accept_stream_mut(&mut self) -> Result<(StreamType, MockStream)> {
+        self.incoming_rx
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or(Error::ConnectionClosed)
     }
 
     /// Get the remote peer's address.
@@ -165,6 +184,49 @@ impl MockConnection {
     /// Generate a new forward ID.
     pub fn next_forward_id(&self) -> u64 {
         self.next_forward_id.fetch_add(1, Ordering::SeqCst)
+    }
+}
+
+impl Connection for MockConnection {
+    type Stream = MockStream;
+
+    fn open_stream(
+        &self,
+        stream_type: StreamType,
+    ) -> impl std::future::Future<Output = Result<Self::Stream>> + Send {
+        let sender = self.incoming_tx.clone();
+        let (our_half, peer_half) = self.open_stream_half(stream_type);
+        async move {
+            sender
+                .send((stream_type, peer_half))
+                .await
+                .map_err(|_| Error::ConnectionClosed)?;
+            Ok(our_half)
+        }
+    }
+
+    fn accept_stream(&self) -> impl std::future::Future<Output = Result<(StreamType, Self::Stream)>> + Send {
+        let rx = Arc::clone(&self.incoming_rx);
+        async move {
+            let mut guard = rx.lock().await;
+            guard.recv().await.ok_or(Error::ConnectionClosed)
+        }
+    }
+
+    fn remote_addr(&self) -> SocketAddr {
+        self.remote_addr()
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        self.local_addr()
+    }
+
+    fn is_connected(&self) -> bool {
+        self.is_connected()
+    }
+
+    fn rtt(&self) -> Duration {
+        self.rtt()
     }
 }
 

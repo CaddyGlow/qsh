@@ -10,6 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
+
 // =============================================================================
 // Top-level Message Enum
 // =============================================================================
@@ -212,72 +213,8 @@ pub struct StateAckPayload {
 // Terminal State Types (Placeholders - will be filled in Track B)
 // =============================================================================
 
-/// Terminal state representation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub struct TerminalState {
-    /// Monotonic version number.
-    pub generation: u64,
-    /// Screen dimensions.
-    pub cols: u16,
-    pub rows: u16,
-    // Full implementation in terminal module
-}
-
-/// State diff enumeration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum StateDiff {
-    /// Complete terminal state (reconnect, major desync).
-    Full(TerminalState),
-    /// Incremental changes.
-    Incremental(IncrementalDiff),
-    /// Only cursor moved.
-    CursorOnly(CursorUpdate),
-}
-
-/// Incremental diff for terminal state.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct IncrementalDiff {
-    /// Previous generation this diff applies to.
-    pub from_generation: u64,
-    /// New generation after applying.
-    pub to_generation: u64,
-    /// Changed cells.
-    pub cell_changes: Vec<CellChange>,
-    /// Cursor update (if changed).
-    pub cursor: Option<CursorState>,
-}
-
-/// Single cell change.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CellChange {
-    pub col: u16,
-    pub row: u16,
-    pub cell: Cell,
-}
-
-/// Cell representation (placeholder).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub struct Cell {
-    /// Unicode grapheme cluster.
-    pub grapheme: String,
-    /// Display width (1 or 2).
-    pub width: u8,
-}
-
-/// Cursor-only update.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CursorUpdate {
-    pub generation: u64,
-    pub cursor: CursorState,
-}
-
-/// Cursor state.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub struct CursorState {
-    pub col: u16,
-    pub row: u16,
-    pub visible: bool,
-}
+// Terminal state/diff are provided by the terminal module.
+pub use crate::terminal::{Cell, Cursor, StateDiff, TerminalState};
 
 // =============================================================================
 // Forward Messages
@@ -802,16 +739,18 @@ mod tests {
     #[test]
     fn test_state_diff_variants() {
         let _full = StateDiff::Full(TerminalState::default());
-        let _incremental = StateDiff::Incremental(IncrementalDiff {
-            from_generation: 0,
-            to_generation: 1,
-            cell_changes: vec![],
+        let _incremental = StateDiff::Incremental {
+            from_gen: 0,
+            to_gen: 1,
+            changes: vec![],
             cursor: None,
-        });
-        let _cursor = StateDiff::CursorOnly(CursorUpdate {
+            title: None,
+            alternate_active: None,
+        };
+        let _cursor = StateDiff::CursorOnly {
             generation: 1,
-            cursor: CursorState::default(),
-        });
+            cursor: Cursor::default(),
+        };
     }
 
     #[cfg(feature = "tunnel")]
