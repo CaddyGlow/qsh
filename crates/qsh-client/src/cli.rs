@@ -186,7 +186,11 @@ pub struct Cli {
     pub bootstrap_port_range: Option<(u16, u16)>,
 
     /// Additional arguments to pass to `qsh-server --bootstrap` (quoted as a single string)
-    #[arg(long = "bootstrap-server-args", value_name = "ARGS", allow_hyphen_values = true)]
+    #[arg(
+        long = "bootstrap-server-args",
+        value_name = "ARGS",
+        allow_hyphen_values = true
+    )]
     pub bootstrap_server_args: Option<String>,
 
     /// Force predictive echo off (safer for password prompts)

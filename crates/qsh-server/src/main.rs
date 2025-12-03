@@ -22,7 +22,8 @@ fn main() {
     // Bootstrap mode: minimal logging to stderr, JSON output to stdout
     if cli.bootstrap {
         // Only log errors in bootstrap mode (to stderr)
-        if let Err(e) = qsh_core::init_logging(0, None, qsh_core::LogFormat::Text) {
+        let log_path = cli.log_file.as_deref();
+        if let Err(e) = qsh_core::init_logging(cli.verbose, log_path, cli.log_format.into()) {
             eprintln!("Failed to initialize logging: {}", e);
             std::process::exit(1);
         }
