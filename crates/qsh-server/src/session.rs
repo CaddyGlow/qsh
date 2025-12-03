@@ -237,7 +237,9 @@ impl ServerSession {
             confirmed_input_seq: self.confirmed_input_seq,
         };
 
-        self.terminal_out.send(&Message::TerminalOutput(output)).await
+        self.terminal_out
+            .send(&Message::TerminalOutput(output))
+            .await
     }
 
     /// Send a state update to the client.
@@ -263,9 +265,7 @@ impl ServerSession {
                 .as_micros() as u64,
         };
 
-        self.terminal_out
-            .send(&Message::StateUpdate(update))
-            .await
+        self.terminal_out.send(&Message::StateUpdate(update)).await
     }
 
     /// Handle a terminal input message.

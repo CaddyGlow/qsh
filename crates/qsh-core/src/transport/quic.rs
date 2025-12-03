@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use quinn::{RecvStream, SendStream};
-use tokio::sync::Mutex;
 use tokio::select;
+use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
 use crate::protocol::{Codec, Message};
@@ -192,8 +192,7 @@ impl StreamPair for QuicStream {
                     }
                 }
             }
-        }
-        ;
+        };
 
         async move {
             let result = fut.await;

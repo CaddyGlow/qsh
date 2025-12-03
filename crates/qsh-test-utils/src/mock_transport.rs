@@ -205,7 +205,9 @@ impl Connection for MockConnection {
         }
     }
 
-    fn accept_stream(&self) -> impl std::future::Future<Output = Result<(StreamType, Self::Stream)>> + Send {
+    fn accept_stream(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(StreamType, Self::Stream)>> + Send {
         let rx = Arc::clone(&self.incoming_rx);
         async move {
             let mut guard = rx.lock().await;

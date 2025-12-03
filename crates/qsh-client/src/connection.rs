@@ -454,8 +454,11 @@ impl ClientConnection {
     /// Record a state generation acknowledged by the server.
     pub fn record_generation(&mut self, generation: u64) {
         self.session.confirm_generation(generation);
-        self.reconnect
-            .start(self.session.last_confirmed_generation(), self.session.last_confirmed_input_seq(), self.reconnect.can_use_0rtt());
+        self.reconnect.start(
+            self.session.last_confirmed_generation(),
+            self.session.last_confirmed_input_seq(),
+            self.reconnect.can_use_0rtt(),
+        );
     }
 
     /// Get the current latency statistics.
@@ -536,11 +539,10 @@ impl ClientConnection {
             .set_status(qsh_core::session::SessionStatus::Reconnecting);
 
         // Establish new QUIC connection
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).map_err(|e| {
-            Error::Transport {
+        let mut endpoint =
+            Endpoint::client("0.0.0.0:0".parse().unwrap()).map_err(|e| Error::Transport {
                 message: format!("failed to create QUIC endpoint: {}", e),
-            }
-        })?;
+            })?;
 
         let crypto = client_crypto_config(self.config.cert_hash.as_deref())?;
         let client_config = ClientConfig::new(Arc::new(
@@ -604,13 +606,15 @@ impl ClientConnection {
         };
 
         if !hello_ack.accepted {
-            self.session.set_status(qsh_core::session::SessionStatus::Closed);
+            self.session
+                .set_status(qsh_core::session::SessionStatus::Closed);
             return Err(Error::AuthenticationFailed);
         }
 
         // Update zero-RTT availability
         self.config.zero_rtt_available = hello_ack.zero_rtt_available;
-        self.session.set_status(qsh_core::session::SessionStatus::Connected);
+        self.session
+            .set_status(qsh_core::session::SessionStatus::Connected);
 
         // Open terminal in/out streams
         let terminal_in_stream = quic

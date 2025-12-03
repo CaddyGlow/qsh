@@ -324,7 +324,10 @@ async fn handle_session(mut session: ServerSession) -> qsh_core::Result<()> {
                                         }
                                     }
                                     Ok(other) => {
-                                        tracing::warn!(?other, "Unexpected message on terminal input stream");
+                                        tracing::warn!(
+                                            ?other,
+                                            "Unexpected message on terminal input stream"
+                                        );
                                     }
                                     Err(qsh_core::Error::ConnectionClosed) => break,
                                     Err(e) => {
