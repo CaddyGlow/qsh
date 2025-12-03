@@ -12,15 +12,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use quinn::{ClientConfig, Endpoint};
-use tracing::{debug, info};
+use quinn::{ClientConfig, Endpoint, IdleTimeout, TransportConfig};
+use tracing::{debug, info, warn};
 
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
     Capabilities, HelloPayload, Message, ResizePayload, ShutdownPayload, ShutdownReason, TermSize,
     TerminalInputPayload,
 };
-use qsh_core::session::{InputTracker, SessionState};
+use qsh_core::session::{InputTracker, ReconnectResult, SessionState};
 use qsh_core::transport::{
     Connection, QuicConnection, QuicSender, QuicStream, StreamPair, client_crypto_config,
 };
@@ -228,15 +228,23 @@ impl ClientConnection {
                 message: format!("failed to create QUIC endpoint: {}", e),
             })?;
 
+        // Configure transport (keepalive + long idle timeout)
+        let mut transport = TransportConfig::default();
+        transport.keep_alive_interval(Some(Duration::from_secs(10)));
+        if let Ok(timeout) = IdleTimeout::try_from(Duration::from_secs(30)) {
+            transport.max_idle_timeout(Some(timeout));
+        }
+
         // Configure TLS with optional cert pinning
         let crypto = client_crypto_config(config.cert_hash.as_deref())?;
-        let client_config = ClientConfig::new(Arc::new(
+        let mut client_config = ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto).map_err(|e| {
                 Error::Transport {
                     message: format!("failed to create QUIC config: {}", e),
                 }
             })?,
         ));
+        client_config.transport_config(Arc::new(transport));
         endpoint.set_default_client_config(client_config);
 
         // Connect to server
@@ -544,14 +552,21 @@ impl ClientConnection {
                 message: format!("failed to create QUIC endpoint: {}", e),
             })?;
 
+        let mut transport = TransportConfig::default();
+        transport.keep_alive_interval(Some(Duration::from_secs(15)));
+        if let Ok(timeout) = IdleTimeout::try_from(Duration::from_secs(60 * 60 * 24 * 7)) {
+            transport.max_idle_timeout(Some(timeout));
+        }
+
         let crypto = client_crypto_config(self.config.cert_hash.as_deref())?;
-        let client_config = ClientConfig::new(Arc::new(
+        let mut client_config = ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto).map_err(|e| {
                 Error::Transport {
                     message: format!("failed to create QUIC config: {}", e),
                 }
             })?,
         ));
+        client_config.transport_config(Arc::new(transport));
         endpoint.set_default_client_config(client_config);
 
         let connecting = endpoint
@@ -655,7 +670,73 @@ impl ClientConnection {
         self._input_task = input_task;
         self.server_caps = hello_ack.capabilities;
 
+        // Process reconnection result to update trackers/state.
+        let (server_generation, server_input_seq, needs_full_sync) =
+            if let Some(state) = hello_ack.initial_state {
+                (state.generation, 0, true)
+            } else {
+                (
+                    self.session.last_confirmed_generation(),
+                    self.session.last_confirmed_input_seq(),
+                    false,
+                )
+            };
+
+        let result = ReconnectResult::Success {
+            server_input_seq,
+            server_generation,
+            needs_full_sync,
+        };
+
+        self.reconnect
+            .process_result(&result, &mut self.session, &mut self.input_tracker)?;
+
+        // Prepare handler for potential future reconnects.
+        self.reconnect.start(
+            self.session.last_confirmed_generation(),
+            self.session.last_confirmed_input_seq(),
+            self.config.zero_rtt_available,
+        );
+
         Ok(())
+    }
+
+    /// Attempt to reconnect with exponential backoff until success or exhaustion.
+    ///
+    /// `on_attempt` is invoked before each attempt with (attempt_number, delay_before_attempt).
+    pub async fn reconnect_with_backoff(
+        &mut self,
+        mut on_attempt: impl FnMut(u32, Duration),
+    ) -> Result<()> {
+        let mut last_err: Option<Error> = None;
+
+        while self.reconnect.should_retry() {
+            let delay = self.reconnect.next_delay();
+            on_attempt(self.reconnect.attempt(), delay);
+            tokio::time::sleep(delay).await;
+
+            match self.reconnect().await {
+                Ok(()) => {
+                    self.reconnect.reset();
+                    self.reconnect.start(
+                        self.session.last_confirmed_generation(),
+                        self.session.last_confirmed_input_seq(),
+                        self.config.zero_rtt_available,
+                    );
+                    return Ok(());
+                }
+                Err(Error::AuthenticationFailed) => return Err(Error::AuthenticationFailed),
+                Err(Error::SessionExpired) => return Err(Error::SessionExpired),
+                Err(e) => {
+                    warn!(error = %e, attempt = self.reconnect.attempt(), "Reconnect attempt failed");
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or(Error::Transport {
+            message: "reconnection attempts exhausted".to_string(),
+        }))
     }
 }
 

@@ -12,7 +12,7 @@ use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use quinn::{Endpoint, ServerConfig};
+use quinn::{Endpoint, IdleTimeout, ServerConfig, TransportConfig};
 use rand::Rng;
 use ring::digest::{self, SHA256};
 use tracing::{debug, info};
@@ -66,13 +66,19 @@ impl BootstrapServer {
 
         // Create TLS config
         let crypto = server_crypto_config(cert_der.clone(), key_der.clone())?;
-        let server_config = ServerConfig::with_crypto(Arc::new(
+        let mut server_config = ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(crypto).map_err(|e| {
                 Error::Transport {
                     message: format!("failed to create QUIC config: {}", e),
                 }
             })?,
         ));
+
+        // Configure transport (keepalive + idle timeout)
+        let mut transport = TransportConfig::default();
+        transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+        transport.max_idle_timeout(IdleTimeout::try_from(std::time::Duration::from_secs(30)).ok());
+        server_config.transport_config(Arc::new(transport));
 
         // Find an available port and create endpoint
         let endpoint = if port == 0 {

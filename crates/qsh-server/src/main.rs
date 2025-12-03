@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::Parser;
-use quinn::{Endpoint, ServerConfig};
+use quinn::{Endpoint, IdleTimeout, ServerConfig, TransportConfig};
 use tracing::{debug, error, info, warn};
 
 use qsh_core::protocol::{Capabilities, Message, ResizePayload, ShutdownReason};
@@ -191,13 +191,19 @@ async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
 
     // Create TLS config
     let crypto = server_crypto_config(cert, key)?;
-    let server_config = ServerConfig::with_crypto(Arc::new(
+    let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(crypto).map_err(|e| {
             qsh_core::Error::Transport {
                 message: format!("failed to create QUIC config: {}", e),
             }
         })?,
     ));
+
+    // Configure transport (keepalive + idle timeout)
+    let mut transport = TransportConfig::default();
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+    transport.max_idle_timeout(IdleTimeout::try_from(std::time::Duration::from_secs(30)).ok());
+    server_config.transport_config(Arc::new(transport));
 
     // Create QUIC endpoint
     let endpoint =

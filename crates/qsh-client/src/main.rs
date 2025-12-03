@@ -3,8 +3,10 @@
 //! Modern roaming-capable remote terminal client.
 
 use std::net::ToSocketAddrs;
+use std::sync::Arc;
 
 use clap::Parser;
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use qsh_client::cli::{OverlayPosition as CliOverlayPosition, SshBootstrapMode};
@@ -17,6 +19,7 @@ use qsh_client::{
 use qsh_core::constants::DEFAULT_QUIC_PORT_RANGE;
 use qsh_core::forward::ForwardSpec;
 use qsh_core::protocol::{Message, StateDiff, TermSize};
+use qsh_core::transport::QuicConnection;
 
 fn main() {
     // Parse CLI arguments
@@ -208,55 +211,7 @@ async fn run_session(
     let toggle_key = parse_toggle_key(&cli.overlay_key);
 
     // Start port forwarders
-    let quic_conn = conn.quic_connection();
-    let mut forward_handles = Vec::new();
-
-    // Start local forwarders (-L)
-    for spec_str in &cli.local_forward {
-        match ForwardSpec::parse_local(spec_str) {
-            Ok(spec) => match LocalForwarder::new(spec, quic_conn.clone()).await {
-                Ok(mut forwarder) => {
-                    info!(spec = spec_str.as_str(), "Local forward started");
-                    forward_handles.push(tokio::spawn(async move {
-                        if let Err(e) = forwarder.run().await {
-                            error!(error = %e, "Local forwarder error");
-                        }
-                    }));
-                }
-                Err(e) => {
-                    warn!(spec = spec_str.as_str(), error = %e, "Failed to start local forward");
-                }
-            },
-            Err(e) => {
-                warn!(spec = spec_str.as_str(), error = %e, "Invalid local forward spec");
-            }
-        }
-    }
-
-    // Start dynamic forwarders (-D)
-    for spec_str in &cli.dynamic_forward {
-        match ForwardSpec::parse_dynamic(spec_str) {
-            Ok(spec) => {
-                let bind_addr = spec.bind_addr();
-                match Socks5Proxy::new(bind_addr, quic_conn.clone()).await {
-                    Ok(mut proxy) => {
-                        info!(addr = %bind_addr, "SOCKS5 proxy started");
-                        forward_handles.push(tokio::spawn(async move {
-                            if let Err(e) = proxy.run().await {
-                                error!(error = %e, "SOCKS5 proxy error");
-                            }
-                        }));
-                    }
-                    Err(e) => {
-                        warn!(spec = spec_str.as_str(), error = %e, "Failed to start SOCKS5 proxy");
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(spec = spec_str.as_str(), error = %e, "Invalid dynamic forward spec");
-            }
-        }
-    }
+    let mut forward_handles = spawn_forwarders(cli, conn.quic_connection()).await;
 
     // Note: Remote forwards (-R) are server-initiated and handled differently
     // They would be sent as ForwardSetup messages during handshake
@@ -322,7 +277,8 @@ async fn run_session(
                             }
                             Err(e) => {
                                 error!(error = %e, "Failed to queue input");
-                                break;
+                                attempt_reconnect(&mut conn, cli, &mut overlay, &mut stdout, &mut forward_handles).await?;
+                                continue;
                             }
                         }
                     }
@@ -389,12 +345,18 @@ async fn run_session(
                         debug!(msg = ?other, "Unexpected message");
                     }
                     Err(qsh_core::Error::ConnectionClosed) => {
-                        info!("Stream closed by server");
-                        break;
+                        info!("Stream closed by server, attempting reconnect");
+                        attempt_reconnect(&mut conn, cli, &mut overlay, &mut stdout, &mut forward_handles).await?;
+                        continue;
                     }
                     Err(e) => {
                         error!(error = %e, "Error receiving from server");
-                        break;
+                        if should_attempt_reconnect(&e) {
+                            attempt_reconnect(&mut conn, cli, &mut overlay, &mut stdout, &mut forward_handles).await?;
+                            continue;
+                        } else {
+                            break;
+                        }
                     }
                 }
             }
@@ -436,10 +398,122 @@ async fn run_session(
     Ok(())
 }
 
+async fn attempt_reconnect(
+    conn: &mut ClientConnection,
+    cli: &Cli,
+    overlay: &mut StatusOverlay,
+    stdout: &mut StdoutWriter,
+    forward_handles: &mut Vec<JoinHandle<()>>,
+) -> qsh_core::Result<()> {
+    // Stop existing forwarders; they'll be recreated after reconnect.
+    for handle in forward_handles.drain(..) {
+        handle.abort();
+    }
+
+    overlay.set_status(ConnectionStatus::Reconnecting);
+    render_overlay_if_visible(overlay, stdout).await;
+
+    if let Err(e) = conn
+        .reconnect_with_backoff(|attempt, delay| {
+            info!(
+                attempt,
+                delay_ms = delay.as_millis(),
+                "Attempting reconnection after transport loss"
+            );
+        })
+        .await
+    {
+        overlay.set_status(ConnectionStatus::Disconnected);
+        render_overlay_if_visible(overlay, stdout).await;
+        return Err(e);
+    }
+
+    overlay.metrics_mut().record_reconnect();
+    overlay.metrics_mut().update_rtt(conn.rtt());
+    overlay.set_status(ConnectionStatus::Connected);
+
+    *forward_handles = spawn_forwarders(cli, conn.quic_connection()).await;
+    render_overlay_if_visible(overlay, stdout).await;
+
+    Ok(())
+}
+
+async fn render_overlay_if_visible(overlay: &StatusOverlay, stdout: &mut StdoutWriter) {
+    if overlay.is_visible() {
+        let term_size = get_term_size();
+        let overlay_output = overlay.render(term_size.cols);
+        if !overlay_output.is_empty() {
+            let _ = stdout.write(overlay_output.as_bytes()).await;
+        }
+    }
+}
+
+fn should_attempt_reconnect(err: &qsh_core::Error) -> bool {
+    matches!(
+        err,
+        qsh_core::Error::Transport { .. }
+            | qsh_core::Error::ConnectionClosed
+            | qsh_core::Error::Timeout
+    )
+}
+
+async fn spawn_forwarders(cli: &Cli, quic_conn: Arc<QuicConnection>) -> Vec<JoinHandle<()>> {
+    let mut forward_handles = Vec::new();
+
+    // Start local forwarders (-L)
+    for spec_str in &cli.local_forward {
+        match ForwardSpec::parse_local(spec_str) {
+            Ok(spec) => match LocalForwarder::new(spec, quic_conn.clone()).await {
+                Ok(mut forwarder) => {
+                    info!(spec = spec_str.as_str(), "Local forward started");
+                    forward_handles.push(tokio::spawn(async move {
+                        if let Err(e) = forwarder.run().await {
+                            error!(error = %e, "Local forwarder error");
+                        }
+                    }));
+                }
+                Err(e) => {
+                    warn!(spec = spec_str.as_str(), error = %e, "Failed to start local forward");
+                }
+            },
+            Err(e) => {
+                warn!(spec = spec_str.as_str(), error = %e, "Invalid local forward spec");
+            }
+        }
+    }
+
+    // Start dynamic forwarders (-D)
+    for spec_str in &cli.dynamic_forward {
+        match ForwardSpec::parse_dynamic(spec_str) {
+            Ok(spec) => {
+                let bind_addr = spec.bind_addr();
+                match Socks5Proxy::new(bind_addr, quic_conn.clone()).await {
+                    Ok(mut proxy) => {
+                        info!(addr = %bind_addr, "SOCKS5 proxy started");
+                        forward_handles.push(tokio::spawn(async move {
+                            if let Err(e) = proxy.run().await {
+                                error!(error = %e, "SOCKS5 proxy error");
+                            }
+                        }));
+                    }
+                    Err(e) => {
+                        warn!(spec = spec_str.as_str(), error = %e, "Failed to start SOCKS5 proxy");
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(spec = spec_str.as_str(), error = %e, "Invalid dynamic forward spec");
+            }
+        }
+    }
+
+    forward_handles
+}
+
 /// Fallback session for when raw mode isn't available.
 async fn run_session_cooked(
     conn: ClientConnection,
-    mut forward_handles: Vec<tokio::task::JoinHandle<()>>,
+    mut forward_handles: Vec<JoinHandle<()>>,
 ) -> qsh_core::Result<()> {
     eprintln!("Running in cooked mode (raw terminal unavailable).");
     eprintln!("Press Ctrl+C to exit.");

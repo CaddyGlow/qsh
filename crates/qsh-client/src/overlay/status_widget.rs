@@ -98,6 +98,11 @@ impl ConnectionMetrics {
         self.bytes_recv += bytes as u64;
     }
 
+    /// Record a reconnection event.
+    pub fn record_reconnect(&mut self) {
+        self.reconnect_count = self.reconnect_count.saturating_add(1);
+    }
+
     /// Get session duration.
     pub fn session_duration(&self) -> Duration {
         self.session_start
@@ -316,6 +321,14 @@ mod tests {
 
         metrics.record_recv(200);
         assert_eq!(metrics.bytes_recv, 200);
+    }
+
+    #[test]
+    fn metrics_record_reconnect() {
+        let mut metrics = ConnectionMetrics::new();
+        metrics.record_reconnect();
+        metrics.record_reconnect();
+        assert_eq!(metrics.reconnect_count, 2);
     }
 
     #[test]
