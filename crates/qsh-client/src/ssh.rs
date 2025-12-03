@@ -52,6 +52,8 @@ pub struct SshConfig {
     pub skip_host_key_check: bool,
     /// Requested bootstrap QUIC port range.
     pub port_range: Option<(u16, u16)>,
+    /// Additional args to pass to `qsh-server --bootstrap`.
+    pub server_args: Option<String>,
     /// SSH implementation to use for bootstrap.
     pub mode: BootstrapMode,
 }
@@ -63,6 +65,7 @@ impl Default for SshConfig {
             identity_file: None,
             skip_host_key_check: false,
             port_range: None,
+            server_args: None,
             mode: BootstrapMode::SshCli,
         }
     }
@@ -160,6 +163,14 @@ async fn bootstrap_via_ssh_cli(
     cmd.arg("qsh-server").arg("--bootstrap");
     if let Some((start, end)) = config.port_range {
         cmd.arg("--port-range").arg(format!("{}-{}", start, end));
+    }
+    if let Some(args) = &config.server_args {
+        let extra = shell_words::split(args).map_err(|e| Error::Transport {
+            message: format!("invalid bootstrap server args: {}", e),
+        })?;
+        for a in extra {
+            cmd.arg(a);
+        }
     }
     cmd.stdin(Stdio::null()); // Don't inherit stdin - we need it for terminal input
     cmd.stdout(Stdio::piped());
@@ -328,6 +339,10 @@ async fn bootstrap_via_russh(
     let mut bootstrap_cmd = "qsh-server --bootstrap".to_string();
     if let Some((start, end)) = config.port_range {
         bootstrap_cmd.push_str(&format!(" --port-range {}-{}", start, end));
+    }
+    if let Some(args) = &config.server_args {
+        bootstrap_cmd.push(' ');
+        bootstrap_cmd.push_str(args);
     }
 
     channel

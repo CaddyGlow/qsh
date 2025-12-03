@@ -85,6 +85,7 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
         identity_file: cli.identity.first().cloned(),
         skip_host_key_check: false,
         port_range: cli.bootstrap_port_range,
+        server_args: cli.bootstrap_server_args.clone(),
         mode: match cli.ssh_bootstrap_mode {
             SshBootstrapMode::Ssh => BootstrapMode::SshCli,
             SshBootstrapMode::Russh => BootstrapMode::Russh,
@@ -509,7 +510,8 @@ fn create_status_overlay(cli: &Cli, user_host: Option<String>) -> StatusOverlay 
     }
 
     // Set initial visibility (--status enables, --no-overlay disables)
-    let visible = cli.show_status && !cli.no_overlay && cli.overlay_position != CliOverlayPosition::None;
+    let visible =
+        cli.show_status && !cli.no_overlay && cli.overlay_position != CliOverlayPosition::None;
     overlay.set_visible(visible);
 
     // Set user@host if available
