@@ -101,7 +101,10 @@ impl Codec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Capabilities, HelloPayload, TermSize, TerminalInputPayload};
+    use crate::protocol::{
+        Capabilities, HelloAckPayload, HelloPayload, TermSize, TerminalInputPayload,
+    };
+    use crate::terminal::TerminalState;
 
     #[test]
     fn encode_decode_roundtrip_ping() {
@@ -122,6 +125,25 @@ mod tests {
             term_type: "xterm-256color".into(),
             last_generation: 0,
             last_input_seq: 0,
+        });
+
+        let encoded = Codec::encode(&msg).unwrap();
+        let decoded = Codec::decode_slice(&encoded).unwrap().unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn encode_decode_roundtrip_hello_ack_with_initial_state() {
+        let mut state = TerminalState::new(80, 24);
+        state.pending_osc.clear(); // Explicit for clarity
+
+        let msg = Message::HelloAck(HelloAckPayload {
+            protocol_version: 1,
+            accepted: true,
+            reject_reason: None,
+            capabilities: Capabilities::default(),
+            initial_state: Some(state),
+            zero_rtt_available: false,
         });
 
         let encoded = Codec::encode(&msg).unwrap();

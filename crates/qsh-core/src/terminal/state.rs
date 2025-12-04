@@ -361,7 +361,7 @@ pub struct TerminalState {
     pub clipboard: Option<(String, String)>,
     /// Pending OSC sequences to forward verbatim (for unhandled OSC codes).
     /// Each entry is the raw OSC content (without ESC ] prefix and ST/BEL terminator).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub pending_osc: Vec<String>,
     /// Current foreground color for new cells.
     pub current_fg: Color,
