@@ -82,6 +82,9 @@ pub struct HelloPayload {
     pub term_size: TermSize,
     /// TERM environment variable.
     pub term_type: String,
+    /// Additional environment variables to pass to the PTY (e.g., COLORTERM).
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
     /// Last confirmed state generation (0 if new session).
     pub last_generation: u64,
     /// Last confirmed input sequence.
@@ -603,6 +606,7 @@ mod tests {
             capabilities: Capabilities::default(),
             term_size: TermSize::default(),
             term_type: "xterm-256color".into(),
+            env: Vec::new(),
             last_generation: 0,
             last_input_seq: 0,
         });

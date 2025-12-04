@@ -83,6 +83,7 @@ pub trait SessionSpawner: Send + Sync {
         cols: u16,
         rows: u16,
         term_type: &str,
+        client_env: &[(String, String)],
     ) -> Result<SpawnedSession>;
 }
 
@@ -99,9 +100,13 @@ impl SessionSpawner for RealSessionSpawner {
         cols: u16,
         rows: u16,
         term_type: &str,
+        client_env: &[(String, String)],
     ) -> Result<SpawnedSession> {
-        // Merge base env with client-provided TERM
+        // Merge: server base env < client env < TERM override
         let mut env = self.env.clone();
+        // Add client environment variables (e.g., COLORTERM)
+        env.extend(client_env.iter().cloned());
+        // TERM from term_type takes precedence
         env.push(("TERM".to_string(), term_type.to_string()));
         let pty = Arc::new(Pty::spawn(cols, rows, self.shell.as_deref(), &env)?);
         let relay = PtyRelay::start(pty.clone());
@@ -448,6 +453,7 @@ impl SessionRegistry {
                     hello.term_size.cols,
                     hello.term_size.rows,
                     &hello.term_type,
+                    &hello.env,
                 )?;
                 let entry = SessionEntry::new(hello.session_key, spawned, self.cleanup_tx.clone());
                 guard.insert(hello.session_key, entry.clone());
@@ -596,6 +602,7 @@ mod tests {
             cols: u16,
             rows: u16,
             _term_type: &str,
+            _client_env: &[(String, String)],
         ) -> Result<SpawnedSession> {
             let mut fake = FakePty::with_size(cols, rows);
             let mut output_rx = fake
@@ -637,6 +644,7 @@ mod tests {
             capabilities: Default::default(),
             term_size: qsh_core::protocol::TermSize { cols: 80, rows: 24 },
             term_type: "xterm".to_string(),
+            env: Vec::new(),
             last_generation: 0,
             last_input_seq: 0,
         }

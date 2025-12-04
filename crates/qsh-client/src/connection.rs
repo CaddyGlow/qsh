@@ -163,6 +163,8 @@ pub struct ConnectionConfig {
     pub term_size: TermSize,
     /// TERM environment variable.
     pub term_type: String,
+    /// Additional environment variables to pass to the PTY (e.g., COLORTERM).
+    pub env: Vec<(String, String)>,
     /// Enable predictive echo.
     pub predictive_echo: bool,
     /// Connection timeout.
@@ -183,6 +185,7 @@ impl Default for ConnectionConfig {
             cert_hash: None,
             term_size: TermSize { cols: 80, rows: 24 },
             term_type: "xterm-256color".to_string(),
+            env: Vec::new(),
             predictive_echo: true,
             connect_timeout: Duration::from_secs(5),
             zero_rtt_available: false,
@@ -300,6 +303,7 @@ impl ClientConnection {
             },
             term_size: config.term_size,
             term_type: config.term_type.clone(),
+            env: config.env.clone(),
             last_generation: session.last_confirmed_generation(),
             last_input_seq: session.last_confirmed_input_seq(),
         };
@@ -642,6 +646,7 @@ impl ClientConnection {
             },
             term_size: self.config.term_size,
             term_type: self.config.term_type.clone(),
+            env: self.config.env.clone(),
             last_generation: self.session.last_confirmed_generation(),
             last_input_seq: self.session.last_confirmed_input_seq(),
         };

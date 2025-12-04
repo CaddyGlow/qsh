@@ -124,6 +124,7 @@ mod tests {
             capabilities: Capabilities::default(),
             term_size: TermSize::default(),
             term_type: "xterm-256color".into(),
+            env: vec![("COLORTERM".into(), "truecolor".into())],
             last_generation: 0,
             last_input_seq: 0,
         });

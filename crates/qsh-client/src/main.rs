@@ -138,6 +138,7 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
                 cert_hash: None,
                 term_size: get_term_size(),
                 term_type: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
+                env: collect_terminal_env(),
                 predictive_echo: !cli.no_prediction,
                 connect_timeout: cli.connect_timeout(),
                 zero_rtt_available: false,
@@ -188,6 +189,7 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
         cert_hash,
         term_size: get_term_size(),
         term_type: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
+        env: collect_terminal_env(),
         predictive_echo: !cli.no_prediction,
         connect_timeout: cli.connect_timeout(),
         zero_rtt_available: false, // updated after HelloAck inside connect
@@ -800,6 +802,36 @@ fn get_term_size() -> TermSize {
         Ok(size) => size,
         Err(_) => TermSize { cols: 80, rows: 24 },
     }
+}
+
+/// Collect terminal-related environment variables to pass to the remote PTY.
+///
+/// Note: TERM is handled separately as part of the PTY request (like SSH does),
+/// not as an environment variable here.
+fn collect_terminal_env() -> Vec<(String, String)> {
+    let mut env = Vec::new();
+
+    // COLORTERM indicates true color support (truecolor/24bit)
+    if let Ok(val) = std::env::var("COLORTERM") {
+        env.push(("COLORTERM".to_string(), val));
+    }
+
+    // NO_COLOR disables color output (https://no-color.org/)
+    if let Ok(val) = std::env::var("NO_COLOR") {
+        env.push(("NO_COLOR".to_string(), val));
+    }
+
+    // Locale variables (LANG and LC_*)
+    if let Ok(val) = std::env::var("LANG") {
+        env.push(("LANG".to_string(), val));
+    }
+    for (key, val) in std::env::vars() {
+        if key.starts_with("LC_") {
+            env.push((key, val));
+        }
+    }
+
+    env
 }
 
 /// Format user@host string for overlay display.

@@ -54,6 +54,7 @@ prop_compose! {
         capabilities in arb_capabilities(),
         term_size in arb_term_size(),
         term_type in "[a-z0-9-]{1,32}",
+        env in prop::collection::vec(("[A-Z_]{1,16}", "[a-zA-Z0-9_-]{0,32}"), 0..3),
         last_generation in any::<u64>(),
         last_input_seq in any::<u64>(),
     ) -> HelloPayload {
@@ -64,6 +65,7 @@ prop_compose! {
             capabilities,
             term_size,
             term_type,
+            env: env.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             last_generation,
             last_input_seq,
         }
