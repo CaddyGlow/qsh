@@ -82,6 +82,7 @@ pub trait SessionSpawner: Send + Sync {
         key: [u8; SESSION_KEY_LEN],
         cols: u16,
         rows: u16,
+        term_type: &str,
     ) -> Result<SpawnedSession>;
 }
 
@@ -97,8 +98,12 @@ impl SessionSpawner for RealSessionSpawner {
         _key: [u8; SESSION_KEY_LEN],
         cols: u16,
         rows: u16,
+        term_type: &str,
     ) -> Result<SpawnedSession> {
-        let pty = Arc::new(Pty::spawn(cols, rows, self.shell.as_deref(), &self.env)?);
+        // Merge base env with client-provided TERM
+        let mut env = self.env.clone();
+        env.push(("TERM".to_string(), term_type.to_string()));
+        let pty = Arc::new(Pty::spawn(cols, rows, self.shell.as_deref(), &env)?);
         let relay = PtyRelay::start(pty.clone());
         let (input_tx, output_rx) = relay.split();
 
@@ -440,9 +445,12 @@ impl SessionRegistry {
             if let Some(entry) = guard.get(&hello.session_key).cloned() {
                 entry
             } else {
-                let spawned = self
-                    .spawner
-                    .spawn(hello.session_key, hello.term_size.cols, hello.term_size.rows)?;
+                let spawned = self.spawner.spawn(
+                    hello.session_key,
+                    hello.term_size.cols,
+                    hello.term_size.rows,
+                    &hello.term_type,
+                )?;
                 let entry = SessionEntry::new(hello.session_key, spawned, self.cleanup_tx.clone());
                 guard.insert(hello.session_key, entry.clone());
                 entry
@@ -589,6 +597,7 @@ mod tests {
             _key: [u8; SESSION_KEY_LEN],
             cols: u16,
             rows: u16,
+            _term_type: &str,
         ) -> Result<SpawnedSession> {
             let mut fake = FakePty::with_size(cols, rows);
             let mut output_rx = fake
