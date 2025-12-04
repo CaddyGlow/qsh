@@ -164,6 +164,30 @@ impl Default for Cursor {
 }
 
 // =============================================================================
+// Scroll Region
+// =============================================================================
+
+/// Scroll region (top and bottom margins for DECSTBM).
+/// Both values are 0-indexed row numbers. The region is inclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScrollRegion {
+    pub top: u16,
+    pub bottom: u16,
+}
+
+impl ScrollRegion {
+    /// Create a new scroll region with given top and bottom margins.
+    pub fn new(top: u16, bottom: u16) -> Self {
+        Self { top, bottom }
+    }
+
+    /// Check if a row is within the scroll region.
+    pub fn contains(&self, row: u16) -> bool {
+        row >= self.top && row <= self.bottom
+    }
+}
+
+// =============================================================================
 // Screen
 // =============================================================================
 
@@ -284,44 +308,87 @@ impl Screen {
     }
 
     /// Scroll the screen up by n lines, filling bottom with empty lines.
+    /// This scrolls the entire screen (for backwards compatibility).
     pub fn scroll_up(&mut self, n: u16) {
-        if n == 0 {
-            return;
-        }
-
-        if n >= self.rows {
-            self.clear();
-            return;
-        }
-
-        // Shift cells up (Cell is not Copy, so we rotate and clear)
-        let shift = n as usize * self.cols as usize;
-        self.cells.rotate_left(shift);
-
-        // Clear bottom rows
-        let total = self.cells.len();
-        for cell in self.cells[(total - shift)..].iter_mut() {
-            *cell = Cell::default();
-        }
+        self.scroll_up_region(n, 0, self.rows.saturating_sub(1));
     }
 
     /// Scroll the screen down by n lines, filling top with empty lines.
+    /// This scrolls the entire screen (for backwards compatibility).
     pub fn scroll_down(&mut self, n: u16) {
-        if n == 0 {
+        self.scroll_down_region(n, 0, self.rows.saturating_sub(1));
+    }
+
+    /// Scroll a region up by n lines, filling bottom of region with empty lines.
+    /// top and bottom are 0-indexed inclusive row numbers.
+    pub fn scroll_up_region(&mut self, n: u16, top: u16, bottom: u16) {
+        if n == 0 || top > bottom || bottom >= self.rows {
             return;
         }
 
-        if n >= self.rows {
-            self.clear();
+        let region_height = bottom - top + 1;
+        let n = n.min(region_height);
+
+        if n >= region_height {
+            // Clear entire region
+            for row in top..=bottom {
+                self.clear_row(row);
+            }
             return;
         }
 
-        let shift = n as usize * self.cols as usize;
-        self.cells.rotate_right(shift);
+        // Move lines up within the region
+        let cols = self.cols as usize;
+        for dst_row in top..(bottom - n + 1) {
+            let src_row = dst_row + n;
+            let dst_start = dst_row as usize * cols;
+            let src_start = src_row as usize * cols;
 
-        // Clear top rows
-        for cell in self.cells[..shift].iter_mut() {
-            *cell = Cell::default();
+            // Copy row by row (can't use rotate for partial regions)
+            for col in 0..cols {
+                self.cells[dst_start + col] = self.cells[src_start + col].clone();
+            }
+        }
+
+        // Clear bottom n rows of the region
+        for row in (bottom - n + 1)..=bottom {
+            self.clear_row(row);
+        }
+    }
+
+    /// Scroll a region down by n lines, filling top of region with empty lines.
+    /// top and bottom are 0-indexed inclusive row numbers.
+    pub fn scroll_down_region(&mut self, n: u16, top: u16, bottom: u16) {
+        if n == 0 || top > bottom || bottom >= self.rows {
+            return;
+        }
+
+        let region_height = bottom - top + 1;
+        let n = n.min(region_height);
+
+        if n >= region_height {
+            // Clear entire region
+            for row in top..=bottom {
+                self.clear_row(row);
+            }
+            return;
+        }
+
+        // Move lines down within the region (iterate backwards to avoid overwriting)
+        let cols = self.cols as usize;
+        for dst_row in ((top + n)..=bottom).rev() {
+            let src_row = dst_row - n;
+            let dst_start = dst_row as usize * cols;
+            let src_start = src_row as usize * cols;
+
+            for col in 0..cols {
+                self.cells[dst_start + col] = self.cells[src_start + col].clone();
+            }
+        }
+
+        // Clear top n rows of the region
+        for row in top..(top + n) {
+            self.clear_row(row);
         }
     }
 
@@ -352,6 +419,8 @@ pub struct TerminalState {
     pub cursor: Cursor,
     /// Whether alternate screen is active.
     pub alternate_active: bool,
+    /// Scroll region (top/bottom margins). None means full screen.
+    pub scroll_region: Option<ScrollRegion>,
     /// Window/tab title (OSC 0/1/2).
     pub title: Option<String>,
     /// Current working directory (OSC 7).
@@ -380,6 +449,7 @@ impl TerminalState {
             alternate: Screen::new(cols, rows),
             cursor: Cursor::default(),
             alternate_active: false,
+            scroll_region: None,
             title: None,
             cwd: None,
             clipboard: None,
@@ -420,6 +490,40 @@ impl TerminalState {
         // Clamp cursor to new bounds
         self.cursor.col = self.cursor.col.min(cols.saturating_sub(1));
         self.cursor.row = self.cursor.row.min(rows.saturating_sub(1));
+        // Reset scroll region on resize
+        self.scroll_region = None;
+    }
+
+    /// Set the scroll region (DECSTBM).
+    /// Top and bottom are 1-indexed (VT100 convention), converted internally to 0-indexed.
+    /// Pass (0, 0) or (1, rows) to reset to full screen.
+    pub fn set_scroll_region(&mut self, top: u16, bottom: u16) {
+        let rows = self.screen().rows();
+        let top = if top == 0 { 1 } else { top };
+        let bottom = if bottom == 0 { rows } else { bottom };
+
+        // Validate and convert to 0-indexed
+        if top < bottom && bottom <= rows {
+            let top_0 = top.saturating_sub(1);
+            let bottom_0 = bottom.saturating_sub(1);
+
+            // If it covers the full screen, just clear the region
+            if top_0 == 0 && bottom_0 == rows - 1 {
+                self.scroll_region = None;
+            } else {
+                self.scroll_region = Some(ScrollRegion::new(top_0, bottom_0));
+            }
+
+            // DECSTBM moves cursor to home position
+            self.cursor.col = 0;
+            self.cursor.row = 0;
+        }
+    }
+
+    /// Get the effective scroll region (returns full screen if None).
+    pub fn effective_scroll_region(&self) -> ScrollRegion {
+        self.scroll_region
+            .unwrap_or_else(|| ScrollRegion::new(0, self.screen().rows().saturating_sub(1)))
     }
 
     /// Switch to alternate screen.
@@ -653,5 +757,122 @@ mod tests {
 
         attrs.reset();
         assert!(attrs.is_default());
+    }
+
+    #[test]
+    fn scroll_region_contains() {
+        let region = ScrollRegion::new(2, 5);
+        assert!(!region.contains(0));
+        assert!(!region.contains(1));
+        assert!(region.contains(2));
+        assert!(region.contains(3));
+        assert!(region.contains(5));
+        assert!(!region.contains(6));
+    }
+
+    #[test]
+    fn set_scroll_region_basic() {
+        let mut state = TerminalState::new(80, 24);
+
+        // Set scroll region (1-indexed input as per VT100)
+        state.set_scroll_region(5, 15);
+
+        let region = state.scroll_region.unwrap();
+        assert_eq!(region.top, 4); // Converted to 0-indexed
+        assert_eq!(region.bottom, 14);
+
+        // Cursor should move to home
+        assert_eq!(state.cursor.row, 0);
+        assert_eq!(state.cursor.col, 0);
+    }
+
+    #[test]
+    fn set_scroll_region_full_screen_clears() {
+        let mut state = TerminalState::new(80, 24);
+
+        // First set a region
+        state.set_scroll_region(5, 15);
+        assert!(state.scroll_region.is_some());
+
+        // Now set full screen region (should clear)
+        state.set_scroll_region(1, 24);
+        assert!(state.scroll_region.is_none());
+
+        // Reset with 0,0 also clears
+        state.set_scroll_region(5, 15);
+        state.set_scroll_region(0, 0);
+        assert!(state.scroll_region.is_none());
+    }
+
+    #[test]
+    fn effective_scroll_region_returns_full_when_none() {
+        let state = TerminalState::new(80, 24);
+        let region = state.effective_scroll_region();
+        assert_eq!(region.top, 0);
+        assert_eq!(region.bottom, 23);
+    }
+
+    #[test]
+    fn screen_scroll_up_region() {
+        let mut screen = Screen::new(80, 10);
+        // Fill rows with letters
+        for row in 0..10 {
+            screen.set(0, row, Cell::new((b'A' + row as u8) as char));
+        }
+
+        // Scroll region 2-6 (rows C-G) up by 2
+        screen.scroll_up_region(2, 2, 6);
+
+        // Rows 0-1 unchanged
+        assert_eq!(screen.get(0, 0).unwrap().ch, 'A');
+        assert_eq!(screen.get(0, 1).unwrap().ch, 'B');
+        // Rows 2-4 should have shifted content from 4-6
+        assert_eq!(screen.get(0, 2).unwrap().ch, 'E');
+        assert_eq!(screen.get(0, 3).unwrap().ch, 'F');
+        assert_eq!(screen.get(0, 4).unwrap().ch, 'G');
+        // Rows 5-6 should be cleared
+        assert_eq!(screen.get(0, 5).unwrap().ch, ' ');
+        assert_eq!(screen.get(0, 6).unwrap().ch, ' ');
+        // Rows 7-9 unchanged
+        assert_eq!(screen.get(0, 7).unwrap().ch, 'H');
+        assert_eq!(screen.get(0, 8).unwrap().ch, 'I');
+        assert_eq!(screen.get(0, 9).unwrap().ch, 'J');
+    }
+
+    #[test]
+    fn screen_scroll_down_region() {
+        let mut screen = Screen::new(80, 10);
+        // Fill rows with letters
+        for row in 0..10 {
+            screen.set(0, row, Cell::new((b'A' + row as u8) as char));
+        }
+
+        // Scroll region 2-6 (rows C-G) down by 2
+        screen.scroll_down_region(2, 2, 6);
+
+        // Rows 0-1 unchanged
+        assert_eq!(screen.get(0, 0).unwrap().ch, 'A');
+        assert_eq!(screen.get(0, 1).unwrap().ch, 'B');
+        // Rows 2-3 should be cleared
+        assert_eq!(screen.get(0, 2).unwrap().ch, ' ');
+        assert_eq!(screen.get(0, 3).unwrap().ch, ' ');
+        // Rows 4-6 should have shifted content from 2-4
+        assert_eq!(screen.get(0, 4).unwrap().ch, 'C');
+        assert_eq!(screen.get(0, 5).unwrap().ch, 'D');
+        assert_eq!(screen.get(0, 6).unwrap().ch, 'E');
+        // Rows 7-9 unchanged
+        assert_eq!(screen.get(0, 7).unwrap().ch, 'H');
+        assert_eq!(screen.get(0, 8).unwrap().ch, 'I');
+        assert_eq!(screen.get(0, 9).unwrap().ch, 'J');
+    }
+
+    #[test]
+    fn resize_clears_scroll_region() {
+        let mut state = TerminalState::new(80, 24);
+        state.set_scroll_region(5, 15);
+        assert!(state.scroll_region.is_some());
+
+        state.resize(100, 30);
+        assert!(state.scroll_region.is_none());
     }
 }

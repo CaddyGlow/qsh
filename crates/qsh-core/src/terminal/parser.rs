@@ -80,9 +80,12 @@ impl Perform for Performer<'_> {
             // Newline (LF) - in "newline mode" also does CR
             0x0A => {
                 state.cursor.col = 0; // Implicit CR
-                let rows = state.screen().rows();
-                if state.cursor.row + 1 >= rows {
-                    state.screen_mut().scroll_up(1);
+                let region = state.effective_scroll_region();
+                if state.cursor.row >= region.bottom {
+                    // At or past bottom of scroll region: scroll up
+                    state
+                        .screen_mut()
+                        .scroll_up_region(1, region.top, region.bottom);
                 } else {
                     state.cursor.row += 1;
                 }
@@ -223,6 +226,26 @@ impl Perform for Performer<'_> {
                     _ => CursorShape::Block,
                 };
             }
+            // Set Scrolling Region (DECSTBM) - CSI Pt ; Pb r
+            ('r', []) => {
+                state.set_scroll_region(param0, param1);
+            }
+            // Scroll Up (SU) - CSI Ps S
+            ('S', []) => {
+                let n = param0.max(1);
+                let region = state.effective_scroll_region();
+                state
+                    .screen_mut()
+                    .scroll_up_region(n, region.top, region.bottom);
+            }
+            // Scroll Down (SD) - CSI Ps T
+            ('T', []) => {
+                let n = param0.max(1);
+                let region = state.effective_scroll_region();
+                state
+                    .screen_mut()
+                    .scroll_down_region(n, region.top, region.bottom);
+            }
             _ => {}
         }
     }
@@ -306,13 +329,16 @@ impl Perform for Performer<'_> {
 fn put_char(state: &mut TerminalState, c: char) {
     let width = c.width().unwrap_or(1);
     let cols = state.screen().cols();
-    let rows = state.screen().rows();
+    let region = state.effective_scroll_region();
 
     // Handle line wrap
     if state.cursor.col >= cols {
         state.cursor.col = 0;
-        if state.cursor.row + 1 >= rows {
-            state.screen_mut().scroll_up(1);
+        if state.cursor.row >= region.bottom {
+            // At bottom of scroll region: scroll up
+            state
+                .screen_mut()
+                .scroll_up_region(1, region.top, region.bottom);
         } else {
             state.cursor.row += 1;
         }
@@ -751,5 +777,144 @@ mod tests {
 
         parser.process(b"B");
         assert_eq!(parser.state().generation, 2);
+    }
+
+    #[test]
+    fn decstbm_set_scroll_region() {
+        let mut parser = TerminalParser::new(80, 24);
+        // CSI 5 ; 15 r - set scroll region to lines 5-15
+        parser.process(b"\x1b[5;15r");
+
+        let state = parser.state();
+        let region = state.scroll_region.unwrap();
+        assert_eq!(region.top, 4); // 0-indexed
+        assert_eq!(region.bottom, 14);
+        // Cursor moves to home
+        assert_eq!(state.cursor.row, 0);
+        assert_eq!(state.cursor.col, 0);
+    }
+
+    #[test]
+    fn decstbm_reset_scroll_region() {
+        let mut parser = TerminalParser::new(80, 24);
+        // First set a region
+        parser.process(b"\x1b[5;15r");
+        assert!(parser.state().scroll_region.is_some());
+
+        // CSI r with no params resets to full screen
+        parser.process(b"\x1b[r");
+        assert!(parser.state().scroll_region.is_none());
+    }
+
+    #[test]
+    fn csi_scroll_up() {
+        let mut parser = TerminalParser::new(80, 5);
+        // Fill screen
+        for row in 0..5 {
+            parser.process(format!("{}", (b'A' + row) as char).as_bytes());
+            if row < 4 {
+                parser.process(b"\n");
+            }
+        }
+        parser.process(b"\x1b[H"); // Home
+
+        // CSI 2 S - scroll up by 2 lines
+        parser.process(b"\x1b[2S");
+
+        let state = parser.state();
+        assert_eq!(state.screen().get(0, 0).unwrap().ch, 'C');
+        assert_eq!(state.screen().get(0, 1).unwrap().ch, 'D');
+        assert_eq!(state.screen().get(0, 2).unwrap().ch, 'E');
+        assert_eq!(state.screen().get(0, 3).unwrap().ch, ' ');
+        assert_eq!(state.screen().get(0, 4).unwrap().ch, ' ');
+    }
+
+    #[test]
+    fn csi_scroll_down() {
+        let mut parser = TerminalParser::new(80, 5);
+        // Fill screen
+        for row in 0..5 {
+            parser.process(format!("{}", (b'A' + row) as char).as_bytes());
+            if row < 4 {
+                parser.process(b"\n");
+            }
+        }
+        parser.process(b"\x1b[H"); // Home
+
+        // CSI 2 T - scroll down by 2 lines
+        parser.process(b"\x1b[2T");
+
+        let state = parser.state();
+        assert_eq!(state.screen().get(0, 0).unwrap().ch, ' ');
+        assert_eq!(state.screen().get(0, 1).unwrap().ch, ' ');
+        assert_eq!(state.screen().get(0, 2).unwrap().ch, 'A');
+        assert_eq!(state.screen().get(0, 3).unwrap().ch, 'B');
+        assert_eq!(state.screen().get(0, 4).unwrap().ch, 'C');
+    }
+
+    #[test]
+    fn scroll_respects_region() {
+        let mut parser = TerminalParser::new(80, 10);
+        // Fill screen
+        for row in 0..10 {
+            parser.process(format!("{}", (b'A' + row) as char).as_bytes());
+            if row < 9 {
+                parser.process(b"\n");
+            }
+        }
+        parser.process(b"\x1b[H"); // Home
+
+        // Set scroll region to lines 3-7 (0-indexed: 2-6)
+        parser.process(b"\x1b[3;7r");
+
+        // Scroll up by 2 within region
+        parser.process(b"\x1b[2S");
+
+        let state = parser.state();
+        // Lines outside region unchanged
+        assert_eq!(state.screen().get(0, 0).unwrap().ch, 'A');
+        assert_eq!(state.screen().get(0, 1).unwrap().ch, 'B');
+        // Within region: shifted up
+        assert_eq!(state.screen().get(0, 2).unwrap().ch, 'E');
+        assert_eq!(state.screen().get(0, 3).unwrap().ch, 'F');
+        assert_eq!(state.screen().get(0, 4).unwrap().ch, 'G');
+        // Bottom of region cleared
+        assert_eq!(state.screen().get(0, 5).unwrap().ch, ' ');
+        assert_eq!(state.screen().get(0, 6).unwrap().ch, ' ');
+        // Lines below region unchanged
+        assert_eq!(state.screen().get(0, 7).unwrap().ch, 'H');
+        assert_eq!(state.screen().get(0, 8).unwrap().ch, 'I');
+        assert_eq!(state.screen().get(0, 9).unwrap().ch, 'J');
+    }
+
+    #[test]
+    fn newline_scrolls_within_region() {
+        let mut parser = TerminalParser::new(80, 10);
+        // Fill screen
+        for row in 0..10 {
+            parser.process(format!("{}", (b'A' + row) as char).as_bytes());
+            if row < 9 {
+                parser.process(b"\n");
+            }
+        }
+
+        // Set scroll region to lines 3-7 (0-indexed: 2-6)
+        parser.process(b"\x1b[3;7r");
+
+        // Move to bottom of region and add newline
+        parser.process(b"\x1b[7;1H"); // Row 7 (0-indexed: 6), col 1
+        parser.process(b"\n");
+
+        let state = parser.state();
+        // Line above region unchanged
+        assert_eq!(state.screen().get(0, 1).unwrap().ch, 'B');
+        // Region scrolled
+        assert_eq!(state.screen().get(0, 2).unwrap().ch, 'D');
+        assert_eq!(state.screen().get(0, 3).unwrap().ch, 'E');
+        assert_eq!(state.screen().get(0, 4).unwrap().ch, 'F');
+        assert_eq!(state.screen().get(0, 5).unwrap().ch, 'G');
+        assert_eq!(state.screen().get(0, 6).unwrap().ch, ' '); // Cleared
+        // Lines below region unchanged
+        assert_eq!(state.screen().get(0, 7).unwrap().ch, 'H');
     }
 }

@@ -11,4 +11,4 @@ mod state;
 
 pub use diff::{CellChange, StateDiff};
 pub use parser::TerminalParser;
-pub use state::{Cell, CellAttrs, Color, Cursor, CursorShape, Screen, TerminalState};
+pub use state::{Cell, CellAttrs, Color, Cursor, CursorShape, Screen, ScrollRegion, TerminalState};
