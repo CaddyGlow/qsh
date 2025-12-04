@@ -15,9 +15,9 @@ use qsh_client::cli::{OverlayPosition as CliOverlayPosition, SshBootstrapMode};
 use qsh_client::overlay::{ConnectionStatus, OverlayPosition, PredictionOverlay, StatusOverlay};
 use qsh_client::render::StateRenderer;
 use qsh_client::{
-    BootstrapMode, Cli, ClientConnection, ConnectionConfig, LocalForwarder, RawModeGuard,
-    Socks5Proxy, SshConfig, StdinReader, StdoutWriter, bootstrap, get_terminal_size,
-    restore_terminal,
+    BootstrapMode, Cli, ClientConnection, ConnectionConfig, EscapeCommand, EscapeHandler,
+    EscapeResult, LocalForwarder, RawModeGuard, Socks5Proxy, SshConfig, StdinReader, StdoutWriter,
+    bootstrap, get_terminal_size, parse_escape_key, restore_terminal,
 };
 use qsh_core::terminal::TerminalState;
 use qsh_core::constants::DEFAULT_QUIC_PORT_RANGE;
@@ -268,6 +268,10 @@ async fn run_session(
     // Parse toggle key (default ctrl+shift+o, parsed as ctrl+o = 0x0f)
     let toggle_key = parse_toggle_key(&cli.overlay_key);
 
+    // Parse escape key and create handler (default ctrl+^, like mosh)
+    let escape_key = parse_escape_key(&cli.escape_key);
+    let mut escape_handler = EscapeHandler::new(escape_key);
+
     // Start port forwarders
     let mut forward_handles = spawn_forwarders(cli, conn.quic_connection()).await;
 
@@ -311,6 +315,45 @@ async fn run_session(
             input = stdin.read() => {
                 match input {
                     Some(data) if !data.is_empty() => {
+                        // Process through escape handler first (mosh-style ctrl+^ sequences)
+                        let data = match escape_handler.process(&data) {
+                            EscapeResult::Waiting => {
+                                // Escape key pressed, waiting for command
+                                continue;
+                            }
+                            EscapeResult::Command(EscapeCommand::Disconnect) => {
+                                info!("Disconnect requested via escape sequence");
+                                break;
+                            }
+                            EscapeResult::Command(EscapeCommand::ToggleOverlay) => {
+                                overlay.toggle();
+                                overlay_auto_shown = false;
+                                if overlay.is_visible() {
+                                    let term_size = get_term_size();
+                                    let overlay_output = overlay.render(term_size.cols);
+                                    if !overlay_output.is_empty() {
+                                        let _ = stdout.write(overlay_output.as_bytes()).await;
+                                    }
+                                } else {
+                                    clear_overlay(&mut stdout, overlay.position()).await;
+                                }
+                                continue;
+                            }
+                            EscapeResult::Command(EscapeCommand::SendEscapeKey) => {
+                                // User pressed escape twice, send the escape key
+                                if let Some(key) = escape_handler.escape_key() {
+                                    vec![key]
+                                } else {
+                                    continue;
+                                }
+                            }
+                            EscapeResult::PassThrough(data) => data,
+                        };
+
+                        if data.is_empty() {
+                            continue;
+                        }
+
                         // Check for overlay toggle key
                         if let Some(key) = toggle_key {
                             if data.len() == 1 && data[0] == key {

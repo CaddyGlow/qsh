@@ -217,6 +217,11 @@ pub struct Cli {
     )]
     pub overlay_key: String,
 
+    /// Escape key for client commands (e.g., ctrl+^ then . to disconnect).
+    /// Use "none" to disable escape sequences.
+    #[arg(long = "escape-key", default_value = "ctrl+^", value_name = "KEY")]
+    pub escape_key: String,
+
     /// QUIC keep-alive interval in seconds (0 disables).
     #[arg(long = "keep-alive", default_value = "5", value_name = "SECONDS")]
     pub keep_alive_secs: u64,
@@ -554,6 +559,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_escape_key() {
+        let cli = Cli::try_parse_from(["qsh", "--escape-key", "ctrl+]", "example.com"]).unwrap();
+        assert_eq!(cli.escape_key, "ctrl+]");
+    }
+
+    #[test]
+    fn parse_escape_key_none() {
+        let cli = Cli::try_parse_from(["qsh", "--escape-key", "none", "example.com"]).unwrap();
+        assert_eq!(cli.escape_key, "none");
+    }
+
+    #[test]
     fn default_values() {
         let cli = Cli::try_parse_from(["qsh", "example.com"]).unwrap();
         assert_eq!(cli.port, 22);
@@ -567,6 +584,7 @@ mod tests {
         assert_eq!(cli.log_format, CliLogFormat::Text);
         assert_eq!(cli.overlay_position, OverlayPosition::Top);
         assert_eq!(cli.overlay_key, "ctrl+shift+o");
+        assert_eq!(cli.escape_key, "ctrl+^");
         assert!(!cli.no_overlay);
         assert!(!cli.force_pty);
         assert!(!cli.disable_pty);
