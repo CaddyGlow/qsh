@@ -9,6 +9,7 @@ description = "Core library for qsh - protocol, types, terminal state"
 [features]
 default = []
 tunnel = ["tun"]
+standalone = ["dep:ssh-key", "dep:rpassword", "dep:libc", "dep:ring"]
 
 [dependencies]
 tokio = { workspace = true }
@@ -27,6 +28,13 @@ tun = { workspace = true, optional = true }
 quinn = { workspace = true }
 rustls = { workspace = true }
 sha2 = "0.10"
+rand = { workspace = true }
+
+# Standalone auth dependencies (optional)
+ssh-key = { workspace = true, optional = true }
+rpassword = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
+ring = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }
@@ -34,3 +42,4 @@ proptest = { workspace = true }
 test-case = { workspace = true }
 assert_matches = { workspace = true }
 qsh-test-utils = { workspace = true }
+tempfile = { workspace = true }

@@ -19,6 +19,12 @@ use qsh_client::{
     EscapeResult, LocalForwarder, RawModeGuard, Socks5Proxy, SshConfig, StdinReader, StdoutWriter,
     bootstrap, get_terminal_size, parse_escape_key, restore_terminal,
 };
+
+#[cfg(feature = "standalone")]
+use qsh_client::{DirectAuthenticator, DirectConfig};
+#[cfg(feature = "standalone")]
+use qsh_client::standalone::authenticate as standalone_authenticate;
+
 use qsh_core::constants::DEFAULT_QUIC_PORT_RANGE;
 use qsh_core::forward::ForwardSpec;
 use qsh_core::protocol::{Message, StateDiff, TermSize};
@@ -91,7 +97,88 @@ fn extract_cursor(diff: &StateDiff) -> Option<(u16, u16)> {
     }
 }
 
+#[cfg(feature = "standalone")]
+async fn run_client_direct(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Result<()> {
+    use rand::RngCore;
+
+    // Determine server address for direct mode
+    let server_addr_str = if let Some(ref server) = cli.server {
+        server.clone()
+    } else {
+        // Default to host:4433 if not specified
+        format!("{}:4433", host)
+    };
+
+    let direct_config = DirectConfig {
+        server_addr: server_addr_str.clone(),
+        key_path: cli.key.clone(),
+        known_hosts_path: cli.known_hosts.clone(),
+        accept_unknown_host: cli.accept_unknown_host,
+        no_agent: cli.no_agent,
+    };
+
+    // Build direct authenticator (loads known_hosts and signing key)
+    let mut authenticator = DirectAuthenticator::new(&direct_config).await?;
+
+    // Resolve server address for QUIC
+    let server_sock_addr = server_addr_str
+        .to_socket_addrs()
+        .map_err(|e| qsh_core::Error::Transport {
+            message: format!("failed to resolve server address: {}", e),
+        })?
+        .next()
+        .ok_or_else(|| qsh_core::Error::Transport {
+            message: "no addresses found for server".to_string(),
+        })?;
+
+    // Generate a fresh session key (not authenticated by standalone auth;
+    // used for session identification and reconnection).
+    let mut session_key = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut session_key);
+
+    let conn_config = ConnectionConfig {
+        server_addr: server_sock_addr,
+        session_key,
+        cert_hash: None,
+        term_size: get_term_size(),
+        term_type: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
+        env: collect_terminal_env(),
+        predictive_echo: !cli.no_prediction,
+        connect_timeout: cli.connect_timeout(),
+        zero_rtt_available: false,
+        keep_alive_interval: cli.keep_alive_interval(),
+        max_idle_timeout: cli.max_idle_timeout(),
+    };
+
+    info!(addr = %conn_config.server_addr, "Connecting directly to server");
+    let quic_conn = ClientConnection::connect_quic(&conn_config).await?;
+
+    // Perform standalone authentication on a dedicated server-initiated stream.
+    // Server opens the stream and sends AuthChallenge; client accepts and responds.
+    let (mut send, mut recv) = quic_conn
+        .accept_bi()
+        .await
+        .map_err(|e| qsh_core::Error::Transport {
+            message: format!("failed to accept auth stream: {}", e),
+        })?;
+
+    standalone_authenticate(&mut authenticator, &mut send, &mut recv).await?;
+    info!("Standalone authentication succeeded");
+
+    // Complete qsh protocol handshake and start session.
+    let conn = ClientConnection::from_quic(quic_conn, conn_config).await?;
+    info!(rtt = ?conn.rtt(), "Connected to server");
+
+    let user_host = format_user_host(user, host);
+    run_session(conn, cli, Some(user_host)).await
+}
+
 async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Result<()> {
+    #[cfg(feature = "standalone")]
+    if cli.direct {
+        return run_client_direct(cli, host, user).await;
+    }
+
     // Step 1: Bootstrap via SSH to get QUIC endpoint info
     info!("Bootstrapping via SSH...");
 

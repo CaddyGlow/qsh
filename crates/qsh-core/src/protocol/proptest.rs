@@ -17,6 +17,11 @@ use crate::protocol::{
     TerminalInputPayload,
 };
 
+#[cfg(feature = "standalone")]
+use crate::protocol::{
+    AuthChallengePayload, AuthErrorCode, AuthFailurePayload, AuthResponsePayload,
+};
+
 // =============================================================================
 // Arbitrary Generators
 // =============================================================================
@@ -114,8 +119,67 @@ prop_compose! {
     }
 }
 
-/// Generate an arbitrary Message
-fn arb_message() -> impl Strategy<Value = Message> {
+// =============================================================================
+// Standalone Auth Generators (Feature-gated)
+// =============================================================================
+
+#[cfg(feature = "standalone")]
+fn arb_auth_error_code() -> impl Strategy<Value = AuthErrorCode> {
+    prop_oneof![
+        Just(AuthErrorCode::AuthFailed),
+        Just(AuthErrorCode::Timeout),
+        Just(AuthErrorCode::ProtocolError),
+        Just(AuthErrorCode::InternalError),
+    ]
+}
+
+#[cfg(feature = "standalone")]
+prop_compose! {
+    fn arb_auth_challenge()(
+        server_public_key in "[a-zA-Z0-9+/= -]{64,256}",
+        challenge in any::<[u8; 32]>(),
+        server_nonce in any::<[u8; 32]>(),
+        server_signature in prop::collection::vec(any::<u8>(), 64..256),
+    ) -> AuthChallengePayload {
+        AuthChallengePayload {
+            server_public_key,
+            challenge,
+            server_nonce,
+            server_signature,
+        }
+    }
+}
+
+#[cfg(feature = "standalone")]
+prop_compose! {
+    fn arb_auth_response()(
+        client_public_key in "[a-zA-Z0-9+/= -]{64,256}",
+        client_nonce in any::<[u8; 32]>(),
+        signature in prop::collection::vec(any::<u8>(), 64..256),
+    ) -> AuthResponsePayload {
+        AuthResponsePayload {
+            client_public_key,
+            client_nonce,
+            signature,
+        }
+    }
+}
+
+#[cfg(feature = "standalone")]
+prop_compose! {
+    fn arb_auth_failure()(
+        code in arb_auth_error_code(),
+        message in "[a-z ]{0,64}",
+    ) -> AuthFailurePayload {
+        AuthFailurePayload {
+            code,
+            message,
+        }
+    }
+}
+
+/// Generate an arbitrary Message (base messages without feature-gated variants)
+fn arb_message_base() -> impl Strategy<Value = Message> {
     prop_oneof![
         // Control messages
         arb_hello().prop_map(Message::Hello),
@@ -153,6 +217,25 @@ fn arb_message() -> impl Strategy<Value = Message> {
                 reason,
             }
         )),
+    ]
+}
+
+/// Generate an arbitrary Message (without standalone feature)
+#[cfg(not(feature = "standalone"))]
+fn arb_message() -> impl Strategy<Value = Message> {
+    arb_message_base()
+}
+
+/// Generate an arbitrary Message (with standalone feature)
+#[cfg(feature = "standalone")]
+fn arb_message() -> impl Strategy<Value = Message> {
+    prop_oneof![
+        // Base messages (weighted higher since there are more of them)
+        10 => arb_message_base(),
+        // Auth messages
+        1 => arb_auth_challenge().prop_map(Message::AuthChallenge),
+        1 => arb_auth_response().prop_map(Message::AuthResponse),
+        1 => arb_auth_failure().prop_map(Message::AuthFailure),
     ]
 }
 

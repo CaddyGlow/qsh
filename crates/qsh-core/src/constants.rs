@@ -123,6 +123,30 @@ pub const STATE_HISTORY_DEPTH: usize = 100;
 /// Anti-replay cache size.
 pub const ANTI_REPLAY_CACHE_SIZE: usize = 10000;
 
+// =============================================================================
+// Standalone Auth Constants (Feature: standalone)
+// =============================================================================
+
+/// Auth context prefix for domain separation.
+#[cfg(feature = "standalone")]
+pub const AUTH_CTX: &[u8] = b"qsh-standalone-auth-v1";
+
+/// Nonce length in bytes.
+#[cfg(feature = "standalone")]
+pub const AUTH_NONCE_LEN: usize = 32;
+
+/// Challenge length in bytes.
+#[cfg(feature = "standalone")]
+pub const AUTH_CHALLENGE_LEN: usize = 32;
+
+/// Auth handshake timeout.
+#[cfg(feature = "standalone")]
+pub const AUTH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum passphrase attempts for encrypted keys.
+#[cfg(feature = "standalone")]
+pub const MAX_PASSPHRASE_ATTEMPTS: u8 = 3;
+
 #[cfg(test)]
 mod tests {
     use super::*;

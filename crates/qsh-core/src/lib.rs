@@ -8,6 +8,7 @@
 //! - Port forwarding types
 //! - Logging and metrics
 //! - Tunnel types (feature-gated)
+//! - SSH key authentication for standalone mode (feature-gated)
 
 pub mod bootstrap;
 pub mod constants;
@@ -22,6 +23,9 @@ pub mod transport;
 
 #[cfg(feature = "tunnel")]
 pub mod tunnel;
+
+#[cfg(feature = "standalone")]
+pub mod auth;
 
 pub use error::{Error, Result};
 pub use logging::{LogFormat, init_logging};

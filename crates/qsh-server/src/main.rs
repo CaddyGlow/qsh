@@ -16,9 +16,25 @@ use qsh_server::{
     SessionAuthorizer, SessionConfig, SessionRegistry,
 };
 
+#[cfg(feature = "standalone")]
+use qsh_server::{StandaloneAuthenticator, StandaloneConfig};
+
+#[cfg(feature = "standalone")]
+type StandaloneAuth = Arc<StandaloneAuthenticator>;
+
+#[cfg(not(feature = "standalone"))]
+type StandaloneAuth = ();
+
 fn main() {
     // Parse CLI arguments
     let cli = Cli::parse();
+
+    // Standalone mode is incompatible with bootstrap mode (they use different auth flows).
+    #[cfg(feature = "standalone")]
+    if cli.standalone && cli.bootstrap {
+        eprintln!("qsh-server: --standalone cannot be used with --bootstrap");
+        std::process::exit(1);
+    }
 
     // Bootstrap mode: minimal logging to stderr, JSON output to stdout
     if cli.bootstrap {
@@ -162,7 +178,7 @@ async fn run_bootstrap(cli: &Cli) -> qsh_core::Result<()> {
         allow_remote_forwards: cli.allow_remote_forwards,
     };
 
-    serve_endpoint(endpoint, session_config, registry, Some(authorizer)).await
+    serve_endpoint(endpoint, session_config, registry, Some(authorizer), None).await
 }
 
 async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
@@ -238,7 +254,28 @@ async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
 
     let registry = build_registry(cli);
 
-    serve_endpoint(endpoint, session_config, registry, None).await
+    // Optional standalone authenticator (feature-gated)
+    #[cfg(feature = "standalone")]
+    let standalone_auth: Option<StandaloneAuth> = if cli.standalone {
+        let config = StandaloneConfig {
+            host_key_path: cli.host_key.clone(),
+            authorized_keys_path: cli.authorized_keys.clone(),
+        };
+        match StandaloneAuthenticator::new(config) {
+            Ok(auth) => Some(Arc::new(auth)),
+            Err(e) => {
+                error!(error = %e, "Failed to initialize standalone authenticator");
+                return Err(e);
+            }
+        }
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "standalone"))]
+    let standalone_auth: Option<StandaloneAuth> = None;
+
+    serve_endpoint(endpoint, session_config, registry, None, standalone_auth).await
 }
 
 fn build_registry(cli: &Cli) -> Arc<SessionRegistry> {
@@ -256,6 +293,7 @@ async fn serve_endpoint(
     session_config: SessionConfig,
     registry: Arc<SessionRegistry>,
     authorizer: Option<Arc<SessionAuthorizer>>,
+    standalone_auth: Option<StandaloneAuth>,
 ) -> qsh_core::Result<()> {
     let addr = endpoint.local_addr().ok();
     info!(?addr, "Server listening");
@@ -273,8 +311,11 @@ async fn serve_endpoint(
         let config = session_config.clone();
         let registry = registry.clone();
         let authorizer = authorizer.clone();
+        let standalone_auth = standalone_auth.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(incoming, config, registry, authorizer).await {
+            if let Err(e) =
+                handle_connection(incoming, config, registry, authorizer, standalone_auth).await
+            {
                 error!(error = %e, "Connection handler error");
             }
         });
@@ -288,6 +329,7 @@ async fn handle_connection(
     config: SessionConfig,
     registry: Arc<SessionRegistry>,
     authorizer: Option<Arc<SessionAuthorizer>>,
+    standalone_auth: Option<StandaloneAuth>,
 ) -> qsh_core::Result<()> {
     let addr = incoming.remote_address();
     info!(addr = %addr, "Incoming connection");
@@ -295,6 +337,46 @@ async fn handle_connection(
     let conn = incoming.await.map_err(|e| qsh_core::Error::Transport {
         message: format!("connection failed: {}", e),
     })?;
+
+    // If standalone mode is enabled, perform mutual SSH key authentication
+    // before proceeding to the normal session Hello/HelloAck handshake.
+    #[cfg(feature = "standalone")]
+    if let Some(auth) = standalone_auth {
+        use qsh_server::standalone::{AuthResult, authenticate_connection, send_auth_failure};
+
+        // Open a dedicated bidirectional stream for auth handshake (server-initiated).
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| qsh_core::Error::Transport {
+                message: format!("failed to open auth stream: {}", e),
+            })?;
+
+        match authenticate_connection(auth.as_ref(), &mut send, &mut recv).await {
+            AuthResult::Success {
+                client_fingerprint,
+            } => {
+                info!(%client_fingerprint, "Standalone client authenticated");
+            }
+            AuthResult::Failure {
+                code,
+                internal_message,
+            } => {
+                error!(
+                    code = ?code,
+                    message = %internal_message,
+                    "Standalone authentication failed"
+                );
+
+                // Best-effort attempt to send AuthFailure to the client.
+                if let Err(e) = send_auth_failure(&mut send, code, &internal_message).await {
+                    warn!(error = %e, "Failed to send AuthFailure to client");
+                }
+
+                return Err(qsh_core::Error::AuthenticationFailed);
+            }
+        }
+    }
 
     let quic = qsh_core::transport::QuicConnection::new(conn);
 

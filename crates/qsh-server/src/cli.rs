@@ -135,6 +135,22 @@ pub struct Cli {
         env = "QSH_SESSION_LINGER_SECS"
     )]
     pub session_linger_secs: u64,
+
+    // Standalone mode options (feature-gated)
+    /// Run in standalone mode with SSH key authentication
+    #[cfg(feature = "standalone")]
+    #[arg(long = "standalone")]
+    pub standalone: bool,
+
+    /// Path to host private key for standalone mode
+    #[cfg(feature = "standalone")]
+    #[arg(long = "host-key", value_name = "PATH")]
+    pub host_key: Option<PathBuf>,
+
+    /// Path to authorized_keys file for standalone mode
+    #[cfg(feature = "standalone")]
+    #[arg(long = "authorized-keys", value_name = "PATH")]
+    pub authorized_keys: Option<PathBuf>,
 }
 
 impl Cli {
@@ -225,6 +241,12 @@ impl Default for Cli {
             #[cfg(feature = "tunnel")]
             allow_tunnel: false,
             session_linger_secs: 172_800,
+            #[cfg(feature = "standalone")]
+            standalone: false,
+            #[cfg(feature = "standalone")]
+            host_key: None,
+            #[cfg(feature = "standalone")]
+            authorized_keys: None,
         }
     }
 }

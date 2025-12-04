@@ -1486,6 +1486,8 @@ dependencies = [
  "qsh-core",
  "qsh-test-utils",
  "quinn",
+ "rand 0.8.5",
+ "rpassword",
  "russh",
  "russh-keys",
  "rustls",
@@ -1493,6 +1495,7 @@ dependencies = [
  "serde_json",
  "shell-escape",
  "shell-words",
+ "ssh-key",
  "test-case",
  "tokio",
  "tokio-test",
@@ -1509,13 +1512,19 @@ dependencies = [
  "bincode",
  "bytes",
  "ipnet",
+ "libc",
  "proptest",
  "qsh-test-utils",
  "quinn",
+ "rand 0.8.5",
+ "ring",
+ "rpassword",
  "rustls",
  "serde",
  "serde_json",
  "sha2",
+ "ssh-key",
+ "tempfile",
  "test-case",
  "thiserror 2.0.17",
  "tokio",
@@ -1539,6 +1548,7 @@ dependencies = [
  "libc",
  "nix 0.29.0",
  "proptest",
+ "qsh-client",
  "qsh-core",
  "qsh-test-utils",
  "quinn",
@@ -1548,6 +1558,8 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "ssh-key",
+ "tempfile",
  "test-case",
  "tokio",
  "tokio-test",
@@ -1779,6 +1791,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpassword"
+version = "7.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66d4c8b64f049c6721ec8ccec37ddfc3d641c4a7fca57e8f2a89de509c73df39"
+dependencies = [
+ "libc",
+ "rtoolbox",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "rsa"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1797,6 +1820,16 @@ dependencies = [
  "spki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rtoolbox"
+version = "0.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7cc970b249fbe527d6e02e0a227762c9108b2f49d81094fe357ffc6d14d7f6f"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

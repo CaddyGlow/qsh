@@ -61,6 +61,17 @@ pub enum Message {
     /// Raw IP packet through tunnel.
     #[cfg(feature = "tunnel")]
     TunnelPacket(TunnelPacketPayload),
+
+    // Standalone authentication messages
+    /// Server sends after QUIC connect (includes server signature for client to verify).
+    #[cfg(feature = "standalone")]
+    AuthChallenge(AuthChallengePayload),
+    /// Client response (proves client identity).
+    #[cfg(feature = "standalone")]
+    AuthResponse(AuthResponsePayload),
+    /// Authentication failure (sent by server).
+    #[cfg(feature = "standalone")]
+    AuthFailure(AuthFailurePayload),
 }
 
 // =============================================================================
@@ -587,6 +598,82 @@ pub use ipnet::IpNet;
 
 #[cfg(feature = "tunnel")]
 pub use std::net::IpAddr;
+
+// =============================================================================
+// Standalone Authentication Messages (Feature-gated)
+// =============================================================================
+
+/// Server authentication challenge payload.
+///
+/// Server sends this after QUIC connect. Includes the server's signature
+/// for the client to verify against known_hosts.
+#[cfg(feature = "standalone")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuthChallengePayload {
+    /// Server's host public key (OpenSSH format).
+    pub server_public_key: String,
+    /// Random challenge for client to sign.
+    pub challenge: [u8; 32],
+    /// Server's random nonce.
+    pub server_nonce: [u8; 32],
+    /// Server's signature over: AUTH_CTX || "server" || host || port || challenge || server_nonce
+    pub server_signature: Vec<u8>,
+}
+
+/// Client authentication response payload.
+///
+/// Client sends this after verifying the server's identity.
+#[cfg(feature = "standalone")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuthResponsePayload {
+    /// Client's public key (OpenSSH format).
+    pub client_public_key: String,
+    /// Client's random nonce.
+    pub client_nonce: [u8; 32],
+    /// Client's signature over: AUTH_CTX || "client" || host || port || challenge || server_nonce || client_nonce
+    pub signature: Vec<u8>,
+}
+
+/// Authentication failure payload.
+///
+/// Server sends this when authentication fails for any reason.
+#[cfg(feature = "standalone")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuthFailurePayload {
+    /// Error code indicating failure type.
+    pub code: AuthErrorCode,
+    /// Human-readable error message.
+    pub message: String,
+}
+
+/// Authentication error codes.
+///
+/// Note: Only coarse-grained errors are exposed to clients.
+/// Internal failure details are logged server-side only.
+#[cfg(feature = "standalone")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthErrorCode {
+    /// Generic authentication failure (unknown key, revoked, bad signature, etc.)
+    AuthFailed,
+    /// Client took too long to respond.
+    Timeout,
+    /// Malformed or unexpected message.
+    ProtocolError,
+    /// Server-side error.
+    InternalError,
+}
+
+#[cfg(feature = "standalone")]
+impl std::fmt::Display for AuthErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthErrorCode::AuthFailed => write!(f, "authentication failed"),
+            AuthErrorCode::Timeout => write!(f, "timeout"),
+            AuthErrorCode::ProtocolError => write!(f, "protocol error"),
+            AuthErrorCode::InternalError => write!(f, "internal error"),
+        }
+    }
+}
 
 // =============================================================================
 // Tests

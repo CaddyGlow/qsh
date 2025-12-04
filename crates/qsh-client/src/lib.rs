@@ -9,6 +9,7 @@
 //! - Port forwarding handlers
 //! - Connection management
 //! - Raw terminal mode handling
+//! - Direct connection mode with SSH key authentication (feature-gated)
 
 pub mod cli;
 pub mod connection;
@@ -20,9 +21,15 @@ pub mod render;
 pub mod ssh;
 pub mod terminal;
 
+#[cfg(feature = "standalone")]
+pub mod standalone;
+
 pub use cli::Cli;
 pub use connection::{ClientConnection, ConnectionConfig, LatencyStats, LatencyTracker};
 pub use escape::{EscapeCommand, EscapeHandler, EscapeResult, parse_escape_key};
 pub use forward::{LocalForwarder, Socks5Proxy};
 pub use ssh::{BootstrapHandle, BootstrapMode, SshConfig, bootstrap};
 pub use terminal::{RawModeGuard, StdinReader, StdoutWriter, get_terminal_size, restore_terminal};
+
+#[cfg(feature = "standalone")]
+pub use standalone::{DirectAuthenticator, DirectConfig};

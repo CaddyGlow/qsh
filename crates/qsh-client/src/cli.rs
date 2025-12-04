@@ -241,6 +241,37 @@ pub struct Cli {
     /// Connection timeout in seconds (per connection attempt).
     #[arg(long = "connect-timeout", default_value = "5", value_name = "SECONDS")]
     pub connect_timeout_secs: u64,
+
+    // Direct/standalone mode options (feature-gated)
+    /// Connect directly to server (skip SSH bootstrap)
+    #[cfg(feature = "standalone")]
+    #[arg(long = "direct")]
+    pub direct: bool,
+
+    /// Server address for direct mode (host:port)
+    #[cfg(feature = "standalone")]
+    #[arg(long = "server", value_name = "HOST:PORT")]
+    pub server: Option<String>,
+
+    /// Path to client private key for direct mode
+    #[cfg(feature = "standalone")]
+    #[arg(long = "key", value_name = "PATH")]
+    pub key: Option<PathBuf>,
+
+    /// Path to known_hosts file for direct mode
+    #[cfg(feature = "standalone")]
+    #[arg(long = "known-hosts", value_name = "PATH")]
+    pub known_hosts: Option<PathBuf>,
+
+    /// Accept unknown host keys (TOFU - Trust On First Use)
+    #[cfg(feature = "standalone")]
+    #[arg(long = "accept-unknown-host")]
+    pub accept_unknown_host: bool,
+
+    /// Disable SSH agent for key operations
+    #[cfg(feature = "standalone")]
+    #[arg(long = "no-agent")]
+    pub no_agent: bool,
 }
 
 impl Cli {
@@ -602,6 +633,15 @@ mod tests {
             assert!(cli.tunnel.is_none());
             assert!(cli.route.is_empty());
             assert_eq!(cli.tun_mtu, 1280);
+        }
+        #[cfg(feature = "standalone")]
+        {
+            assert!(!cli.direct);
+            assert!(cli.server.is_none());
+            assert!(cli.key.is_none());
+            assert!(cli.known_hosts.is_none());
+            assert!(!cli.accept_unknown_host);
+            assert!(!cli.no_agent);
         }
     }
 }

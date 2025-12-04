@@ -16,6 +16,7 @@ path = "src/main.rs"
 [features]
 default = []
 tunnel = ["qsh-core/tunnel"]
+standalone = ["qsh-core/standalone", "dep:ssh-key", "dep:rpassword"]
 
 [dependencies]
 qsh-core = { workspace = true }
@@ -35,6 +36,11 @@ serde_json = { workspace = true }
 shell-escape = { workspace = true }
 shell-words = { workspace = true }
 libc = { workspace = true }
+rand = { workspace = true }
+
+# Standalone mode (optional)
+ssh-key = { workspace = true, optional = true }
+rpassword = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

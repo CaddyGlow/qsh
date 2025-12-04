@@ -233,9 +233,18 @@ pub struct ClientConnection {
 
 impl ClientConnection {
     /// Establish a new connection to the server.
-    pub async fn connect(mut config: ConnectionConfig) -> Result<Self> {
+    pub async fn connect(config: ConnectionConfig) -> Result<Self> {
         info!(addr = %config.server_addr, "Connecting to server");
+        let conn = Self::connect_quic(&config).await?;
+        Self::from_quic(conn, config).await
+    }
 
+    /// Establish a raw QUIC connection using the provided configuration.
+    ///
+    /// This performs the QUIC/TLS handshake but does not send qsh protocol
+    /// messages. It is used by both the standard SSH-bootstrap flow and
+    /// standalone/direct mode authentication.
+    pub async fn connect_quic(config: &ConnectionConfig) -> Result<quinn::Connection> {
         // Create QUIC endpoint
         let mut endpoint =
             Endpoint::client("0.0.0.0:0".parse().unwrap()).map_err(|e| Error::Transport {
@@ -275,6 +284,14 @@ impl ClientConnection {
                 message: format!("connection failed: {}", e),
             })?;
 
+        Ok(conn)
+    }
+
+    /// Complete the qsh protocol handshake on an existing QUIC connection.
+    ///
+    /// This sends Hello/HelloAck, opens terminal streams, and constructs
+    /// the [`ClientConnection`] wrapper used by higher-level code.
+    pub async fn from_quic(conn: quinn::Connection, mut config: ConnectionConfig) -> Result<Self> {
         info!("QUIC connection established");
         let quic = Arc::new(QuicConnection::new(conn));
 

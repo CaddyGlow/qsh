@@ -16,6 +16,7 @@ path = "src/main.rs"
 [features]
 default = []
 tunnel = ["qsh-core/tunnel"]
+standalone = ["qsh-core/standalone", "dep:ssh-key"]
 
 [dependencies]
 qsh-core = { workspace = true }
@@ -36,6 +37,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 
+# Standalone mode (optional)
+ssh-key = { workspace = true, optional = true }
+
 [dev-dependencies]
 tokio-test = { workspace = true }
 proptest = { workspace = true }
@@ -43,3 +47,5 @@ test-case = { workspace = true }
 assert_matches = { workspace = true }
 qsh-test-utils = { workspace = true }
 futures = { workspace = true }
+qsh-client = { workspace = true, features = ["standalone"] }
+tempfile = { workspace = true }

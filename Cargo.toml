@@ -53,6 +53,10 @@ rand = "0.8"
 base64 = "0.22"
 ring = "0.17"
 
+# SSH keys (for standalone auth feature)
+ssh-key = { version = "0.6", features = ["ed25519", "rsa", "p256", "std", "encryption", "crypto"] }
+rpassword = "7"
+
 # IP networking
 ipnet = { version = "2.9", features = ["serde"] }
 
@@ -77,3 +81,4 @@ proptest = "1.5"
 test-case = "3.3"
 assert_matches = "1.5"
 futures = "0.3"
+tempfile = "3"
