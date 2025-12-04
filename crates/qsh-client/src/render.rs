@@ -26,6 +26,12 @@ pub struct StateRenderer {
     current_attrs: CellAttrs,
     current_fg: Color,
     current_bg: Color,
+    /// Last title we set on the terminal (OSC 0).
+    current_title: Option<String>,
+    /// Last CWD we set on the terminal (OSC 7).
+    current_cwd: Option<String>,
+    /// Last clipboard sent (OSC 52). Track to avoid re-sending same data.
+    last_clipboard: Option<(String, String)>,
 }
 
 impl StateRenderer {
@@ -38,6 +44,9 @@ impl StateRenderer {
             current_attrs: CellAttrs::default(),
             current_fg: Color::Default,
             current_bg: Color::Default,
+            current_title: None,
+            current_cwd: None,
+            last_clipboard: None,
         }
     }
 
@@ -126,6 +135,42 @@ impl StateRenderer {
             output.push_str("\x1b[?25h");
         } else {
             output.push_str("\x1b[?25l");
+        }
+
+        // Emit title OSC if changed
+        if new_state.title != self.current_title {
+            if let Some(ref title) = new_state.title {
+                // OSC 0 sets both icon name and window title
+                let _ = write!(output, "\x1b]0;{}\x07", title);
+            } else {
+                // Clear title by setting empty string
+                output.push_str("\x1b]0;\x07");
+            }
+            self.current_title = new_state.title.clone();
+        }
+
+        // Emit CWD OSC 7 if changed
+        if new_state.cwd != self.current_cwd {
+            if let Some(ref cwd) = new_state.cwd {
+                // OSC 7 sets current working directory
+                let _ = write!(output, "\x1b]7;{}\x07", cwd);
+            }
+            // Note: There's no standard way to "clear" CWD, so we only emit when set
+            self.current_cwd = new_state.cwd.clone();
+        }
+
+        // Emit clipboard OSC 52 if changed
+        if new_state.clipboard != self.last_clipboard {
+            if let Some((ref selection, ref data)) = new_state.clipboard {
+                // OSC 52 ; selection ; base64-data ST
+                let _ = write!(output, "\x1b]52;{};{}\x07", selection, data);
+            }
+            self.last_clipboard = new_state.clipboard.clone();
+        }
+
+        // Emit any pending OSC sequences verbatim (already includes ESC ] and terminator)
+        for osc in &new_state.pending_osc {
+            output.push_str(osc);
         }
 
         output
@@ -326,11 +371,176 @@ impl StateRenderer {
         self.local_framebuffer = None;
         self.cursor_x = -1;
         self.cursor_y = -1;
+        self.current_title = None;
+        self.current_cwd = None;
+        self.last_clipboard = None;
     }
 }
 
 impl Default for StateRenderer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::overlay::PredictionOverlay;
+
+    #[test]
+    fn renders_title_osc_on_change() {
+        let mut renderer = StateRenderer::new();
+        let overlay = PredictionOverlay::new();
+
+        // Initial state with no title - no OSC emitted (None == None)
+        let state = TerminalState::new(80, 24);
+        let output = renderer.render(&state, &overlay);
+        assert!(
+            !output.contains("\x1b]0;"),
+            "should not emit title OSC when both are None"
+        );
+
+        // Set a title
+        let mut state_with_title = TerminalState::new(80, 24);
+        state_with_title.title = Some("My Title".to_string());
+        let output = renderer.render(&state_with_title, &overlay);
+
+        assert!(
+            output.contains("\x1b]0;My Title\x07"),
+            "should emit title OSC: {:?}",
+            output
+        );
+
+        // Render again with same title - should not emit
+        let output = renderer.render(&state_with_title, &overlay);
+        assert!(
+            !output.contains("\x1b]0;"),
+            "should not re-emit unchanged title"
+        );
+    }
+
+    #[test]
+    fn clears_title_when_removed() {
+        let mut renderer = StateRenderer::new();
+        let overlay = PredictionOverlay::new();
+
+        // Set initial title
+        let mut state = TerminalState::new(80, 24);
+        state.title = Some("Title".to_string());
+        renderer.render(&state, &overlay);
+
+        // Remove title
+        state.title = None;
+        let output = renderer.render(&state, &overlay);
+
+        assert!(
+            output.contains("\x1b]0;\x07"),
+            "should emit empty title OSC to clear"
+        );
+    }
+
+    #[test]
+    fn invalidate_resets_title_tracking() {
+        let mut renderer = StateRenderer::new();
+        let overlay = PredictionOverlay::new();
+
+        // Set a title
+        let mut state = TerminalState::new(80, 24);
+        state.title = Some("Title".to_string());
+        renderer.render(&state, &overlay);
+
+        // Invalidate
+        renderer.invalidate();
+
+        // Same title should be re-emitted
+        let output = renderer.render(&state, &overlay);
+        assert!(
+            output.contains("\x1b]0;Title\x07"),
+            "should re-emit title after invalidate"
+        );
+    }
+
+    #[test]
+    fn renders_cwd_osc7_on_change() {
+        let mut renderer = StateRenderer::new();
+        let overlay = PredictionOverlay::new();
+
+        // Initial state with no CWD - no OSC emitted
+        let state = TerminalState::new(80, 24);
+        let output = renderer.render(&state, &overlay);
+        assert!(
+            !output.contains("\x1b]7;"),
+            "should not emit CWD OSC when None"
+        );
+
+        // Set a CWD
+        let mut state_with_cwd = TerminalState::new(80, 24);
+        state_with_cwd.cwd = Some("file://localhost/home/user".to_string());
+        let output = renderer.render(&state_with_cwd, &overlay);
+
+        assert!(
+            output.contains("\x1b]7;file://localhost/home/user\x07"),
+            "should emit CWD OSC: {:?}",
+            output
+        );
+
+        // Render again with same CWD - should not emit
+        let output = renderer.render(&state_with_cwd, &overlay);
+        assert!(
+            !output.contains("\x1b]7;"),
+            "should not re-emit unchanged CWD"
+        );
+    }
+
+    #[test]
+    fn renders_clipboard_osc52_on_change() {
+        let mut renderer = StateRenderer::new();
+        let overlay = PredictionOverlay::new();
+
+        // Initial state with no clipboard - no OSC emitted
+        let state = TerminalState::new(80, 24);
+        let output = renderer.render(&state, &overlay);
+        assert!(
+            !output.contains("\x1b]52;"),
+            "should not emit clipboard OSC when None"
+        );
+
+        // Set clipboard
+        let mut state_with_clipboard = TerminalState::new(80, 24);
+        state_with_clipboard.clipboard = Some(("c".to_string(), "SGVsbG8=".to_string()));
+        let output = renderer.render(&state_with_clipboard, &overlay);
+
+        assert!(
+            output.contains("\x1b]52;c;SGVsbG8=\x07"),
+            "should emit clipboard OSC: {:?}",
+            output
+        );
+
+        // Render again with same clipboard - should not re-emit
+        let output = renderer.render(&state_with_clipboard, &overlay);
+        assert!(
+            !output.contains("\x1b]52;"),
+            "should not re-emit unchanged clipboard"
+        );
+    }
+
+    #[test]
+    fn renders_pending_osc_verbatim() {
+        let mut renderer = StateRenderer::new();
+        let overlay = PredictionOverlay::new();
+
+        // State with pending OSC (e.g., hyperlink)
+        let mut state = TerminalState::new(80, 24);
+        state
+            .pending_osc
+            .push("\x1b]8;;https://example.com\x07".to_string());
+        let output = renderer.render(&state, &overlay);
+
+        assert!(
+            output.contains("\x1b]8;;https://example.com\x07"),
+            "should emit pending OSC verbatim: {:?}",
+            output
+        );
     }
 }

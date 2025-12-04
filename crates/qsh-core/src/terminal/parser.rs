@@ -227,20 +227,72 @@ impl Perform for Performer<'_> {
         }
     }
 
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+    fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         if params.is_empty() {
             return;
         }
 
-        let cmd = std::str::from_utf8(params[0])
-            .ok()
-            .and_then(|s| s.parse::<u8>().ok());
+        let cmd_str = match std::str::from_utf8(params[0]) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
 
-        if let Some(0..=2) = cmd
-            && let Some(title) = params.get(1)
-            && let Ok(title) = std::str::from_utf8(title)
-        {
-            self.state.title = Some(title.to_string());
+        // Try to parse as numeric command
+        let handled = if let Ok(cmd) = cmd_str.parse::<u8>() {
+            match cmd {
+                // OSC 0/1/2: Set window title
+                0..=2 => {
+                    if let Some(title) = params.get(1)
+                        && let Ok(title) = std::str::from_utf8(title)
+                    {
+                        self.state.title = Some(title.to_string());
+                    }
+                    true
+                }
+                // OSC 7: Set current working directory
+                // Format: OSC 7 ; file://hostname/path ST
+                7 => {
+                    if let Some(uri) = params.get(1)
+                        && let Ok(uri) = std::str::from_utf8(uri)
+                    {
+                        self.state.cwd = Some(uri.to_string());
+                    }
+                    true
+                }
+                // OSC 52: Clipboard manipulation
+                // Format: OSC 52 ; selection ; base64-data ST
+                52 => {
+                    if let Some(selection) = params.get(1)
+                        && let Ok(selection) = std::str::from_utf8(selection)
+                        && let Some(data) = params.get(2)
+                        && let Ok(data) = std::str::from_utf8(data)
+                    {
+                        self.state.clipboard = Some((selection.to_string(), data.to_string()));
+                    }
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+
+        // Forward unhandled OSC sequences verbatim
+        if !handled {
+            // Reconstruct the OSC content: join params with semicolons
+            let content: String = params
+                .iter()
+                .filter_map(|p| std::str::from_utf8(p).ok())
+                .collect::<Vec<_>>()
+                .join(";");
+
+            if !content.is_empty() {
+                // Store with terminator info (BEL vs ST)
+                let terminator = if bell_terminated { "\x07" } else { "\x1b\\" };
+                self.state
+                    .pending_osc
+                    .push(format!("\x1b]{}{}", content, terminator));
+            }
         }
     }
 
@@ -614,6 +666,55 @@ mod tests {
         parser.process(b"\x1b]0;My Title\x07");
 
         assert_eq!(parser.state().title, Some("My Title".to_string()));
+    }
+
+    #[test]
+    fn set_cwd_osc7() {
+        let mut parser = TerminalParser::new(80, 24);
+        parser.process(b"\x1b]7;file://localhost/home/user\x07");
+
+        assert_eq!(
+            parser.state().cwd,
+            Some("file://localhost/home/user".to_string())
+        );
+    }
+
+    #[test]
+    fn set_clipboard_osc52() {
+        let mut parser = TerminalParser::new(80, 24);
+        // OSC 52 ; c ; SGVsbG8= ST  (base64 for "Hello")
+        parser.process(b"\x1b]52;c;SGVsbG8=\x07");
+
+        assert_eq!(
+            parser.state().clipboard,
+            Some(("c".to_string(), "SGVsbG8=".to_string()))
+        );
+    }
+
+    #[test]
+    fn forward_unhandled_osc() {
+        let mut parser = TerminalParser::new(80, 24);
+        // OSC 8 is hyperlinks - not explicitly handled, should be forwarded
+        parser.process(b"\x1b]8;id=foo;https://example.com\x07");
+
+        assert_eq!(parser.state().pending_osc.len(), 1);
+        assert_eq!(
+            parser.state().pending_osc[0],
+            "\x1b]8;id=foo;https://example.com\x07"
+        );
+    }
+
+    #[test]
+    fn forward_osc_with_st_terminator() {
+        let mut parser = TerminalParser::new(80, 24);
+        // OSC 8 with ST terminator (ESC \)
+        parser.process(b"\x1b]8;;https://example.com\x1b\\");
+
+        assert_eq!(parser.state().pending_osc.len(), 1);
+        assert_eq!(
+            parser.state().pending_osc[0],
+            "\x1b]8;;https://example.com\x1b\\"
+        );
     }
 
     #[test]

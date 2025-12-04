@@ -352,8 +352,17 @@ pub struct TerminalState {
     pub cursor: Cursor,
     /// Whether alternate screen is active.
     pub alternate_active: bool,
-    /// Window/tab title.
+    /// Window/tab title (OSC 0/1/2).
     pub title: Option<String>,
+    /// Current working directory (OSC 7).
+    pub cwd: Option<String>,
+    /// Pending clipboard content (OSC 52). Tuple of (selection, base64-encoded data).
+    /// Selection is typically "c" (clipboard) or "p" (primary).
+    pub clipboard: Option<(String, String)>,
+    /// Pending OSC sequences to forward verbatim (for unhandled OSC codes).
+    /// Each entry is the raw OSC content (without ESC ] prefix and ST/BEL terminator).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_osc: Vec<String>,
     /// Current foreground color for new cells.
     pub current_fg: Color,
     /// Current background color for new cells.
@@ -372,6 +381,9 @@ impl TerminalState {
             cursor: Cursor::default(),
             alternate_active: false,
             title: None,
+            cwd: None,
+            clipboard: None,
+            pending_osc: Vec::new(),
             current_fg: Color::Default,
             current_bg: Color::Default,
             current_attrs: CellAttrs::default(),

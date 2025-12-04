@@ -41,6 +41,12 @@ pub enum StateDiff {
         cursor: Option<Cursor>,
         /// New title (if changed).
         title: Option<Option<String>>,
+        /// New current working directory (if changed).
+        cwd: Option<Option<String>>,
+        /// New clipboard content (if changed).
+        clipboard: Option<Option<(String, String)>>,
+        /// Pending OSC sequences to forward.
+        pending_osc: Vec<String>,
         /// Whether alternate screen became active/inactive.
         alternate_active: Option<bool>,
     },
@@ -89,6 +95,21 @@ impl TerminalState {
             None
         };
 
+        let cwd = if self.cwd != other.cwd {
+            Some(other.cwd.clone())
+        } else {
+            None
+        };
+
+        let clipboard = if self.clipboard != other.clipboard {
+            Some(other.clipboard.clone())
+        } else {
+            None
+        };
+
+        // Always include pending_osc - these are ephemeral and should be forwarded
+        let pending_osc = other.pending_osc.clone();
+
         let alternate_active = if self.alternate_active != other.alternate_active {
             Some(other.alternate_active)
         } else {
@@ -101,6 +122,9 @@ impl TerminalState {
             changes,
             cursor,
             title,
+            cwd,
+            clipboard,
+            pending_osc,
             alternate_active,
         }
     }
@@ -123,6 +147,9 @@ impl TerminalState {
                 changes,
                 cursor,
                 title,
+                cwd,
+                clipboard,
+                pending_osc,
                 alternate_active,
             } => {
                 // Verify we're applying to the correct base state
@@ -158,6 +185,19 @@ impl TerminalState {
                     new_state.title = t.clone();
                 }
 
+                // Apply cwd change
+                if let Some(c) = cwd {
+                    new_state.cwd = c.clone();
+                }
+
+                // Apply clipboard change
+                if let Some(c) = clipboard {
+                    new_state.clipboard = c.clone();
+                }
+
+                // Apply pending OSC sequences
+                new_state.pending_osc = pending_osc.clone();
+
                 Ok(new_state)
             }
         }
@@ -172,6 +212,9 @@ impl TerminalState {
         // Check everything else is the same
         self.alternate_active == other.alternate_active
             && self.title == other.title
+            && self.cwd == other.cwd
+            && self.clipboard == other.clipboard
+            && other.pending_osc.is_empty()
             && self.screens_equal(other)
     }
 
@@ -351,6 +394,9 @@ mod tests {
             }],
             cursor: None,
             title: None,
+            cwd: None,
+            clipboard: None,
+            pending_osc: vec![],
             alternate_active: None,
         };
 
@@ -422,6 +468,9 @@ mod tests {
             changes: vec![],
             cursor: None,
             title: None,
+            cwd: None,
+            clipboard: None,
+            pending_osc: vec![],
             alternate_active: None,
         };
 

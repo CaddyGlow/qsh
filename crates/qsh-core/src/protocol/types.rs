@@ -744,6 +744,9 @@ mod tests {
             changes: vec![],
             cursor: None,
             title: None,
+            cwd: None,
+            clipboard: None,
+            pending_osc: vec![],
             alternate_active: None,
         };
         let _cursor = StateDiff::CursorOnly {
