@@ -119,7 +119,14 @@ impl StateRenderer {
         // Render each row - take ownership of old state temporarily
         let old_state = self.local_framebuffer.take();
         for row in 0..rows {
-            self.put_row(&mut output, screen, old_state.as_ref().map(|s| s.screen()), row, cols, initialized);
+            self.put_row(
+                &mut output,
+                screen,
+                old_state.as_ref().map(|s| s.screen()),
+                row,
+                cols,
+                initialized,
+            );
         }
         self.local_framebuffer = old_state;
 

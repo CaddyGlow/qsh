@@ -117,8 +117,6 @@ fn arb_message() -> impl Strategy<Value = Message> {
     prop_oneof![
         // Control messages
         arb_hello().prop_map(Message::Hello),
-        any::<u64>().prop_map(Message::Ping),
-        any::<u64>().prop_map(Message::Pong),
         (any::<u16>(), any::<u16>())
             .prop_map(|(cols, rows)| Message::Resize(ResizePayload { cols, rows })),
         (arb_shutdown_reason(), any::<Option<String>>())

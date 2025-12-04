@@ -254,7 +254,7 @@ qsh uses QUIC's native stream multiplexing. Stream IDs follow QUIC semantics (bi
 Control Stream (ID 0, client-initiated bidi):
   - Opened by client immediately after QUIC handshake
   - Remains open for session lifetime
-  - Carries Hello, HelloAck, Resize, Ping/Pong, Shutdown
+  - Carries Hello, HelloAck, Resize, Shutdown
 
 Terminal Output Stream (server-initiated uni, first ID 3):
   - Opened by server after HelloAck
@@ -328,27 +328,26 @@ pub enum Message {
     Hello(HelloPayload),           // 0x00
     HelloAck(HelloAckPayload),     // 0x01
     Resize(ResizePayload),         // 0x02
-    Ping(u64),                     // 0x03
-    Pong(u64),                     // 0x04
-    Shutdown(ShutdownPayload),     // 0x05
+    Shutdown(ShutdownPayload),     // 0x03
     
     // Terminal streams
-    TerminalInput(TerminalInputPayload),   // 0x10
-    StateUpdate(StateUpdatePayload),       // 0x11
-    StateAck(StateAckPayload),             // 0x12
+    TerminalInput(TerminalInputPayload),   // 0x04
+    TerminalOutput(TerminalOutputPayload), // 0x05
+    StateUpdate(StateUpdatePayload),       // 0x06
+    StateAck(StateAckPayload),             // 0x07
     
     // Forward streams
-    ForwardRequest(ForwardRequestPayload), // 0x20
-    ForwardAccept(ForwardAcceptPayload),   // 0x21
-    ForwardReject(ForwardRejectPayload),   // 0x22
-    ForwardData(ForwardDataPayload),       // 0x23
-    ForwardEof(ForwardEofPayload),         // 0x24
-    ForwardClose(ForwardClosePayload),     // 0x25
+    ForwardRequest(ForwardRequestPayload), // 0x08
+    ForwardAccept(ForwardAcceptPayload),   // 0x09
+    ForwardReject(ForwardRejectPayload),   // 0x0A
+    ForwardData(ForwardDataPayload),       // 0x0B
+    ForwardEof(ForwardEofPayload),         // 0x0C
+    ForwardClose(ForwardClosePayload),     // 0x0D
     
     // Tunnel stream (ID 4)
-    TunnelConfig(TunnelConfigPayload),     // 0x30
-    TunnelConfigAck(TunnelConfigAckPayload), // 0x31
-    TunnelPacket(TunnelPacketPayload),     // 0x32
+    TunnelConfig(TunnelConfigPayload),     // 0x0E
+    TunnelConfigAck(TunnelConfigAckPayload), // 0x0F
+    TunnelPacket(TunnelPacketPayload),     // 0x10
 }
 ```
 
@@ -440,14 +439,7 @@ pub struct ResizePayload {
 }
 ```
 
-#### Ping / Pong
-
-Keepalive and latency measurement.
-
-```rust
-// Ping: u64 timestamp (client's monotonic clock, microseconds)
-// Pong: echoes the timestamp back
-```
+Connection liveness and keepalive are handled by QUIC transport parameters; no application-level ping/pong messages are exchanged.
 
 #### Shutdown
 
@@ -1632,7 +1624,6 @@ pub const DEFAULT_ROWS: u16 = 24;
 | StateUpdate (incremental) | ~500 bytes | ~100 KiB |
 | StateUpdate (full) | ~50 KiB | ~5 MiB |
 | ForwardData | ~1 KiB | ~64 KiB |
-| Ping/Pong | 12 bytes | 12 bytes |
 | TunnelConfig | ~100 bytes | ~1 KiB |
 | TunnelConfigAck | ~150 bytes | ~2 KiB |
 | TunnelPacket | ~500 bytes | ~64 KiB |

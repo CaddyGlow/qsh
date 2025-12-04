@@ -6,12 +6,12 @@
 
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex, watch};
+use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -305,12 +305,9 @@ impl SessionEntry {
 
     /// Send input to PTY.
     pub async fn send_input(&self, data: Vec<u8>) -> Result<()> {
-        self.input_tx
-            .send(data)
-            .await
-            .map_err(|_| Error::Pty {
-                message: "input channel closed".to_string(),
-            })
+        self.input_tx.send(data).await.map_err(|_| Error::Pty {
+            message: "input channel closed".to_string(),
+        })
     }
 
     /// Resize the PTY.

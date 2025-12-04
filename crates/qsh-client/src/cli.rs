@@ -222,12 +222,20 @@ pub struct Cli {
     #[arg(long = "escape-key", default_value = "ctrl+^", value_name = "KEY")]
     pub escape_key: String,
 
-    /// QUIC keep-alive interval in seconds (0 disables).
-    #[arg(long = "keep-alive", default_value = "5", value_name = "SECONDS")]
-    pub keep_alive_secs: u64,
+    /// QUIC keep-alive interval in milliseconds (0 disables).
+    #[arg(
+        long = "keep-alive",
+        default_value = "500",
+        value_name = "MILLISECONDS"
+    )]
+    pub keep_alive_ms: u64,
 
     /// QUIC max idle timeout in seconds (connection closes after this).
-    #[arg(long = "max-idle-timeout", default_value = "15", value_name = "SECONDS")]
+    #[arg(
+        long = "max-idle-timeout",
+        default_value = "15",
+        value_name = "SECONDS"
+    )]
     pub max_idle_timeout_secs: u64,
 
     /// Connection timeout in seconds (per connection attempt).
@@ -264,10 +272,10 @@ impl Cli {
 
     /// QUIC keep-alive interval (None disables).
     pub fn keep_alive_interval(&self) -> Option<std::time::Duration> {
-        if self.keep_alive_secs == 0 {
+        if self.keep_alive_ms == 0 {
             None
         } else {
-            Some(std::time::Duration::from_secs(self.keep_alive_secs))
+            Some(std::time::Duration::from_millis(self.keep_alive_ms))
         }
     }
 

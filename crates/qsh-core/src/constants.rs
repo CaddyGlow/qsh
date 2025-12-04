@@ -31,9 +31,6 @@ pub const SESSION_KEY_LEN: usize = 32;
 // Timing Constants
 // =============================================================================
 
-/// Interval between ping messages for keepalive.
-pub const PING_INTERVAL: Duration = Duration::from_secs(5);
-
 /// QUIC idle timeout.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -133,8 +130,8 @@ mod tests {
     #[test]
     fn timing_constants_are_ordered() {
         // Runtime checks that make sense for the test context
-        assert!(PING_INTERVAL < IDLE_TIMEOUT);
         assert!(RECONNECT_TIMEOUT <= MAX_RECONNECT_TIMEOUT);
+        assert!(IDLE_TIMEOUT < SESSION_TIMEOUT);
     }
 
     #[test]

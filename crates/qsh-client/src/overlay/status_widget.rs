@@ -52,6 +52,8 @@ pub struct ConnectionMetrics {
     pub session_start: Option<Instant>,
     /// Time of last received data from server (for stale detection like mosh's 250ms threshold).
     pub last_heard: Option<Instant>,
+    /// Time of last successful internal keepalive (if tracked separately from data).
+    pub last_keepalive: Option<Instant>,
 }
 
 impl ConnectionMetrics {
@@ -131,6 +133,21 @@ impl ConnectionMetrics {
     /// Record that we received data from the server.
     pub fn record_heard(&mut self) {
         self.last_heard = Some(Instant::now());
+    }
+
+    /// Record that a keepalive was acknowledged.
+    pub fn record_keepalive(&mut self) {
+        self.last_keepalive = Some(Instant::now());
+    }
+
+    /// Latest moment we know the connection was alive (data or keepalive).
+    pub fn last_alive(&self) -> Option<Instant> {
+        match (self.last_heard, self.last_keepalive) {
+            (Some(h), Some(k)) => Some(std::cmp::max(h, k)),
+            (Some(h), None) => Some(h),
+            (None, Some(k)) => Some(k),
+            (None, None) => None,
+        }
     }
 
     /// Get time since last heard from server.
@@ -271,6 +288,11 @@ impl StatusOverlay {
             ConnectionStatus::Degraded => "!",     // warning substitute
             ConnectionStatus::Disconnected => "x",
         };
+        let status_elapsed = self
+            .metrics
+            .last_alive()
+            .map(|t| t.elapsed())
+            .or_else(|| self.status_since.map(|t| t.elapsed()));
 
         // Build status bar content
         let user_host = self.user_host.as_deref().unwrap_or("?");
@@ -285,21 +307,20 @@ impl StatusOverlay {
             .map(|l| format!("{:.1}%", l * 100.0))
             .unwrap_or_else(|| "-".to_string());
 
-        // Show elapsed time when waiting or reconnecting
+        // Show elapsed time when waiting/reconnecting/disconnected
         let status_str = match self.status {
-            ConnectionStatus::Waiting | ConnectionStatus::Reconnecting => {
-                let elapsed = self.metrics.time_since_heard();
-                let symbol = if self.status == ConnectionStatus::Waiting { "?" } else { "~" };
-                if let Some(elapsed) = elapsed {
-                    let secs = elapsed.as_secs_f32();
-                    if secs < 1.0 {
-                        format!("{} {:.0}ms", symbol, elapsed.as_millis())
-                    } else {
-                        format!("{} {:.1}s", symbol, secs)
-                    }
-                } else {
-                    symbol.to_string()
-                }
+            ConnectionStatus::Waiting
+            | ConnectionStatus::Reconnecting
+            | ConnectionStatus::Disconnected => {
+                let symbol = match self.status {
+                    ConnectionStatus::Waiting => "?",
+                    ConnectionStatus::Reconnecting => "~",
+                    ConnectionStatus::Disconnected => "x",
+                    _ => unreachable!(),
+                };
+                status_elapsed
+                    .map(|elapsed| format_duration(symbol, elapsed))
+                    .unwrap_or_else(|| symbol.to_string())
             }
             _ => status_char.to_string(),
         };
@@ -365,11 +386,22 @@ impl StatusOverlay {
             .unwrap_or_else(|| "?".to_string());
 
         let elapsed_str = self
-            .status_since
+            .metrics
+            .last_alive()
+            .or(self.status_since)
             .map(|t| format!("{}s", t.elapsed().as_secs()))
             .unwrap_or_else(|| "-s".to_string());
 
         format!("{} | RTT: {} | {}", status_str, rtt_str, elapsed_str)
+    }
+}
+
+fn format_duration(symbol: &str, elapsed: Duration) -> String {
+    let secs = elapsed.as_secs_f32();
+    if secs < 1.0 {
+        format!("{symbol} {:.0}ms", elapsed.as_millis())
+    } else {
+        format!("{symbol} {:.1}s", secs)
     }
 }
 
@@ -555,9 +587,20 @@ mod tests {
     fn overlay_waiting_status() {
         let mut overlay = StatusOverlay::new();
         overlay.set_visible(true);
-
+        overlay.set_user_host("user@host".into());
         overlay.set_status(ConnectionStatus::Waiting);
+
+        // Simulate keepalive more recent than last_heard so we pick the freshest signal.
+        overlay.status_since = Some(Instant::now() - Duration::from_secs(30));
+        overlay.metrics.last_heard = Some(Instant::now() - Duration::from_secs(10));
+        overlay.metrics.last_keepalive = Some(Instant::now() - Duration::from_millis(1500));
+
         let rendered = overlay.render(80);
         assert!(rendered.contains('?')); // Waiting indicator
+
+        let parts: Vec<_> = rendered.split('|').map(str::trim).collect();
+        let status_part = parts.last().unwrap_or(&"");
+        assert!(status_part.contains('s')); // uses keepalive-based elapsed (~1.5s)
+        assert!(!status_part.contains("30s")); // should pick most recent signal
     }
 }

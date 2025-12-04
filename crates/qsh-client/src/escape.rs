@@ -81,9 +81,7 @@ impl EscapeHandler {
 
         // Check for timeout if we're in escaped state
         if self.state == EscapeState::Escaped
-            && self
-                .escape_time
-                .is_some_and(|t| t.elapsed() > self.timeout)
+            && self.escape_time.is_some_and(|t| t.elapsed() > self.timeout)
         {
             // Timeout expired, release the escape key and reset
             self.state = EscapeState::Normal;

@@ -161,9 +161,7 @@ impl PredictionEngine {
         match self.display_preference {
             DisplayPreference::Never => false,
             DisplayPreference::Always => true,
-            DisplayPreference::Adaptive => {
-                self.srtt_trigger || self.glitch_trigger > 0
-            }
+            DisplayPreference::Adaptive => self.srtt_trigger || self.glitch_trigger > 0,
         }
     }
 
@@ -188,7 +186,13 @@ impl PredictionEngine {
     ///
     /// Returns `Some(PredictedEcho)` if prediction should be displayed,
     /// `None` if prediction was skipped.
-    pub fn predict(&mut self, c: char, col: u16, row: u16, input_seq: u64) -> Option<PredictedEcho> {
+    pub fn predict(
+        &mut self,
+        c: char,
+        col: u16,
+        row: u16,
+        input_seq: u64,
+    ) -> Option<PredictedEcho> {
         if !self.should_predict(c) {
             return None;
         }

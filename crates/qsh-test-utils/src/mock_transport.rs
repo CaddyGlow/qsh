@@ -250,7 +250,7 @@ pub fn mock_connection_pair() -> (MockConnection, MockConnection) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qsh_core::protocol::{Capabilities, HelloPayload, TermSize};
+    use qsh_core::protocol::ResizePayload;
 
     #[tokio::test]
     async fn mock_stream_send_recv() {
@@ -260,7 +260,7 @@ mod tests {
         let mut stream1 = MockStream::new(tx1, rx2);
         let mut stream2 = MockStream::new(tx2, rx1);
 
-        let msg = Message::Ping(42);
+        let msg = Message::Resize(ResizePayload { cols: 80, rows: 24 });
         stream1.send(&msg).await.unwrap();
 
         let received = stream2.recv().await.unwrap();
@@ -276,7 +276,12 @@ mod tests {
         stream.close();
         assert!(stream.is_closed());
 
-        let result = stream.send(&Message::Ping(1)).await;
+        let result = stream
+            .send(&Message::Resize(ResizePayload {
+                cols: 120,
+                rows: 40,
+            }))
+            .await;
         assert!(result.is_err());
     }
 
@@ -292,11 +297,13 @@ mod tests {
     async fn mock_connection_open_stream() {
         let (client, _server) = mock_connection_pair();
 
-        let (our_half, peer_half) = client.open_stream_half(StreamType::Control);
+        let (our_half, _peer_half) = client.open_stream_half(StreamType::Control);
 
         // Should be able to communicate
-        let (tx, rx) = (our_half.tx.clone(), peer_half.rx);
-        tx.send(Message::Ping(123)).await.unwrap();
+        let tx = our_half.tx.clone();
+        tx.send(Message::Resize(ResizePayload { cols: 90, rows: 30 }))
+            .await
+            .unwrap();
         // Note: We'd need to properly wire up the peer half in real usage
     }
 

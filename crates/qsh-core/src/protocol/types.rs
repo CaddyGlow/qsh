@@ -24,10 +24,6 @@ pub enum Message {
     HelloAck(HelloAckPayload),
     /// Terminal resize notification.
     Resize(ResizePayload),
-    /// Ping for keepalive and latency measurement.
-    Ping(u64),
-    /// Pong response to ping.
-    Pong(u64),
     /// Graceful shutdown notification.
     Shutdown(ShutdownPayload),
 
@@ -621,8 +617,6 @@ mod tests {
         });
 
         let _resize = Message::Resize(ResizePayload { cols: 80, rows: 24 });
-        let _ping = Message::Ping(12345);
-        let _pong = Message::Pong(12345);
 
         let _shutdown = Message::Shutdown(ShutdownPayload {
             reason: ShutdownReason::UserRequested,

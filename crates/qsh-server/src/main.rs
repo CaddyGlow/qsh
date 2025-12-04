@@ -133,13 +133,15 @@ async fn run_bootstrap(cli: &Cli) -> qsh_core::Result<()> {
     authorizer.allow(bootstrap.session_key()).await;
 
     // Create pipe for subsequent bootstrap requests and start listener.
-    let _pipe_guard = qsh_server::bootstrap::create_pipe(&pipe_path).map_err(|e| {
-        qsh_core::Error::Transport {
+    let _pipe_guard =
+        qsh_server::bootstrap::create_pipe(&pipe_path).map_err(|e| qsh_core::Error::Transport {
             message: format!("failed to create bootstrap pipe: {}", e),
-        }
-    })?;
-    let _pipe_task =
-        qsh_server::bootstrap::spawn_pipe_listener(pipe_path, bootstrap.clone(), authorizer.clone());
+        })?;
+    let _pipe_task = qsh_server::bootstrap::spawn_pipe_listener(
+        pipe_path,
+        bootstrap.clone(),
+        authorizer.clone(),
+    );
 
     // Output connection info to stdout
     bootstrap.print_response(None)?;
@@ -241,15 +243,12 @@ async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
 
 fn build_registry(cli: &Cli) -> Arc<SessionRegistry> {
     let env_vars = cli.parse_env_vars();
-    let shell = cli
-        .shell
-        .as_ref()
-        .map(|p| p.to_string_lossy().into_owned());
-    let spawner = Arc::new(RealSessionSpawner { shell, env: env_vars });
-    Arc::new(SessionRegistry::new(
-        cli.session_linger_duration(),
-        spawner,
-    ))
+    let shell = cli.shell.as_ref().map(|p| p.to_string_lossy().into_owned());
+    let spawner = Arc::new(RealSessionSpawner {
+        shell,
+        env: env_vars,
+    });
+    Arc::new(SessionRegistry::new(cli.session_linger_duration(), spawner))
 }
 
 async fn serve_endpoint(
@@ -423,7 +422,7 @@ async fn handle_session(
                 }
             }
 
-            // Handle control messages (resize, ping, shutdown)
+            // Handle control messages (resize, shutdown)
             msg = session.process_control() => {
                 match msg {
                     Ok(Some(Message::Resize(ResizePayload { cols, rows }))) => {
@@ -432,13 +431,6 @@ async fn handle_session(
                             warn!(error = %e, "Failed to resize PTY");
                         } else {
                             entry.touch().await;
-                        }
-                    }
-                    Ok(Some(Message::Ping(timestamp))) => {
-                        debug!("Ping received, sending pong");
-                        entry.touch().await;
-                        if let Err(e) = session.send_pong(timestamp).await {
-                            warn!(error = %e, "Failed to send pong");
                         }
                     }
                     Ok(Some(Message::Shutdown(payload))) => {

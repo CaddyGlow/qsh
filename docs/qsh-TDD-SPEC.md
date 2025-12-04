@@ -565,8 +565,6 @@ pub enum Message {
     Hello(HelloPayload),
     HelloAck(HelloAckPayload),
     Resize(ResizePayload),
-    Ping(u64),
-    Pong(u64),
     Shutdown(ShutdownReason),
     
     // Terminal streams
@@ -671,7 +669,7 @@ mod tests {
     
     #[test]
     fn decode_partial_returns_none() {
-        let msg = Message::Ping(42);
+        let msg = Message::Resize(ResizePayload { cols: 80, rows: 24 });
         let encoded = Codec::encode(&msg).unwrap();
         
         // Only provide half the bytes
@@ -2074,12 +2072,21 @@ prop_compose! {
 }
 
 prop_compose! {
-    fn arb_message()(variant in 0u8..10) -> Message {
+    fn arb_message()(variant in 0u8..6) -> Message {
         match variant {
-            0 => Message::Ping(0),
-            1 => Message::Pong(0),
-            // ... generate other variants
-            _ => Message::Ping(0),
+            0 => Message::Hello(HelloPayload {
+                protocol_version: 1,
+                session_key: [0u8; 32],
+                client_nonce: 0,
+                capabilities: Capabilities::default(),
+            }),
+            1 => Message::Resize(ResizePayload { cols: 80, rows: 24 }),
+            2 => Message::Shutdown(ShutdownReason::UserRequested),
+            _ => Message::TerminalInput(TerminalInputPayload {
+                sequence: 0,
+                data: vec![],
+                echo_prediction: false,
+            }),
         }
     }
 }

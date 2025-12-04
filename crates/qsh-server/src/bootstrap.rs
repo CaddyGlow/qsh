@@ -22,14 +22,14 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::task::JoinHandle;
 use tracing::{debug, info};
 
+use crate::session::SessionAuthorizer;
+use libc;
+use nix::sys::stat::Mode;
+use nix::unistd::mkfifo;
 use qsh_core::bootstrap::{BootstrapResponse, ServerInfo};
 use qsh_core::constants::SESSION_KEY_LEN;
 use qsh_core::error::{Error, Result};
 use qsh_core::transport::server_crypto_config;
-use crate::session::SessionAuthorizer;
-use nix::sys::stat::Mode;
-use nix::unistd::mkfifo;
-use libc;
 
 /// Bootstrap server that handles single-connection bootstrap mode.
 pub struct BootstrapServer {
@@ -252,9 +252,7 @@ pub async fn try_existing_bootstrap(pipe_path: &Path) -> Result<Option<String>> 
         Ok(Ok(_)) => {
             let trimmed = line.trim_end();
             // Ignore self-echoes or garbage; only accept valid JSON.
-            if trimmed.is_empty()
-                || serde_json::from_str::<BootstrapResponse>(trimmed).is_err()
-            {
+            if trimmed.is_empty() || serde_json::from_str::<BootstrapResponse>(trimmed).is_err() {
                 tracing::debug!("Bootstrap pipe returned non-JSON response, ignoring");
                 Ok(None)
             } else {
@@ -303,7 +301,12 @@ pub fn spawn_pipe_listener(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let file = match OpenOptions::new().read(true).write(true).open(&pipe_path).await {
+            let file = match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&pipe_path)
+                .await
+            {
                 Ok(f) => f,
                 Err(e) => {
                     tracing::warn!(error = %e, "Bootstrap pipe open failed");

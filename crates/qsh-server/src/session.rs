@@ -14,12 +14,12 @@ use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use qsh_core::constants::SESSION_KEY_LEN;
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
     Capabilities, HelloAckPayload, HelloPayload, Message, ShutdownPayload, ShutdownReason,
     StateDiff, StateUpdatePayload, TerminalOutputPayload,
 };
-use qsh_core::constants::SESSION_KEY_LEN;
 use qsh_core::session::SessionState;
 use qsh_core::terminal::{TerminalParser, TerminalState};
 use qsh_core::transport::{Connection, QuicConnection, QuicStream, StreamPair, StreamType};
@@ -181,11 +181,11 @@ impl PendingSession {
                 reject_reason: Some("invalid session key".to_string()),
                 capabilities: config.capabilities.clone(),
                 initial_state: None,
-            zero_rtt_available: false,
-        };
-        control.send(&Message::HelloAck(ack)).await?;
-        return Err(Error::AuthenticationFailed);
-    }
+                zero_rtt_available: false,
+            };
+            control.send(&Message::HelloAck(ack)).await?;
+            return Err(Error::AuthenticationFailed);
+        }
 
         Ok(Self {
             quic,
@@ -276,7 +276,6 @@ impl PendingSession {
 }
 
 impl ServerSession {
-
     /// Get the session state.
     pub fn state(&self) -> &SessionState {
         &self.session_state
@@ -377,11 +376,6 @@ impl ServerSession {
         // In a full implementation, this would write to the PTY
         debug!(len = data.len(), "Received terminal input");
         Ok(())
-    }
-
-    /// Send a ping response.
-    pub async fn send_pong(&mut self, timestamp: u64) -> Result<()> {
-        self.control.send(&Message::Pong(timestamp)).await
     }
 
     /// Send a shutdown message to the client.

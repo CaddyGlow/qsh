@@ -885,7 +885,7 @@ OPTIONS:
     --overlay-position <POS>    Status overlay: top, bottom, top-right, none
     --no-overlay                Disable status overlay
     --overlay-key <KEY>         Custom overlay toggle key [default: ctrl+shift+s]
-    --ping-interval <SECS>      App-level ping interval (0 disables) [default: 5s]
+    --keep-alive <SECS>         QUIC keep-alive interval (0 disables) [default: 5s]
     
     -o <OPTION>                 SSH-style options (limited support)
     -F <FILE>                   SSH config file for host aliases

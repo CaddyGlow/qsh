@@ -102,13 +102,14 @@ impl Codec {
 mod tests {
     use super::*;
     use crate::protocol::{
-        Capabilities, HelloAckPayload, HelloPayload, TermSize, TerminalInputPayload,
+        Capabilities, HelloAckPayload, HelloPayload, ResizePayload, ShutdownPayload,
+        ShutdownReason, StateAckPayload, TermSize, TerminalInputPayload,
     };
     use crate::terminal::TerminalState;
 
     #[test]
-    fn encode_decode_roundtrip_ping() {
-        let msg = Message::Ping(42);
+    fn encode_decode_roundtrip_resize() {
+        let msg = Message::Resize(ResizePayload { cols: 80, rows: 24 });
         let encoded = Codec::encode(&msg).unwrap();
         let decoded = Codec::decode_slice(&encoded).unwrap().unwrap();
         assert_eq!(msg, decoded);
@@ -166,7 +167,10 @@ mod tests {
 
     #[test]
     fn decode_partial_returns_none() {
-        let msg = Message::Ping(42);
+        let msg = Message::Resize(ResizePayload {
+            cols: 120,
+            rows: 40,
+        });
         let encoded = Codec::encode(&msg).unwrap();
 
         // Only provide half the bytes
@@ -217,7 +221,10 @@ mod tests {
 
     #[test]
     fn encode_creates_length_prefix() {
-        let msg = Message::Ping(42);
+        let msg = Message::Resize(ResizePayload {
+            cols: 200,
+            rows: 50,
+        });
         let encoded = Codec::encode(&msg).unwrap();
 
         // First 4 bytes should be the length
@@ -229,9 +236,12 @@ mod tests {
 
     #[test]
     fn multiple_messages_in_buffer() {
-        let msg1 = Message::Ping(1);
-        let msg2 = Message::Pong(2);
-        let msg3 = Message::Ping(3);
+        let msg1 = Message::Resize(ResizePayload { cols: 80, rows: 24 });
+        let msg2 = Message::Shutdown(ShutdownPayload {
+            reason: ShutdownReason::UserRequested,
+            message: Some("bye".into()),
+        });
+        let msg3 = Message::StateAck(StateAckPayload { generation: 3 });
 
         let enc1 = Codec::encode(&msg1).unwrap();
         let enc2 = Codec::encode(&msg2).unwrap();
@@ -259,7 +269,7 @@ mod tests {
 
     #[test]
     fn decode_advances_buffer_only_on_success() {
-        let msg = Message::Ping(42);
+        let msg = Message::Resize(ResizePayload { cols: 20, rows: 10 });
         let encoded = Codec::encode(&msg).unwrap();
 
         let mut buf = BytesMut::from(&encoded[..]);

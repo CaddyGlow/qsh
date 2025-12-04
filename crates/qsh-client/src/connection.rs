@@ -537,33 +537,6 @@ impl ClientConnection {
         (self.cursor_col, self.cursor_row)
     }
 
-    /// Send a ping for latency measurement.
-    pub async fn ping(&mut self) -> Result<Duration> {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as u64;
-
-        self.control.send(&Message::Ping(timestamp)).await?;
-
-        // Wait for Pong
-        let pong_time = match self.control.recv().await? {
-            Message::Pong(ts) => ts,
-            other => {
-                return Err(Error::Protocol {
-                    message: format!("expected Pong, got {:?}", other),
-                });
-            }
-        };
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as u64;
-
-        Ok(Duration::from_micros(now - pong_time))
-    }
-
     /// Receive a message from the server control stream.
     pub async fn recv(&mut self) -> Result<Message> {
         self.control.recv().await
@@ -588,16 +561,6 @@ impl ClientConnection {
         self.control
             .send(&Message::Resize(ResizePayload { cols, rows }))
             .await
-    }
-
-    /// Send a keepalive ping (non-blocking) and return the timestamp used.
-    pub async fn send_ping(&mut self) -> Result<u64> {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as u64;
-        self.control.send(&Message::Ping(timestamp)).await?;
-        Ok(timestamp)
     }
 
     /// Close the connection gracefully.
@@ -700,7 +663,10 @@ impl ClientConnection {
             return Err(Error::AuthenticationFailed);
         }
 
-        info!(zero_rtt = hello_ack.zero_rtt_available, "Reconnect HelloAck received");
+        info!(
+            zero_rtt = hello_ack.zero_rtt_available,
+            "Reconnect HelloAck received"
+        );
 
         // Update zero-RTT availability
         self.config.zero_rtt_available = hello_ack.zero_rtt_available;
@@ -811,10 +777,7 @@ impl ClientConnection {
     ///
     /// `on_attempt` is invoked before each attempt with (attempt_number, delay_before_attempt).
     /// The callback is async to allow updating UI during reconnection.
-    pub async fn reconnect_with_backoff<F, Fut>(
-        &mut self,
-        mut on_attempt: F,
-    ) -> Result<()>
+    pub async fn reconnect_with_backoff<F, Fut>(&mut self, mut on_attempt: F) -> Result<()>
     where
         F: FnMut(u32, Duration) -> Fut,
         Fut: std::future::Future<Output = ()>,

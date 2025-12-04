@@ -19,10 +19,10 @@ use qsh_client::{
     EscapeResult, LocalForwarder, RawModeGuard, Socks5Proxy, SshConfig, StdinReader, StdoutWriter,
     bootstrap, get_terminal_size, parse_escape_key, restore_terminal,
 };
-use qsh_core::terminal::TerminalState;
 use qsh_core::constants::DEFAULT_QUIC_PORT_RANGE;
 use qsh_core::forward::ForwardSpec;
 use qsh_core::protocol::{Message, StateDiff, TermSize};
+use qsh_core::terminal::TerminalState;
 use qsh_core::transport::QuicConnection;
 
 fn main() {
@@ -244,26 +244,8 @@ async fn run_session(
     let mut overlay_refresh = tokio::time::interval(Duration::from_secs(2));
     overlay_refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-    // Fast stale detection interval (100ms) - like mosh's 250ms "Connecting..." threshold
-    // Checks if we haven't heard from the server in a while
-    let mut stale_check = tokio::time::interval(Duration::from_millis(100));
-    stale_check.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-    // Application-level keepalive pings (every 200ms, like mosh's RTT/2 approach)
-    // This ensures we get regular Pong responses to detect connection issues
-    let mut ping_interval = tokio::time::interval(Duration::from_millis(200));
-    ping_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
     // Initialize last_heard to now
     overlay.metrics_mut().record_heard();
-
-    // Track if overlay was auto-shown due to stale connection (to auto-hide on recovery)
-    let mut overlay_auto_shown = false;
-
-    // Hysteresis for stale detection - require stable connection for 1s before hiding overlay
-    // This prevents jitter when connection is flaky
-    let mut stable_since: Option<std::time::Instant> = Some(std::time::Instant::now());
-    const STABLE_THRESHOLD: Duration = Duration::from_secs(1);
 
     // Parse toggle key (default ctrl+shift+o, parsed as ctrl+o = 0x0f)
     let toggle_key = parse_toggle_key(&cli.overlay_key);
@@ -327,7 +309,6 @@ async fn run_session(
                             }
                             EscapeResult::Command(EscapeCommand::ToggleOverlay) => {
                                 overlay.toggle();
-                                overlay_auto_shown = false;
                                 if overlay.is_visible() {
                                     let term_size = get_term_size();
                                     let overlay_output = overlay.render(term_size.cols);
@@ -355,16 +336,14 @@ async fn run_session(
                         }
 
                         // Check for overlay toggle key
-                        if let Some(key) = toggle_key {
-                            if data.len() == 1 && data[0] == key {
-                                overlay.toggle();
-                                // User manually toggled, so don't auto-hide anymore
-                                overlay_auto_shown = false;
-                                // Re-render overlay after toggle
-                                if overlay.is_visible() {
-                                    let term_size = get_term_size();
-                                    let overlay_output = overlay.render(term_size.cols);
-                                    if !overlay_output.is_empty() {
+                                if let Some(key) = toggle_key {
+                                    if data.len() == 1 && data[0] == key {
+                                        overlay.toggle();
+                                        // Re-render overlay after toggle
+                                        if overlay.is_visible() {
+                                            let term_size = get_term_size();
+                                            let overlay_output = overlay.render(term_size.cols);
+                                            if !overlay_output.is_empty() {
                                         let _ = stdout.write(overlay_output.as_bytes()).await;
                                     }
                                 } else {
@@ -547,10 +526,6 @@ async fn run_session(
                             }
                         }
                     }
-                    Ok(Message::Pong(_)) => {
-                        overlay.metrics_mut().record_heard();
-                        debug!("Pong received");
-                    }
                     Ok(Message::Shutdown(shutdown)) => {
                         overlay.metrics_mut().record_heard();
                         info!(reason = ?shutdown.reason, msg = ?shutdown.message, "Server initiated shutdown");
@@ -589,64 +564,6 @@ async fn run_session(
                     overlay.metrics_mut().update_rtt(conn.rtt());
                     overlay.metrics_mut().update_packet_loss(conn.packet_loss());
                     render_overlay_if_visible(&overlay, &mut stdout).await;
-                }
-            }
-
-            // Application-level keepalive pings (like mosh's timestamp echo)
-            _ = ping_interval.tick() => {
-                if let Err(e) = conn.send_ping().await {
-                    debug!(error = %e, "Failed to send keepalive ping");
-                }
-            }
-
-            // Fast stale detection (like mosh's 250ms "Connecting..." threshold)
-            _ = stale_check.tick() => {
-                let (is_stale, time_since) = {
-                    let metrics = overlay.metrics_mut();
-                    (metrics.is_stale(), metrics.time_since_heard())
-                };
-                let current_status = overlay.status();
-
-                // Update hysteresis tracking
-                if is_stale {
-                    // Connection is stale, reset stable timer
-                    stable_since = None;
-                } else if stable_since.is_none() {
-                    // Connection just became stable, start timer
-                    stable_since = Some(std::time::Instant::now());
-                }
-
-                // Check if stable long enough (hysteresis to prevent jitter)
-                let is_stable_enough = stable_since
-                    .map(|t| t.elapsed() >= STABLE_THRESHOLD)
-                    .unwrap_or(false);
-
-                // Update status based on staleness
-                if is_stale && current_status == ConnectionStatus::Connected {
-                    // Connection appears stale - show waiting indicator immediately
-                    debug!(time_since_heard_ms = ?time_since.map(|d| d.as_millis()), "Connection stale, showing waiting status");
-                    overlay.set_status(ConnectionStatus::Waiting);
-                    // Force overlay visible when connection is stale
-                    if !overlay.is_visible() {
-                        overlay.set_visible(true);
-                        overlay_auto_shown = true;
-                    }
-                    render_overlay_if_visible(&overlay, &mut stdout).await;
-                } else if is_stale && current_status == ConnectionStatus::Waiting {
-                    // Still stale - refresh overlay to update elapsed time display
-                    render_overlay_if_visible(&overlay, &mut stdout).await;
-                } else if is_stable_enough && current_status == ConnectionStatus::Waiting {
-                    // Connection has been stable for STABLE_THRESHOLD - back to connected
-                    debug!("Connection stable for {:?}, hiding waiting status", STABLE_THRESHOLD);
-                    overlay.set_status(ConnectionStatus::Connected);
-                    // Auto-hide overlay if we auto-showed it
-                    if overlay_auto_shown {
-                        overlay.set_visible(false);
-                        overlay_auto_shown = false;
-                        clear_overlay(&mut stdout, overlay.position()).await;
-                    } else {
-                        render_overlay_if_visible(&overlay, &mut stdout).await;
-                    }
                 }
             }
 
@@ -722,7 +639,11 @@ async fn attempt_reconnect(
         let attempt = conn.reconnect_attempt();
 
         // Update overlay with attempt info
-        overlay.set_message(Some(format!("attempt {} (waiting {}ms)...", attempt, delay.as_millis())));
+        overlay.set_message(Some(format!(
+            "attempt {} (waiting {}ms)...",
+            attempt,
+            delay.as_millis()
+        )));
         render_overlay_if_visible(overlay, stdout).await;
 
         info!(
