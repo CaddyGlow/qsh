@@ -11,8 +11,8 @@ use std::path::PathBuf;
 
 use qsh_core::auth::{
     build_client_sign_data, default_client_key_paths, default_known_hosts_paths, key_fingerprint,
-    load_private_key, prompt_passphrase, sign_client, verify_server, Agent, HostStatus, KnownHosts,
-    LocalSigner, Signer,
+    load_private_key, prompt_passphrase, sign_client, verify_server, Agent, HostStatus,
+    KnownHosts, LocalSigner, Signer,
 };
 use qsh_core::constants::MAX_PASSPHRASE_ATTEMPTS;
 use qsh_core::protocol::{AuthChallengePayload, AuthResponsePayload, Codec, Message};
@@ -325,18 +325,16 @@ fn load_file_signer(key_path: &Option<PathBuf>) -> Result<Option<Box<dyn Signer>
 
         debug!(path = %path.display(), "trying to load private key");
 
-        let prompt = || {
-            prompt_passphrase(&format!("Enter passphrase for {}: ", path.display()))
-        };
+        let prompt = || prompt_passphrase(&format!("Enter passphrase for {}: ", path.display()));
 
         match load_private_key(&path, prompt, MAX_PASSPHRASE_ATTEMPTS) {
-            Ok(key) => {
+            Ok(private_key) => {
                 info!(
                     path = %path.display(),
-                    fingerprint = %key_fingerprint(&key.public_key().clone()),
+                    fingerprint = %key_fingerprint(private_key.public_key()),
                     "loaded private key"
                 );
-                return Ok(Some(Box::new(LocalSigner::new(key))));
+                return Ok(Some(Box::new(LocalSigner::new(private_key))));
             }
             Err(e) => {
                 debug!(path = %path.display(), error = %e, "failed to load key");

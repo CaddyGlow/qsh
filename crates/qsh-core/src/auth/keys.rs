@@ -152,7 +152,9 @@ where
         match PrivateKey::from_openssh(content.as_bytes())
             .and_then(|k| k.decrypt(passphrase.as_bytes()))
         {
-            Ok(key) => return Ok(key),
+            Ok(key) => {
+                return Ok(key);
+            }
             Err(ssh_key::Error::Crypto) => {
                 if attempt < max_attempts {
                     debug!(attempt, "incorrect passphrase, retrying");
@@ -366,24 +368,8 @@ pub fn key_fingerprint(key: &PublicKey) -> String {
 /// Returns `Some(true)` if key is authorized, `Some(false)` if key is revoked,
 /// `None` if key is not found.
 pub fn check_authorized(key: &PublicKey, authorized: &[AuthorizedKeyEntry]) -> Option<bool> {
-    let client_fp = key_fingerprint(key);
-    debug!(
-        fingerprint = %client_fp,
-        authorized_count = authorized.len(),
-        "checking client key against authorized keys"
-    );
-
-    for (i, entry) in authorized.iter().enumerate() {
-        let entry_fp = key_fingerprint(&entry.key);
-        let matches = entry.key.key_data() == key.key_data();
-        debug!(
-            index = i,
-            entry_fingerprint = %entry_fp,
-            client_fingerprint = %client_fp,
-            matches = matches,
-            "comparing keys"
-        );
-        if matches {
+    for entry in authorized {
+        if entry.key.key_data() == key.key_data() {
             return Some(!entry.revoked);
         }
     }

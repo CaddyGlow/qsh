@@ -56,6 +56,7 @@ ring = "0.17"
 # SSH keys (for standalone auth feature)
 ssh-key = { version = "0.6", features = ["ed25519", "rsa", "p256", "std", "encryption", "crypto"] }
 rpassword = "7"
+ssh-agent-client-rs = "1.1.2"
 
 # IP networking
 ipnet = { version = "2.9", features = ["serde"] }

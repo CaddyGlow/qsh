@@ -19,7 +19,7 @@ pub use challenge::{
     verify_client, verify_server,
 };
 pub use keys::{
-    check_authorized, load_authorized_keys, load_host_key, load_private_key, key_fingerprint,
+    check_authorized, key_fingerprint, load_authorized_keys, load_host_key, load_private_key,
     prompt_passphrase, AuthorizedKeyEntry, KeyType,
 };
 pub use known_hosts::{HostStatus, KnownHosts};
