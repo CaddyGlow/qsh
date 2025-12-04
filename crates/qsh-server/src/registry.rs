@@ -225,7 +225,8 @@ impl SessionEntry {
 
     /// Clone the current terminal state for handshake.
     pub async fn current_state(&self) -> TerminalState {
-        let mut state = self.parser.lock().await.state().clone();
+        let parser = self.parser.lock().await;
+        let mut state = parser.state().clone();
         state.generation = state.generation.max(1);
         state
     }

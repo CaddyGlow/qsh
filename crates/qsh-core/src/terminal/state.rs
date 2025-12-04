@@ -428,10 +428,6 @@ pub struct TerminalState {
     /// Pending clipboard content (OSC 52). Tuple of (selection, base64-encoded data).
     /// Selection is typically "c" (clipboard) or "p" (primary).
     pub clipboard: Option<(String, String)>,
-    /// Pending OSC sequences to forward verbatim (for unhandled OSC codes).
-    /// Each entry is the raw OSC content (without ESC ] prefix and ST/BEL terminator).
-    #[serde(default)]
-    pub pending_osc: Vec<String>,
     /// Current foreground color for new cells.
     pub current_fg: Color,
     /// Current background color for new cells.
@@ -453,7 +449,6 @@ impl TerminalState {
             title: None,
             cwd: None,
             clipboard: None,
-            pending_osc: Vec::new(),
             current_fg: Color::Default,
             current_bg: Color::Default,
             current_attrs: CellAttrs::default(),

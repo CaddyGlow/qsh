@@ -332,22 +332,31 @@ impl ServerSession {
             .await
     }
 
-    /// Send a state update to the client.
+    /// Send raw output and state update to the client.
     ///
-    /// Gets the current terminal state (already updated by the output task)
-    /// and sends an incremental state diff when possible.
+    /// Sends raw PTY output first (for immediate display and protocol passthrough),
+    /// then sends state update (for reconnection and prediction support).
     ///
     /// NOTE: The parser is shared with SessionEntry which processes PTY output
     /// via process_output(). We must NOT call parser.process() here or the
     /// output would be processed twice, corrupting the terminal state.
-    pub async fn send_state_update(&mut self, _data: Vec<u8>, input_seq: u64) -> Result<()> {
-        // Get current terminal state (already updated by output task)
+    pub async fn send_state_update(&mut self, data: Vec<u8>, input_seq: u64) -> Result<()> {
+        self.confirmed_input_seq = input_seq;
+
+        // Send raw output first - this handles all terminal protocols directly
+        let output = TerminalOutputPayload {
+            data,
+            confirmed_input_seq: self.confirmed_input_seq,
+        };
+        self.terminal_out
+            .send(&Message::TerminalOutput(output))
+            .await?;
+
+        // Then send state update for reconnection/prediction support
         let new_state = {
             let parser = self.parser.lock().await;
             parser.state().clone()
         };
-
-        self.confirmed_input_seq = input_seq;
 
         // Compute diff from last sent state (incremental when possible)
         let diff = if let Some(ref last_state) = self.last_sent_state {

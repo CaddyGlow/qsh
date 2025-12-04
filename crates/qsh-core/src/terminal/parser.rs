@@ -2,6 +2,10 @@
 //!
 //! This module wraps the `vte` crate to parse ANSI escape sequences
 //! and update terminal state accordingly.
+//!
+//! Note: Raw PTY output is sent directly to the client via TerminalOutput,
+//! so this parser only needs to track state for reconnection/prediction.
+//! APC, DCS, and other passthrough sequences are handled by raw output.
 
 use unicode_width::UnicodeWidthChar;
 use vte::{Params, Parser, Perform};
@@ -27,12 +31,13 @@ impl TerminalParser {
 
     /// Process raw bytes from PTY output.
     pub fn process(&mut self, data: &[u8]) {
+        // Use a temporary performer that borrows our state
+        let mut performer = Performer {
+            state: &mut self.state,
+            saved_cursor: &mut self.saved_cursor,
+        };
+
         for &byte in data {
-            // Use a temporary performer that borrows our state
-            let mut performer = Performer {
-                state: &mut self.state,
-                saved_cursor: &mut self.saved_cursor,
-            };
             self.parser.advance(&mut performer, byte);
         }
         self.state.generation += 1;
@@ -246,11 +251,17 @@ impl Perform for Performer<'_> {
                     .screen_mut()
                     .scroll_down_region(n, region.top, region.bottom);
             }
+            // All other CSI sequences are ignored for state tracking.
+            // Raw output is sent directly via TerminalOutput, so no passthrough needed.
             _ => {}
         }
     }
 
-    fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        // Raw PTY output is sent directly to the client via TerminalOutput,
+        // so we only extract state we need to track (title, cwd, clipboard).
+        // All other OSC sequences pass through via raw output.
+
         if params.is_empty() {
             return;
         }
@@ -261,7 +272,7 @@ impl Perform for Performer<'_> {
         };
 
         // Try to parse as numeric command
-        let handled = if let Ok(cmd) = cmd_str.parse::<u8>() {
+        if let Ok(cmd) = cmd_str.parse::<u8>() {
             match cmd {
                 // OSC 0/1/2: Set window title
                 0..=2 => {
@@ -270,7 +281,6 @@ impl Perform for Performer<'_> {
                     {
                         self.state.title = Some(title.to_string());
                     }
-                    true
                 }
                 // OSC 7: Set current working directory
                 // Format: OSC 7 ; file://hostname/path ST
@@ -280,7 +290,6 @@ impl Perform for Performer<'_> {
                     {
                         self.state.cwd = Some(uri.to_string());
                     }
-                    true
                 }
                 // OSC 52: Clipboard manipulation
                 // Format: OSC 52 ; selection ; base64-data ST
@@ -292,36 +301,16 @@ impl Perform for Performer<'_> {
                     {
                         self.state.clipboard = Some((selection.to_string(), data.to_string()));
                     }
-                    true
                 }
-                _ => false,
-            }
-        } else {
-            false
-        };
-
-        // Forward unhandled OSC sequences verbatim
-        if !handled {
-            // Reconstruct the OSC content: join params with semicolons
-            let content: String = params
-                .iter()
-                .filter_map(|p| std::str::from_utf8(p).ok())
-                .collect::<Vec<_>>()
-                .join(";");
-
-            if !content.is_empty() {
-                // Store with terminator info (BEL vs ST)
-                let terminator = if bell_terminated { "\x07" } else { "\x1b\\" };
-                self.state
-                    .pending_osc
-                    .push(format!("\x1b]{}{}", content, terminator));
+                // All other OSC codes pass through via raw TerminalOutput
+                _ => {}
             }
         }
     }
 
-    fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
-    fn put(&mut self, _byte: u8) {}
-    fn unhook(&mut self) {}
+    // DCS sequences (hook/put/unhook) pass through via raw TerminalOutput.
+    // We don't need to capture them for state tracking.
+
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {}
 }
 
@@ -717,30 +706,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn forward_unhandled_osc() {
-        let mut parser = TerminalParser::new(80, 24);
-        // OSC 8 is hyperlinks - not explicitly handled, should be forwarded
-        parser.process(b"\x1b]8;id=foo;https://example.com\x07");
-
-        assert_eq!(parser.state().pending_osc.len(), 1);
-        assert_eq!(
-            parser.state().pending_osc[0],
-            "\x1b]8;id=foo;https://example.com\x07"
-        );
-    }
+    // OSC passthrough tests removed - raw output is now sent directly
+    // via TerminalOutput, so the parser doesn't need to capture OSC sequences.
+    // The parser only extracts state-relevant data (title, cwd, clipboard).
 
     #[test]
-    fn forward_osc_with_st_terminator() {
+    fn osc_does_not_print_to_screen() {
         let mut parser = TerminalParser::new(80, 24);
-        // OSC 8 with ST terminator (ESC \)
-        parser.process(b"\x1b]8;;https://example.com\x1b\\");
-
-        assert_eq!(parser.state().pending_osc.len(), 1);
-        assert_eq!(
-            parser.state().pending_osc[0],
-            "\x1b]8;;https://example.com\x1b\\"
-        );
+        // OSC sequences should not print characters to screen
+        parser.process(b"\x1b]11;rgb:3030/3434/4646\x07");
+        assert_eq!(parser.state().screen().get(0, 0).unwrap().ch, ' ');
     }
 
     #[test]
@@ -917,4 +892,7 @@ mod tests {
         // Lines below region unchanged
         assert_eq!(state.screen().get(0, 7).unwrap().ch, 'H');
     }
+
+    // Note: APC, DCS, CSI passthrough tests removed - raw output is now sent
+    // directly via TerminalOutput, so the parser doesn't need to capture them.
 }

@@ -376,7 +376,7 @@ async fn run_session(
                                             conn.advance_cursor();
                                         }
                                     }
-                                    // Re-render with predictions composited (mosh-style)
+                                    // Re-render with predictions composited (mosh-style local echo)
                                     if made_predictions {
                                         let rendered = renderer.render(&local_state, &pred_overlay);
                                         if !rendered.is_empty() {
@@ -469,25 +469,22 @@ async fn run_session(
                             }
                         }
 
-                        // Apply diff to local terminal state
-                        // Enable state rendering on first StateUpdate from server
+                        // Apply diff to local terminal state for tracking only
+                        // (raw output is already sent via TerminalOutput, so don't render here)
                         if state_rendering_available && !use_state_rendering {
                             use_state_rendering = true;
-                            debug!("State-based rendering enabled");
+                            debug!("State tracking enabled");
                         }
 
                         if use_state_rendering {
                             match local_state.apply_diff(&update.diff) {
                                 Ok(new_state) => {
                                     local_state = new_state;
-                                    // Render with predictions composited
-                                    let rendered = renderer.render(&local_state, &pred_overlay);
-                                    if !rendered.is_empty() {
-                                        let _ = stdout.write(rendered.as_bytes()).await;
-                                    }
+                                    // Don't render - raw output already displayed via TerminalOutput
+                                    // State is tracked for reconnection and prediction only
                                 }
                                 Err(e) => {
-                                    debug!(error = %e, "Failed to apply diff, falling back to raw mode");
+                                    debug!(error = %e, "Failed to apply diff");
                                     use_state_rendering = false;
                                     renderer.invalidate();
                                 }

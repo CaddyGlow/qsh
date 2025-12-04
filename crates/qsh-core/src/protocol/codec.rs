@@ -135,8 +135,7 @@ mod tests {
 
     #[test]
     fn encode_decode_roundtrip_hello_ack_with_initial_state() {
-        let mut state = TerminalState::new(80, 24);
-        state.pending_osc.clear(); // Explicit for clarity
+        let state = TerminalState::new(80, 24);
 
         let msg = Message::HelloAck(HelloAckPayload {
             protocol_version: 1,

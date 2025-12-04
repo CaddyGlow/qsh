@@ -175,13 +175,11 @@ impl StateRenderer {
             self.last_clipboard = new_state.clipboard.clone();
         }
 
-        // Emit any pending OSC sequences verbatim (already includes ESC ] and terminator)
-        for osc in &new_state.pending_osc {
-            output.push_str(osc);
-        }
-
         output
     }
+
+    // Note: Passthrough sequences (OSC, APC, DCS, CSI) are now sent directly
+    // via TerminalOutput raw bytes, not through state rendering.
 
     /// Render a single row, only outputting changed cells.
     fn put_row(
@@ -532,22 +530,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn renders_pending_osc_verbatim() {
-        let mut renderer = StateRenderer::new();
-        let overlay = PredictionOverlay::new();
-
-        // State with pending OSC (e.g., hyperlink)
-        let mut state = TerminalState::new(80, 24);
-        state
-            .pending_osc
-            .push("\x1b]8;;https://example.com\x07".to_string());
-        let output = renderer.render(&state, &overlay);
-
-        assert!(
-            output.contains("\x1b]8;;https://example.com\x07"),
-            "should emit pending OSC verbatim: {:?}",
-            output
-        );
-    }
+    // Note: OSC/APC/DCS passthrough tests removed - raw output is now sent
+    // directly via TerminalOutput, not through state rendering.
 }
