@@ -72,6 +72,20 @@ pub enum Message {
     /// Authentication failure (sent by server).
     #[cfg(feature = "standalone")]
     AuthFailure(AuthFailurePayload),
+
+    // File transfer messages
+    /// Request to start a file transfer.
+    FileRequest(FileRequestPayload),
+    /// File metadata response (size, mtime, block checksums for delta).
+    FileMetadata(FileMetadataPayload),
+    /// File data block.
+    FileData(FileDataPayload),
+    /// Acknowledge received data.
+    FileAck(FileAckPayload),
+    /// Transfer complete notification.
+    FileComplete(FileCompletePayload),
+    /// File transfer error.
+    FileError(FileErrorPayload),
 }
 
 // =============================================================================
@@ -671,6 +685,204 @@ impl std::fmt::Display for AuthErrorCode {
             AuthErrorCode::Timeout => write!(f, "timeout"),
             AuthErrorCode::ProtocolError => write!(f, "protocol error"),
             AuthErrorCode::InternalError => write!(f, "internal error"),
+        }
+    }
+}
+
+// =============================================================================
+// File Transfer Messages
+// =============================================================================
+
+/// Direction of a file transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransferDirection {
+    /// Client uploads to server.
+    Upload,
+    /// Client downloads from server.
+    Download,
+}
+
+/// Transfer options.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TransferOptions {
+    /// Enable compression.
+    pub compress: bool,
+    /// Enable delta sync (only send changed blocks).
+    pub delta: bool,
+    /// Recursive directory transfer.
+    pub recursive: bool,
+    /// Preserve file mode/permissions.
+    pub preserve_mode: bool,
+    /// Maximum parallel file operations (directories).
+    #[serde(default = "default_parallel_files")]
+    pub parallel: usize,
+}
+
+const fn default_parallel_files() -> usize {
+    1
+}
+
+impl Default for TransferOptions {
+    fn default() -> Self {
+        Self {
+            compress: false,
+            delta: false,
+            recursive: false,
+            preserve_mode: false,
+            parallel: default_parallel_files(),
+        }
+    }
+}
+
+/// Chunk specification for parallel transfers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChunkSpec {
+    /// Chunk identifier within the transfer.
+    pub chunk_id: u32,
+    /// Starting byte offset.
+    pub offset: u64,
+    /// Length of this chunk in bytes.
+    pub length: u64,
+}
+
+/// File transfer request payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileRequestPayload {
+    /// Unique identifier for this transfer.
+    pub transfer_id: u64,
+    /// Remote file path.
+    pub path: String,
+    /// Transfer direction.
+    pub direction: TransferDirection,
+    /// Resume from byte offset (if resuming).
+    pub resume_from: Option<u64>,
+    /// Transfer options.
+    pub options: TransferOptions,
+    /// Chunk specification for parallel transfer (None = whole file).
+    pub chunk: Option<ChunkSpec>,
+    /// Client-side block checksums for delta downloads (empty if unused).
+    #[serde(default)]
+    pub client_blocks: Vec<BlockChecksum>,
+}
+
+/// Block checksum for delta sync.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlockChecksum {
+    /// Byte offset of this block.
+    pub offset: u64,
+    /// Weak rolling checksum (Adler-32).
+    pub weak: u32,
+    /// Strong checksum (xxHash64).
+    pub strong: u64,
+}
+
+/// File metadata payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileMetadataPayload {
+    /// Transfer ID this metadata belongs to.
+    pub transfer_id: u64,
+    /// File size in bytes.
+    pub size: u64,
+    /// Modification time (Unix timestamp).
+    pub mtime: u64,
+    /// File mode/permissions.
+    pub mode: u32,
+    /// Block checksums for delta sync (empty if delta disabled).
+    pub blocks: Vec<BlockChecksum>,
+    /// Whether this is a directory.
+    pub is_dir: bool,
+}
+
+/// Data flags for file data blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DataFlags {
+    /// Data is compressed.
+    pub compressed: bool,
+    /// This is the final block.
+    pub final_block: bool,
+    /// This is a block reference (delta transfer).
+    pub block_ref: bool,
+}
+
+/// File data payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileDataPayload {
+    /// Transfer ID this data belongs to.
+    pub transfer_id: u64,
+    /// Byte offset in the file.
+    pub offset: u64,
+    /// Data bytes (or block index if block_ref flag set).
+    pub data: Vec<u8>,
+    /// Data flags.
+    pub flags: DataFlags,
+}
+
+/// File acknowledgment payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileAckPayload {
+    /// Transfer ID.
+    pub transfer_id: u64,
+    /// Bytes received so far.
+    pub bytes_received: u64,
+}
+
+/// File transfer complete payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileCompletePayload {
+    /// Transfer ID.
+    pub transfer_id: u64,
+    /// Final file checksum (xxHash64).
+    pub checksum: u64,
+    /// Total bytes transferred.
+    pub total_bytes: u64,
+}
+
+/// File transfer error payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileErrorPayload {
+    /// Transfer ID.
+    pub transfer_id: u64,
+    /// Error code.
+    pub code: FileErrorCode,
+    /// Human-readable error message.
+    pub message: String,
+}
+
+/// File transfer error codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileErrorCode {
+    /// File not found.
+    NotFound,
+    /// Permission denied.
+    PermissionDenied,
+    /// I/O error.
+    IoError,
+    /// Checksum mismatch.
+    ChecksumMismatch,
+    /// Transfer was cancelled.
+    Cancelled,
+    /// Disk full.
+    DiskFull,
+    /// Path is a directory (expected file).
+    IsDirectory,
+    /// Path is a file (expected directory).
+    IsFile,
+    /// Invalid path.
+    InvalidPath,
+}
+
+impl std::fmt::Display for FileErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FileErrorCode::NotFound => write!(f, "file not found"),
+            FileErrorCode::PermissionDenied => write!(f, "permission denied"),
+            FileErrorCode::IoError => write!(f, "I/O error"),
+            FileErrorCode::ChecksumMismatch => write!(f, "checksum mismatch"),
+            FileErrorCode::Cancelled => write!(f, "transfer cancelled"),
+            FileErrorCode::DiskFull => write!(f, "disk full"),
+            FileErrorCode::IsDirectory => write!(f, "path is a directory"),
+            FileErrorCode::IsFile => write!(f, "path is a file"),
+            FileErrorCode::InvalidPath => write!(f, "invalid path"),
         }
     }
 }

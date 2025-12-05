@@ -290,9 +290,9 @@ impl Connection for QuicConnection {
                 })?;
                 Ok(QuicStream::from_send(send))
             }
-            StreamType::Forward(_) => {
+            StreamType::Forward(_) | StreamType::FileTransfer(_) => {
                 let (send, recv) = self.inner.open_bi().await.map_err(|e| Error::Transport {
-                    message: format!("failed to open forward stream: {}", e),
+                    message: format!("failed to open bidirectional stream: {}", e),
                 })?;
                 Ok(QuicStream::new(send, recv))
             }

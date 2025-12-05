@@ -13,10 +13,15 @@ path = "src/lib.rs"
 name = "qsh"
 path = "src/main.rs"
 
+[[bin]]
+name = "qsh-cp"
+path = "src/bin/qsh-cp.rs"
+
 [features]
-default = []
+default = ["compression"]
 tunnel = ["qsh-core/tunnel"]
 standalone = ["qsh-core/standalone", "dep:ssh-key", "dep:rpassword"]
+compression = ["qsh-core/compression"]
 
 [dependencies]
 qsh-core = { workspace = true }

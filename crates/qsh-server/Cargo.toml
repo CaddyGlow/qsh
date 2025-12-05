@@ -14,9 +14,10 @@ name = "qsh-server"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["compression"]
 tunnel = ["qsh-core/tunnel"]
 standalone = ["qsh-core/standalone", "dep:ssh-key"]
+compression = ["qsh-core/compression"]
 
 [dependencies]
 qsh-core = { workspace = true }

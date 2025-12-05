@@ -6,6 +6,7 @@
 //! - Transport abstractions
 //! - Session management types
 //! - Port forwarding types
+//! - File transfer support
 //! - Logging and metrics
 //! - Tunnel types (feature-gated)
 //! - SSH key authentication for standalone mode (feature-gated)
@@ -13,6 +14,7 @@
 pub mod bootstrap;
 pub mod constants;
 pub mod error;
+pub mod file;
 pub mod forward;
 pub mod logging;
 pub mod metrics;

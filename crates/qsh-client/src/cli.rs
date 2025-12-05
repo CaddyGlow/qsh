@@ -358,6 +358,187 @@ fn parse_port_range(s: &str) -> Result<(u16, u16), String> {
 }
 
 // =============================================================================
+// File Transfer CLI (qsh-cp)
+// =============================================================================
+
+/// File transfer command (qsh cp).
+#[derive(Debug, Parser)]
+#[command(
+    name = "qsh-cp",
+    version,
+    about = "Copy files to/from remote hosts via qsh"
+)]
+pub struct CpCli {
+    /// Source path ([user@]host:path or local path)
+    #[arg(required = true)]
+    pub source: String,
+
+    /// Destination path ([user@]host:path or local path)
+    #[arg(required = true)]
+    pub dest: String,
+
+    /// Recursive copy (directories)
+    #[arg(short = 'r', long)]
+    pub recursive: bool,
+
+    /// Disable delta sync (always transfer full files)
+    #[arg(long = "no-delta")]
+    pub no_delta: bool,
+
+    /// Disable compression
+    #[arg(long = "no-compress")]
+    pub no_compress: bool,
+
+    /// Resume interrupted transfer
+    #[arg(long = "resume")]
+    pub resume: bool,
+
+    /// Number of parallel transfers
+    #[arg(short = 'j', long = "parallel", default_value = "4")]
+    pub parallel: usize,
+
+    /// Preserve file permissions
+    #[arg(short = 'p', long = "preserve")]
+    pub preserve: bool,
+
+    /// SSH port
+    #[arg(short = 'P', long = "port", default_value = "22")]
+    pub port: u16,
+
+    /// Increase verbosity
+    #[arg(short = 'v', long = "verbose", action = ArgAction::Count)]
+    pub verbose: u8,
+
+    /// Log to file
+    #[arg(long = "log-file", value_name = "PATH")]
+    pub log_file: Option<PathBuf>,
+
+    /// Identity file
+    #[arg(short = 'i', long = "identity", action = ArgAction::Append)]
+    pub identity: Vec<PathBuf>,
+
+    // Direct mode options
+    #[cfg(feature = "standalone")]
+    #[arg(long = "direct")]
+    pub direct: bool,
+
+    #[cfg(feature = "standalone")]
+    #[arg(long = "server", value_name = "HOST:PORT")]
+    pub server: Option<String>,
+
+    #[cfg(feature = "standalone")]
+    #[arg(long = "key", value_name = "PATH")]
+    pub key: Option<PathBuf>,
+
+    #[cfg(feature = "standalone")]
+    #[arg(long = "known-hosts", value_name = "PATH")]
+    pub known_hosts: Option<PathBuf>,
+
+    #[cfg(feature = "standalone")]
+    #[arg(long = "accept-unknown-host")]
+    pub accept_unknown_host: bool,
+
+    #[cfg(feature = "standalone")]
+    #[arg(long = "no-agent")]
+    pub no_agent: bool,
+}
+
+/// Parsed file path (local or remote).
+#[derive(Debug, Clone)]
+pub enum FilePath {
+    /// Local file path.
+    Local(PathBuf),
+    /// Remote file path: (user, host, path).
+    Remote {
+        user: Option<String>,
+        host: String,
+        path: String,
+    },
+}
+
+impl CpCli {
+    /// Parse a source/dest string into a FilePath.
+    pub fn parse_path(s: &str) -> FilePath {
+        // Check for remote path: [user@]host:path
+        // Be careful: Windows paths like C:\foo are not remote
+        if let Some(colon_pos) = s.find(':') {
+            let before_colon = &s[..colon_pos];
+
+            // Check if this looks like a remote spec (contains @ or no path separator before :)
+            let is_remote = before_colon.contains('@')
+                || (!before_colon.contains('/') && !before_colon.contains('\\'));
+
+            if is_remote && colon_pos + 1 < s.len() {
+                let host_part = before_colon;
+                let path = s[colon_pos + 1..].to_string();
+
+                if let Some(at_pos) = host_part.find('@') {
+                    let user = host_part[..at_pos].to_string();
+                    let host = host_part[at_pos + 1..].to_string();
+                    return FilePath::Remote {
+                        user: Some(user),
+                        host,
+                        path,
+                    };
+                } else {
+                    return FilePath::Remote {
+                        user: None,
+                        host: host_part.to_string(),
+                        path,
+                    };
+                }
+            }
+        }
+
+        FilePath::Local(PathBuf::from(s))
+    }
+
+    /// Get parsed source path.
+    pub fn source_path(&self) -> FilePath {
+        Self::parse_path(&self.source)
+    }
+
+    /// Get parsed destination path.
+    pub fn dest_path(&self) -> FilePath {
+        Self::parse_path(&self.dest)
+    }
+
+    /// Check if this is an upload (local -> remote).
+    pub fn is_upload(&self) -> bool {
+        matches!(self.source_path(), FilePath::Local(_))
+            && matches!(self.dest_path(), FilePath::Remote { .. })
+    }
+
+    /// Check if this is a download (remote -> local).
+    pub fn is_download(&self) -> bool {
+        matches!(self.source_path(), FilePath::Remote { .. })
+            && matches!(self.dest_path(), FilePath::Local(_))
+    }
+
+    /// Get the remote host for this transfer (host, user).
+    pub fn remote_host(&self) -> Option<(String, Option<String>)> {
+        match self.source_path() {
+            FilePath::Remote { host, user, .. } => Some((host, user)),
+            FilePath::Local(_) => match self.dest_path() {
+                FilePath::Remote { host, user, .. } => Some((host, user)),
+                FilePath::Local(_) => None,
+            },
+        }
+    }
+
+    /// Build TransferOptions from CLI args.
+    pub fn transfer_options(&self) -> qsh_core::protocol::TransferOptions {
+        qsh_core::protocol::TransferOptions {
+            compress: !self.no_compress,
+            delta: !self.no_delta,
+            recursive: self.recursive,
+            preserve_mode: self.preserve,
+            parallel: self.parallel.max(1),
+        }
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -634,6 +815,193 @@ mod tests {
             assert!(cli.route.is_empty());
             assert_eq!(cli.tun_mtu, 1280);
         }
+        #[cfg(feature = "standalone")]
+        {
+            assert!(!cli.direct);
+            assert!(cli.server.is_none());
+            assert!(cli.key.is_none());
+            assert!(cli.known_hosts.is_none());
+            assert!(!cli.accept_unknown_host);
+            assert!(!cli.no_agent);
+        }
+    }
+
+    // =========================================================================
+    // CpCli Tests
+    // =========================================================================
+
+    #[test]
+    fn verify_cp_cli() {
+        CpCli::command().debug_assert();
+    }
+
+    #[test]
+    fn cp_parse_local_path() {
+        let path = CpCli::parse_path("/home/user/file.txt");
+        assert!(matches!(path, FilePath::Local(p) if p.to_str() == Some("/home/user/file.txt")));
+    }
+
+    #[test]
+    fn cp_parse_remote_path_with_user() {
+        let path = CpCli::parse_path("user@host:/path/to/file");
+        match path {
+            FilePath::Remote { user, host, path } => {
+                assert_eq!(user, Some("user".to_string()));
+                assert_eq!(host, "host");
+                assert_eq!(path, "/path/to/file");
+            }
+            _ => panic!("expected remote path"),
+        }
+    }
+
+    #[test]
+    fn cp_parse_remote_path_no_user() {
+        let path = CpCli::parse_path("host:/path/to/file");
+        match path {
+            FilePath::Remote { user, host, path } => {
+                assert!(user.is_none());
+                assert_eq!(host, "host");
+                assert_eq!(path, "/path/to/file");
+            }
+            _ => panic!("expected remote path"),
+        }
+    }
+
+    #[test]
+    fn cp_parse_relative_path() {
+        let path = CpCli::parse_path("./relative/path");
+        assert!(matches!(path, FilePath::Local(p) if p.to_str() == Some("./relative/path")));
+    }
+
+    #[test]
+    fn cp_is_upload() {
+        let cli =
+            CpCli::try_parse_from(["qsh-cp", "/local/file.txt", "user@host:/remote/file.txt"])
+                .unwrap();
+        assert!(cli.is_upload());
+        assert!(!cli.is_download());
+    }
+
+    #[test]
+    fn cp_is_download() {
+        let cli =
+            CpCli::try_parse_from(["qsh-cp", "user@host:/remote/file.txt", "/local/file.txt"])
+                .unwrap();
+        assert!(cli.is_download());
+        assert!(!cli.is_upload());
+    }
+
+    #[test]
+    fn cp_remote_host_upload() {
+        let cli = CpCli::try_parse_from([
+            "qsh-cp",
+            "/local/file.txt",
+            "admin@server.example.com:/remote/path",
+        ])
+        .unwrap();
+        let (host, user) = cli.remote_host().unwrap();
+        assert_eq!(host, "server.example.com");
+        assert_eq!(user, Some("admin".to_string()));
+    }
+
+    #[test]
+    fn cp_remote_host_download() {
+        let cli =
+            CpCli::try_parse_from(["qsh-cp", "server.example.com:/remote/path", "/local/path"])
+                .unwrap();
+        let (host, user) = cli.remote_host().unwrap();
+        assert_eq!(host, "server.example.com");
+        assert!(user.is_none());
+    }
+
+    #[test]
+    fn cp_transfer_options_defaults() {
+        let cli = CpCli::try_parse_from(["qsh-cp", "/local/file", "host:/remote/file"]).unwrap();
+        let opts = cli.transfer_options();
+        assert!(opts.compress);
+        assert!(opts.delta);
+        assert!(!opts.recursive);
+        assert!(!opts.preserve_mode);
+        assert_eq!(opts.parallel, 4);
+    }
+
+    #[test]
+    fn cp_transfer_options_custom() {
+        let cli = CpCli::try_parse_from([
+            "qsh-cp",
+            "-r",
+            "-p",
+            "--no-delta",
+            "--no-compress",
+            "/local/dir",
+            "host:/remote/dir",
+        ])
+        .unwrap();
+        let opts = cli.transfer_options();
+        assert!(!opts.compress);
+        assert!(!opts.delta);
+        assert!(opts.recursive);
+        assert!(opts.preserve_mode);
+        assert_eq!(opts.parallel, 4);
+    }
+
+    #[test]
+    fn cp_parallel_flag() {
+        let cli = CpCli::try_parse_from(["qsh-cp", "-j", "8", "/local/file", "host:/remote/file"])
+            .unwrap();
+        assert_eq!(cli.parallel, 8);
+    }
+
+    #[test]
+    fn cp_port_flag() {
+        let cli =
+            CpCli::try_parse_from(["qsh-cp", "-P", "2222", "/local/file", "host:/remote/file"])
+                .unwrap();
+        assert_eq!(cli.port, 2222);
+    }
+
+    #[test]
+    fn cp_verbose_flag() {
+        let cli =
+            CpCli::try_parse_from(["qsh-cp", "-vvv", "/local/file", "host:/remote/file"]).unwrap();
+        assert_eq!(cli.verbose, 3);
+    }
+
+    #[test]
+    fn cp_identity_files() {
+        let cli = CpCli::try_parse_from([
+            "qsh-cp",
+            "-i",
+            "~/.ssh/id_rsa",
+            "-i",
+            "~/.ssh/id_ed25519",
+            "/local/file",
+            "host:/remote/file",
+        ])
+        .unwrap();
+        assert_eq!(cli.identity.len(), 2);
+    }
+
+    #[test]
+    fn cp_resume_flag() {
+        let cli = CpCli::try_parse_from(["qsh-cp", "--resume", "/local/file", "host:/remote/file"])
+            .unwrap();
+        assert!(cli.resume);
+    }
+
+    #[test]
+    fn cp_defaults() {
+        let cli = CpCli::try_parse_from(["qsh-cp", "/local/file", "host:/remote/file"]).unwrap();
+        assert_eq!(cli.port, 22);
+        assert_eq!(cli.parallel, 4);
+        assert_eq!(cli.verbose, 0);
+        assert!(!cli.recursive);
+        assert!(!cli.no_delta);
+        assert!(!cli.no_compress);
+        assert!(!cli.resume);
+        assert!(!cli.preserve);
+        assert!(cli.identity.is_empty());
+        assert!(cli.log_file.is_none());
         #[cfg(feature = "standalone")]
         {
             assert!(!cli.direct);

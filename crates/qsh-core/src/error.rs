@@ -52,6 +52,10 @@ pub enum Error {
     /// PTY error.
     #[error("pty error: {message}")]
     Pty { message: String },
+
+    /// File transfer error.
+    #[error("file transfer error: {message}")]
+    FileTransfer { message: String },
 }
 
 /// Convenience result type for qsh operations.

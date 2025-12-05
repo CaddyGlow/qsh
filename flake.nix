@@ -98,6 +98,10 @@
           pkgsCross.aarch64-multiplatform-musl.stdenv.cc
           pkgsCross.armv7l-hf-multiplatform.stdenv.cc
 
+          # Static libraries for musl builds
+          pkgsCross.musl64.zstd.dev
+          pkgsCross.musl64.zstd.out
+
           # Windows cross-compilation
           pkgsCross.mingwW64.stdenv.cc
           pkgsCross.mingw32.stdenv.cc
@@ -150,9 +154,10 @@
           export CC_i686_linux_android="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/${ndkPrebuiltDir}/bin/i686-linux-android34-clang"
           export AR_i686_linux_android="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/${ndkPrebuiltDir}/bin/llvm-ar"
 
-          # Musl target linkers
+          # Musl target compiler/linkers for C deps (e.g. zstd-sys, ring)
           export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="${pkgs.pkgsCross.musl64.stdenv.cc}/bin/x86_64-unknown-linux-musl-gcc"
           export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="${pkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc}/bin/aarch64-unknown-linux-musl-gcc"
+          export CC_x86_64_unknown_linux_musl="${pkgs.pkgsCross.musl64.stdenv.cc}/bin/x86_64-unknown-linux-musl-gcc"
 
           # Windows target linkers
           export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-gcc"
@@ -233,6 +238,8 @@
               ++ pkgs.lib.optionals isLinux [
                 # Musl
                 pkgsCross.musl64.stdenv.cc
+                pkgsCross.musl64.zstd.dev
+                pkgsCross.musl64.zstd.out
                 # Windows
                 pkgsCross.mingwW64.stdenv.cc
               ];
@@ -243,6 +250,8 @@
               ${pkgs.lib.optionalString isLinux ''
               export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="${pkgs.pkgsCross.musl64.stdenv.cc}/bin/x86_64-unknown-linux-musl-gcc"
               export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-gcc"
+              # Musl C compiler for C deps (e.g. zstd-sys, ring)
+              export CC_x86_64_unknown_linux_musl="${pkgs.pkgsCross.musl64.stdenv.cc}/bin/x86_64-unknown-linux-musl-gcc"
               ''}
               echo "qsh minimal dev environment (no Android)"
             '';

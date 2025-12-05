@@ -13,7 +13,8 @@
       "Bash(cargo build:*)",
       "WebSearch",
       "WebFetch(domain:docs.rs)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(cargo tree:*)"
     ],
     "deny": [],
     "ask": []

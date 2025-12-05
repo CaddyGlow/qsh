@@ -19,8 +19,8 @@ pub use challenge::{
     verify_client, verify_server,
 };
 pub use keys::{
-    check_authorized, key_fingerprint, load_authorized_keys, load_host_key, load_private_key,
-    prompt_passphrase, AuthorizedKeyEntry, KeyType,
+    AuthorizedKeyEntry, KeyType, check_authorized, key_fingerprint, load_authorized_keys,
+    load_host_key, load_private_key, prompt_passphrase,
 };
 pub use known_hosts::{HostStatus, KnownHosts};
 

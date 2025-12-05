@@ -10,9 +10,9 @@
 use std::path::PathBuf;
 
 use qsh_core::auth::{
-    build_client_sign_data, default_client_key_paths, default_known_hosts_paths, key_fingerprint,
-    load_private_key, prompt_passphrase, sign_client, verify_server, Agent, HostStatus,
-    KnownHosts, LocalSigner, Signer,
+    Agent, HostStatus, KnownHosts, LocalSigner, Signer, build_client_sign_data,
+    default_client_key_paths, default_known_hosts_paths, key_fingerprint, load_private_key,
+    prompt_passphrase, sign_client, verify_server,
 };
 use qsh_core::constants::MAX_PASSPHRASE_ATTEMPTS;
 use qsh_core::protocol::{AuthChallengePayload, AuthResponsePayload, Codec, Message};
@@ -124,17 +124,18 @@ impl DirectAuthenticator {
     pub fn verify_server(&mut self, challenge: &AuthChallengePayload) -> Result<()> {
         // Parse server's public key
         let server_key =
-            PublicKey::from_openssh(&challenge.server_public_key).map_err(|e| {
-                Error::Protocol {
-                    message: format!("invalid server public key: {}", e),
-                }
+            PublicKey::from_openssh(&challenge.server_public_key).map_err(|e| Error::Protocol {
+                message: format!("invalid server public key: {}", e),
             })?;
 
         let fingerprint = key_fingerprint(&server_key);
         debug!(fingerprint = %fingerprint, "verifying server key");
 
         // Check known_hosts
-        match self.known_hosts.verify_host(&self.hostname, self.port, &server_key) {
+        match self
+            .known_hosts
+            .verify_host(&self.hostname, self.port, &server_key)
+        {
             HostStatus::Known => {
                 info!(fingerprint = %fingerprint, "server key verified");
             }
@@ -167,7 +168,10 @@ impl DirectAuthenticator {
                     });
                 }
             }
-            HostStatus::Changed { expected_fingerprint, actual_fingerprint } => {
+            HostStatus::Changed {
+                expected_fingerprint,
+                actual_fingerprint,
+            } => {
                 error!(
                     hostname = %self.hostname,
                     expected = %expected_fingerprint,
@@ -189,10 +193,7 @@ impl DirectAuthenticator {
                     "server key is revoked"
                 );
                 return Err(Error::Protocol {
-                    message: format!(
-                        "server key for {}:{} is revoked",
-                        self.hostname, self.port
-                    ),
+                    message: format!("server key for {}:{} is revoked", self.hostname, self.port),
                 });
             }
         }
@@ -269,9 +270,12 @@ impl DirectAuthenticator {
                     &challenge.server_nonce,
                     &client_nonce,
                 )?;
-                let pk_openssh = signer.public_key().to_openssh().map_err(|e| Error::Protocol {
-                    message: format!("failed to encode public key: {}", e),
-                })?;
+                let pk_openssh = signer
+                    .public_key()
+                    .to_openssh()
+                    .map_err(|e| Error::Protocol {
+                        message: format!("failed to encode public key: {}", e),
+                    })?;
                 (sig, pk_openssh)
             } else if let Some(e) = last_error {
                 return Err(e);
@@ -287,9 +291,12 @@ impl DirectAuthenticator {
                 &challenge.server_nonce,
                 &client_nonce,
             )?;
-            let pk_openssh = signer.public_key().to_openssh().map_err(|e| Error::Protocol {
-                message: format!("failed to encode public key: {}", e),
-            })?;
+            let pk_openssh = signer
+                .public_key()
+                .to_openssh()
+                .map_err(|e| Error::Protocol {
+                    message: format!("failed to encode public key: {}", e),
+                })?;
             (sig, pk_openssh)
         } else {
             return Err(Error::Protocol {
@@ -345,7 +352,6 @@ fn load_file_signer(key_path: &Option<PathBuf>) -> Result<Option<Box<dyn Signer>
     Ok(None)
 }
 
-
 /// Perform the authentication handshake with the server.
 pub async fn authenticate<S, R>(
     authenticator: &mut DirectAuthenticator,
@@ -361,7 +367,9 @@ where
 
     // Read AuthChallenge
     let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf).await.map_err(|e| Error::Io(e))?;
+    recv.read_exact(&mut len_buf)
+        .await
+        .map_err(|e| Error::Io(e))?;
     let len = u32::from_le_bytes(len_buf) as usize;
 
     if len > qsh_core::constants::MAX_MESSAGE_SIZE {

@@ -9,7 +9,7 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 
-use ssh_key::{private::PrivateKey, public::PublicKey, Algorithm, HashAlg};
+use ssh_key::{Algorithm, HashAlg, private::PrivateKey, public::PublicKey};
 use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
@@ -99,10 +99,7 @@ pub fn load_host_key(
     // If we have known_hosts keys, prefer a matching key
     if let Some(known_keys) = known_hosts_keys {
         for (private, public, _) in &candidates {
-            if known_keys
-                .iter()
-                .any(|k| k.key_data() == public.key_data())
-            {
+            if known_keys.iter().any(|k| k.key_data() == public.key_data()) {
                 debug!("selected host key matching known_hosts");
                 return Ok((private.clone(), public.clone()));
             }
@@ -129,7 +126,11 @@ fn load_private_key_file(path: &Path) -> Result<PrivateKey> {
 ///
 /// The `passphrase_prompt` function is called for each attempt when the key is encrypted.
 /// Fails after `max_attempts` failed passphrase attempts.
-pub fn load_private_key<F>(path: &Path, mut passphrase_prompt: F, max_attempts: u8) -> Result<PrivateKey>
+pub fn load_private_key<F>(
+    path: &Path,
+    mut passphrase_prompt: F,
+    max_attempts: u8,
+) -> Result<PrivateKey>
 where
     F: FnMut() -> Result<String>,
 {

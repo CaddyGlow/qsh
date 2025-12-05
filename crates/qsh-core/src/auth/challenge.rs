@@ -6,7 +6,7 @@
 //! - Client signs: AUTH_CTX || "client" || challenge || server_nonce || client_nonce
 //!   (No hostname - server verifies key against authorized_keys)
 
-use ssh_key::{private::PrivateKey, public::PublicKey, HashAlg, Signature};
+use ssh_key::{HashAlg, Signature, private::PrivateKey, public::PublicKey};
 use tracing::debug;
 
 use crate::constants::{AUTH_CHALLENGE_LEN, AUTH_CTX, AUTH_NONCE_LEN};
@@ -210,15 +210,17 @@ fn verify_signature(key: &PublicKey, signature_bytes: &[u8], data: &[u8]) -> Res
     let namespace = "qsh-auth";
 
     // Parse the raw signature bytes into a Signature
-    let signature = Signature::new(key.algorithm(), signature_bytes.to_vec())
-        .map_err(|e| Error::Protocol {
+    let signature =
+        Signature::new(key.algorithm(), signature_bytes.to_vec()).map_err(|e| Error::Protocol {
             message: format!("failed to create signature: {}", e),
         })?;
 
     // Create the SshSig for verification
-    let ssh_sig = SshSig::new(key.key_data().clone(), namespace, hash_alg, signature)
-        .map_err(|e| Error::Protocol {
-            message: format!("failed to create ssh signature: {}", e),
+    let ssh_sig =
+        SshSig::new(key.key_data().clone(), namespace, hash_alg, signature).map_err(|e| {
+            Error::Protocol {
+                message: format!("failed to create ssh signature: {}", e),
+            }
         })?;
 
     match key.verify(namespace, data, &ssh_sig) {

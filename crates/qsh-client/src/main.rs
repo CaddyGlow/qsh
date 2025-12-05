@@ -21,9 +21,9 @@ use qsh_client::{
 };
 
 #[cfg(feature = "standalone")]
-use qsh_client::{DirectAuthenticator, DirectConfig};
-#[cfg(feature = "standalone")]
 use qsh_client::standalone::authenticate as standalone_authenticate;
+#[cfg(feature = "standalone")]
+use qsh_client::{DirectAuthenticator, DirectConfig};
 
 use qsh_core::constants::DEFAULT_QUIC_PORT_RANGE;
 use qsh_core::forward::ForwardSpec;
@@ -155,12 +155,13 @@ async fn run_client_direct(cli: &Cli, host: &str, user: Option<&str>) -> qsh_cor
 
     // Perform standalone authentication on a dedicated server-initiated stream.
     // Server opens the stream and sends AuthChallenge; client accepts and responds.
-    let (mut send, mut recv) = quic_conn
-        .accept_bi()
-        .await
-        .map_err(|e| qsh_core::Error::Transport {
-            message: format!("failed to accept auth stream: {}", e),
-        })?;
+    let (mut send, mut recv) =
+        quic_conn
+            .accept_bi()
+            .await
+            .map_err(|e| qsh_core::Error::Transport {
+                message: format!("failed to accept auth stream: {}", e),
+            })?;
 
     standalone_authenticate(&mut authenticator, &mut send, &mut recv).await?;
     info!("Standalone authentication succeeded");

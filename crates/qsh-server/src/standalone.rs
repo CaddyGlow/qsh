@@ -10,10 +10,9 @@
 use std::path::PathBuf;
 
 use qsh_core::auth::{
-    AuthorizedKeyEntry, KnownHosts, LocalSigner, check_authorized,
-    default_authorized_keys_paths, default_host_key_paths, default_known_hosts_paths,
-    generate_challenge, generate_nonce, key_fingerprint, load_authorized_keys, load_host_key,
-    sign_server, verify_client,
+    AuthorizedKeyEntry, KnownHosts, LocalSigner, check_authorized, default_authorized_keys_paths,
+    default_host_key_paths, default_known_hosts_paths, generate_challenge, generate_nonce,
+    key_fingerprint, load_authorized_keys, load_host_key, sign_server, verify_client,
 };
 use qsh_core::constants::AUTH_HANDSHAKE_TIMEOUT;
 use qsh_core::protocol::{
@@ -64,8 +63,7 @@ impl StandaloneAuthenticator {
         let known_hosts = KnownHosts::load(&known_hosts_paths).ok();
         let known_keys = known_hosts.as_ref().map(|kh| kh.known_keys());
 
-        let (private_key, public_key) =
-            load_host_key(&host_key_paths, known_keys.as_deref())?;
+        let (private_key, public_key) = load_host_key(&host_key_paths, known_keys.as_deref())?;
 
         let public_key_openssh = public_key.to_openssh().map_err(|e| Error::Protocol {
             message: format!("failed to encode public key: {}", e),
@@ -84,10 +82,7 @@ impl StandaloneAuthenticator {
         };
 
         let authorized_keys = load_authorized_keys(&authorized_keys_paths)?;
-        info!(
-            count = authorized_keys.len(),
-            "loaded authorized keys"
-        );
+        info!(count = authorized_keys.len(), "loaded authorized keys");
 
         let signer = LocalSigner::new(private_key);
 
@@ -126,11 +121,10 @@ impl StandaloneAuthenticator {
         response: &AuthResponsePayload,
     ) -> Result<String> {
         // Parse client's public key
-        let client_key =
-            PublicKey::from_openssh(&response.client_public_key).map_err(|e| {
-                warn!(error = %e, "failed to parse client public key");
-                Error::AuthenticationFailed
-            })?;
+        let client_key = PublicKey::from_openssh(&response.client_public_key).map_err(|e| {
+            warn!(error = %e, "failed to parse client public key");
+            Error::AuthenticationFailed
+        })?;
 
         let fingerprint = key_fingerprint(&client_key);
 
@@ -239,12 +233,7 @@ where
     }
 
     // Wait for response with timeout
-    let response = match timeout(
-        AUTH_HANDSHAKE_TIMEOUT,
-        read_auth_response(recv),
-    )
-    .await
-    {
+    let response = match timeout(AUTH_HANDSHAKE_TIMEOUT, read_auth_response(recv)).await {
         Ok(Ok(resp)) => resp,
         Ok(Err(e)) => {
             return AuthResult::Failure {
@@ -284,7 +273,9 @@ where
 
     // Read length prefix
     let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf).await.map_err(|e| Error::Io(e))?;
+    recv.read_exact(&mut len_buf)
+        .await
+        .map_err(|e| Error::Io(e))?;
     let len = u32::from_le_bytes(len_buf) as usize;
 
     if len > qsh_core::constants::MAX_MESSAGE_SIZE {
@@ -310,17 +301,16 @@ where
     match msg {
         Message::AuthResponse(resp) => Ok(resp),
         _ => Err(Error::Protocol {
-            message: format!("expected AuthResponse, got {:?}", std::mem::discriminant(&msg)),
+            message: format!(
+                "expected AuthResponse, got {:?}",
+                std::mem::discriminant(&msg)
+            ),
         }),
     }
 }
 
 /// Send an AuthFailure message.
-pub async fn send_auth_failure<S>(
-    send: &mut S,
-    code: AuthErrorCode,
-    _message: &str,
-) -> Result<()>
+pub async fn send_auth_failure<S>(send: &mut S, code: AuthErrorCode, _message: &str) -> Result<()>
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
@@ -346,9 +336,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qsh_client::standalone::{DirectAuthenticator, DirectConfig, authenticate as client_authenticate};
+    use qsh_client::standalone::{
+        DirectAuthenticator, DirectConfig, authenticate as client_authenticate,
+    };
     use qsh_client::{ClientConnection, ConnectionConfig};
-    use qsh_core::protocol::{Capabilities, HelloAckPayload, TerminalOutputPayload, TermSize};
+    use qsh_core::protocol::{Capabilities, HelloAckPayload, TermSize, TerminalOutputPayload};
     use qsh_core::terminal::TerminalState;
     use qsh_core::transport::{Connection, StreamPair, StreamType, server_crypto_config};
     use qsh_test_utils::TestKeys;
@@ -414,7 +406,8 @@ AAAECBrLZZNM25f1vduElMLpZWAH9g5heM7sv1r62hvVfglNRHlNW52FYlU/5DcNv/dWdr\n\
         std::fs::write(&client_key_path, TEST_PRIVATE_KEY).expect("failed to write client key");
 
         // authorized_keys: allow the test public key.
-        std::fs::write(&authorized_keys_path, TEST_PUBLIC_KEY).expect("failed to write authorized_keys");
+        std::fs::write(&authorized_keys_path, TEST_PUBLIC_KEY)
+            .expect("failed to write authorized_keys");
 
         // known_hosts: record localhost with the server's public key.
         let known_hosts_entry = format!("localhost {}", TEST_PUBLIC_KEY);
@@ -436,8 +429,9 @@ AAAECBrLZZNM25f1vduElMLpZWAH9g5heM7sv1r62hvVfglNRHlNW52FYlU/5DcNv/dWdr\n\
             accept_unknown_host: false,
             no_agent: true,
         };
-        let mut direct_auth =
-            DirectAuthenticator::new(&direct_config).await.expect("failed to create DirectAuthenticator");
+        let mut direct_auth = DirectAuthenticator::new(&direct_config)
+            .await
+            .expect("failed to create DirectAuthenticator");
 
         // In-memory duplex stream to simulate the QUIC stream used for auth.
         let (client_io, server_io) = duplex(8192);
@@ -463,7 +457,10 @@ AAAECBrLZZNM25f1vduElMLpZWAH9g5heM7sv1r62hvVfglNRHlNW52FYlU/5DcNv/dWdr\n\
             AuthResult::Success { client_fingerprint } => {
                 assert!(!client_fingerprint.is_empty());
             }
-            AuthResult::Failure { code, internal_message } => {
+            AuthResult::Failure {
+                code,
+                internal_message,
+            } => {
                 panic!(
                     "server authentication failed: code={:?} message={}",
                     code, internal_message
@@ -503,7 +500,8 @@ AAAECBrLZZNM25f1vduElMLpZWAH9g5heM7sv1r62hvVfglNRHlNW52FYlU/5DcNv/dWdr\n\
         std::fs::write(&client_key_path, TEST_PRIVATE_KEY).expect("failed to write client key");
 
         // authorized_keys: allow the test public key.
-        std::fs::write(&authorized_keys_path, TEST_PUBLIC_KEY).expect("failed to write authorized_keys");
+        std::fs::write(&authorized_keys_path, TEST_PUBLIC_KEY)
+            .expect("failed to write authorized_keys");
 
         // known_hosts: record localhost with the server's public key.
         let known_hosts_entry = format!("localhost {}", TEST_PUBLIC_KEY);
@@ -539,8 +537,8 @@ AAAECBrLZZNM25f1vduElMLpZWAH9g5heM7sv1r62hvVfglNRHlNW52FYlU/5DcNv/dWdr\n\
             authorized_keys_path: Some(authorized_keys_path.clone()),
         };
         eprintln!("standalone_quic_session: creating StandaloneAuthenticator");
-        let authenticator =
-            StandaloneAuthenticator::new(server_auth_config).expect("failed to create authenticator");
+        let authenticator = StandaloneAuthenticator::new(server_auth_config)
+            .expect("failed to create authenticator");
 
         // Spawn server task handling a single connection.
         eprintln!("standalone_quic_session: spawning server task");
@@ -556,10 +554,13 @@ AAAECBrLZZNM25f1vduElMLpZWAH9g5heM7sv1r62hvVfglNRHlNW52FYlU/5DcNv/dWdr\n\
             eprintln!("server: auth stream opened");
             let auth_result =
                 authenticate_connection(&authenticator, &mut auth_send, &mut auth_recv).await;
-            eprintln!("server: auth_result = {:?}", match &auth_result {
-                AuthResult::Success { .. } => "success",
-                AuthResult::Failure { .. } => "failure",
-            });
+            eprintln!(
+                "server: auth_result = {:?}",
+                match &auth_result {
+                    AuthResult::Success { .. } => "success",
+                    AuthResult::Failure { .. } => "failure",
+                }
+            );
 
             let client_fingerprint = match auth_result {
                 AuthResult::Success { client_fingerprint } => client_fingerprint,
@@ -642,8 +643,9 @@ AAAECBrLZZNM25f1vduElMLpZWAH9g5heM7sv1r62hvVfglNRHlNW52FYlU/5DcNv/dWdr\n\
             no_agent: true,
         };
         eprintln!("client: creating DirectAuthenticator");
-        let mut direct_auth =
-            DirectAuthenticator::new(&direct_config).await.expect("failed to create DirectAuthenticator");
+        let mut direct_auth = DirectAuthenticator::new(&direct_config)
+            .await
+            .expect("failed to create DirectAuthenticator");
 
         // Build ConnectionConfig for QUIC client
         let server_sock_addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
@@ -663,13 +665,16 @@ AAAECBrLZZNM25f1vduElMLpZWAH9g5heM7sv1r62hvVfglNRHlNW52FYlU/5DcNv/dWdr\n\
 
         // Establish QUIC connection
         eprintln!("client: connecting QUIC");
-        let quic_conn =
-            ClientConnection::connect_quic(&conn_config).await.expect("connect_quic failed");
+        let quic_conn = ClientConnection::connect_quic(&conn_config)
+            .await
+            .expect("connect_quic failed");
 
         // Accept auth stream and perform client-side standalone auth
         eprintln!("client: waiting for auth stream");
-        let (mut client_send, mut client_recv) =
-            quic_conn.accept_bi().await.expect("accept auth bidi failed");
+        let (mut client_send, mut client_recv) = quic_conn
+            .accept_bi()
+            .await
+            .expect("accept auth bidi failed");
         eprintln!("client: performing standalone auth");
         client_authenticate(&mut direct_auth, &mut client_send, &mut client_recv)
             .await
@@ -677,8 +682,9 @@ AAAECBrLZZNM25f1vduElMLpZWAH9g5heM7sv1r62hvVfglNRHlNW52FYlU/5DcNv/dWdr\n\
 
         // Complete Hello/HelloAck handshake and open terminal streams
         eprintln!("client: completing Hello/HelloAck via from_quic");
-        let mut client_conn =
-            ClientConnection::from_quic(quic_conn, conn_config).await.expect("from_quic failed");
+        let mut client_conn = ClientConnection::from_quic(quic_conn, conn_config)
+            .await
+            .expect("from_quic failed");
 
         // Sanity: send a resize and close cleanly
         eprintln!("client: sending resize");

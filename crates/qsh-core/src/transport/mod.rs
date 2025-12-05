@@ -41,11 +41,13 @@ pub enum StreamType {
     Tunnel,
     /// Port forward data (dynamic bidirectional streams).
     Forward(u32),
+    /// File transfer data (dynamic bidirectional streams).
+    FileTransfer(u64),
 }
 
 impl StreamType {
     /// Get the QUIC stream ID for this type (if fixed).
-    /// Forward streams are dynamically allocated, so return None.
+    /// Forward and FileTransfer streams are dynamically allocated, so return None.
     pub fn fixed_id(&self) -> Option<u64> {
         match self {
             StreamType::Control => Some(0),
@@ -53,6 +55,7 @@ impl StreamType {
             StreamType::TerminalOut => Some(3),
             StreamType::Tunnel => Some(4),
             StreamType::Forward(_) => None,
+            StreamType::FileTransfer(_) => None,
         }
     }
 
@@ -60,7 +63,10 @@ impl StreamType {
     pub fn is_bidirectional(&self) -> bool {
         matches!(
             self,
-            StreamType::Control | StreamType::Tunnel | StreamType::Forward(_)
+            StreamType::Control
+                | StreamType::Tunnel
+                | StreamType::Forward(_)
+                | StreamType::FileTransfer(_)
         )
     }
 

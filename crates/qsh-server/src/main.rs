@@ -12,8 +12,8 @@ use tracing::{debug, error, info, warn};
 use qsh_core::protocol::{Capabilities, Message, ResizePayload, ShutdownReason};
 use qsh_core::transport::{Connection, StreamPair, StreamType, server_crypto_config};
 use qsh_server::{
-    BootstrapServer, Cli, ForwardHandler, PendingSession, RealSessionSpawner, ServerSession,
-    SessionAuthorizer, SessionConfig, SessionRegistry,
+    BootstrapServer, Cli, FileHandler, ForwardHandler, PendingSession, RealSessionSpawner,
+    ServerSession, SessionAuthorizer, SessionConfig, SessionRegistry,
 };
 
 #[cfg(feature = "standalone")]
@@ -345,17 +345,15 @@ async fn handle_connection(
         use qsh_server::standalone::{AuthResult, authenticate_connection, send_auth_failure};
 
         // Open a dedicated bidirectional stream for auth handshake (server-initiated).
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| qsh_core::Error::Transport {
-                message: format!("failed to open auth stream: {}", e),
-            })?;
+        let (mut send, mut recv) =
+            conn.open_bi()
+                .await
+                .map_err(|e| qsh_core::Error::Transport {
+                    message: format!("failed to open auth stream: {}", e),
+                })?;
 
         match authenticate_connection(auth.as_ref(), &mut send, &mut recv).await {
-            AuthResult::Success {
-                client_fingerprint,
-            } => {
+            AuthResult::Success { client_fingerprint } => {
                 info!(%client_fingerprint, "Standalone client authenticated");
             }
             AuthResult::Failure {
@@ -413,18 +411,29 @@ async fn handle_session(
         session.max_forwards(),
     ));
 
+    // Create file-transfer handler rooted at the user's home directory
+    // (or current directory as a fallback).
+    let base_dir = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
+        });
+    let file_handler = Arc::new(FileHandler::new(quic_conn.clone(), base_dir));
+
     // Spawn a task to accept forward streams and terminal input stream
     let accept_quic = quic_conn.clone();
-    let accept_handler = Arc::clone(&forward_handler);
+    let accept_forward = Arc::clone(&forward_handler);
+    let accept_file = Arc::clone(&file_handler);
     let terminal_input_tx = input_tx.clone();
     let accept_task = tokio::spawn(async move {
         loop {
             match accept_quic.accept_stream().await {
                 Ok((stream_type, stream)) => match stream_type {
-                    StreamType::Forward(_) => {
-                        let handler = Arc::clone(&accept_handler);
+                    StreamType::Forward(_) | StreamType::FileTransfer(_) | StreamType::Tunnel => {
+                        let fwd = Arc::clone(&accept_forward);
+                        let file = Arc::clone(&accept_file);
                         tokio::spawn(async move {
-                            handler.handle_stream(stream_type, stream).await;
+                            dispatch_dynamic_stream(stream_type, stream, fwd, file).await;
                         });
                     }
                     StreamType::TerminalIn => {
@@ -622,4 +631,38 @@ async fn handle_session(
     session.close().await;
 
     Ok(())
+}
+
+/// Dispatch a dynamically-typed bidirectional stream by peeking at the first message.
+async fn dispatch_dynamic_stream<C: Connection + 'static>(
+    stream_type: StreamType,
+    mut stream: impl StreamPair + 'static,
+    forward_handler: Arc<ForwardHandler<C>>,
+    file_handler: Arc<FileHandler<C>>,
+) {
+    let first = match stream.recv().await {
+        Ok(msg) => msg,
+        Err(e) => {
+            warn!(stream = ?stream_type, error = %e, "Failed to read first message on stream");
+            return;
+        }
+    };
+
+    match first {
+        Message::ForwardRequest(req) => {
+            let forward_id = req.forward_id;
+            if let Err(e) = forward_handler.handle_request(req, stream).await {
+                error!(forward_id, error = %e, "Forward request handling failed");
+            }
+        }
+        Message::FileRequest(req) => {
+            let transfer_id = req.transfer_id;
+            if let Err(e) = file_handler.handle_request(req, stream).await {
+                error!(transfer_id, error = %e, "File request handling failed");
+            }
+        }
+        other => {
+            warn!(?stream_type, msg = ?other, "Unexpected first message on dynamic stream");
+        }
+    }
 }

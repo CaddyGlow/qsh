@@ -50,11 +50,9 @@ impl Agent {
                     message: format!("failed to connect to SSH agent: {}", e),
                 })?;
 
-                let identities = client
-                    .list_all_identities()
-                    .map_err(|e| Error::Protocol {
-                        message: format!("failed to list identities from SSH agent: {}", e),
-                    })?;
+                let identities = client.list_all_identities().map_err(|e| Error::Protocol {
+                    message: format!("failed to list identities from SSH agent: {}", e),
+                })?;
 
                 let mut keys = Vec::new();
                 for identity in identities {

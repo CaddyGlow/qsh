@@ -71,7 +71,7 @@ shell-words = "1.1"
 libc = "0.2"
 
 # Internal crates
-qsh-core = { path = "crates/qsh-core" }
+qsh-core = { path = "crates/qsh-core", default-features = false }
 qsh-client = { path = "crates/qsh-client" }
 qsh-server = { path = "crates/qsh-server" }
 qsh-test-utils = { path = "crates/qsh-test-utils" }
