@@ -9,6 +9,7 @@ use clap::Parser;
 use tracing::{error, info};
 
 use qsh_client::{ClientConnection, CpCli, FilePath, FileTransfer};
+use qsh_client::file::transfer::resolve_remote_upload_path;
 use qsh_core::transport::QuicConnection;
 
 #[cfg(feature = "standalone")]
@@ -94,13 +95,30 @@ async fn run_transfer(
             FilePath::Local(p) => p,
             _ => unreachable!(),
         };
-        let remote_path = match dest {
+        let raw_remote_path: &str = match dest {
             FilePath::Remote { path, .. } => path.as_str(),
             _ => unreachable!(),
         };
 
+        // For scp-style semantics we first determine whether the raw remote
+        // path refers to an existing directory (when specified), then resolve
+        // the final upload path accordingly.
+        let remote_is_dir = if !raw_remote_path.is_empty() {
+            match transfer.remote_is_directory(raw_remote_path).await {
+                Ok(is_dir) => is_dir,
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+
+        let remote_path =
+            resolve_remote_upload_path(local_path, raw_remote_path, remote_is_dir);
+
         info!(local = %local_path.display(), remote = %remote_path, "Starting upload");
-        let result = transfer.upload(local_path, remote_path, options).await?;
+        let result = transfer
+            .upload(local_path, &remote_path, options)
+            .await?;
 
         eprintln!(
             "Uploaded {} in {:.1}s ({}/s){}",

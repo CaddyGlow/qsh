@@ -17,8 +17,8 @@ use qsh_core::file::{
     hash_xxh64,
 };
 use qsh_core::protocol::{
-    DataFlags, FileCompletePayload, FileDataPayload, FileMetadataPayload, FileRequestPayload,
-    Message, TransferDirection, TransferOptions,
+    BlockChecksum, DataFlags, FileCompletePayload, FileDataPayload, FileMetadataPayload,
+    FileRequestPayload, FileErrorCode, Message, TransferDirection, TransferOptions,
 };
 use qsh_core::transport::{Connection, StreamPair, StreamType};
 
@@ -48,6 +48,37 @@ pub struct TransferResult {
     pub delta_used: bool,
 }
 
+/// Resolve the final remote path for an upload (scp-style semantics).
+///
+/// - If `remote_path` is empty (e.g. `host:`), use the local file name.
+/// - If `remote_path` refers to a directory, append the local file name.
+/// - Otherwise, use `remote_path` as-is.
+pub fn resolve_remote_upload_path(
+    local_path: &Path,
+    remote_path: &str,
+    remote_is_directory: bool,
+) -> String {
+    if remote_path.is_empty() {
+        if let Some(name) = local_path.file_name() {
+            return name.to_string_lossy().to_string();
+        }
+        return remote_path.to_string();
+    }
+
+    if remote_is_directory {
+        if let Some(name) = local_path.file_name() {
+            let base = remote_path.trim_end_matches('/');
+            if base.is_empty() {
+                return name.to_string_lossy().to_string();
+            } else {
+                return format!("{}/{}", base, name.to_string_lossy());
+            }
+        }
+    }
+
+    remote_path.to_string()
+}
+
 /// File transfer client.
 #[derive(Clone)]
 pub struct FileTransfer<C: Connection> {
@@ -72,6 +103,63 @@ impl<C: Connection + 'static> FileTransfer<C> {
         let current = *id;
         *id += 1;
         current
+    }
+
+    /// Check if a remote path refers to an existing directory (scp-style semantics).
+    ///
+    /// Returns:
+    /// - Ok(true) if the path is an existing directory
+    /// - Ok(false) if it is a file or does not exist
+    /// - Err(_) for other errors (permission denied, invalid path, etc.)
+    pub async fn remote_is_directory(&self, remote_path: &str) -> Result<bool> {
+        let transfer_id = self.next_id().await;
+
+        let mut stream = self
+            .connection
+            .open_stream(StreamType::FileTransfer(transfer_id))
+            .await?;
+
+        // Use minimal options: no recursion, compression or delta.
+        let opts = TransferOptions {
+            compress: false,
+            delta: false,
+            recursive: false,
+            preserve_mode: false,
+            parallel: 1,
+        };
+
+        let request = Message::FileRequest(FileRequestPayload {
+            transfer_id,
+            path: remote_path.to_string(),
+            direction: TransferDirection::Download,
+            resume_from: None,
+            options: opts,
+            chunk: None,
+            client_blocks: Vec::new(),
+        });
+        stream.send(&request).await?;
+
+        let is_dir = match stream.recv().await? {
+            Message::FileMetadata(_) => false,
+            Message::FileError(e) => match e.code {
+                FileErrorCode::IsDirectory => true,
+                FileErrorCode::NotFound => false,
+                other => {
+                    return Err(Error::FileTransfer {
+                        message: format!("{}: {}", other, e.message),
+                    })
+                }
+            },
+            other => {
+                return Err(Error::FileTransfer {
+                    message: format!("unexpected response: {:?}", other),
+                });
+            }
+        };
+
+        // Best-effort close; server may still attempt to send, but will handle errors.
+        stream.close();
+        Ok(is_dir)
     }
 
     /// Collect all files under a directory (relative paths).
@@ -139,57 +227,101 @@ impl<C: Connection + 'static> FileTransfer<C> {
         stream: &mut impl StreamPair,
         progress: &mut ProgressReporter,
     ) -> Result<u64> {
-        // Read local file
+        // Build signature from server's blocks (existing remote file).
+        let signature = DeltaSignature::new(&server_metadata.blocks, BLOCK_SIZE);
+        let mut encoder = DeltaEncoder::new(signature);
+
+        // Read the new local file in chunks to avoid loading it entirely into memory.
         let mut file = File::open(local_path).map_err(|e| Error::FileTransfer {
             message: format!("failed to open file: {}", e),
         })?;
 
-        let mut data = Vec::new();
-        file.read_to_end(&mut data)
-            .map_err(|e| Error::FileTransfer {
-                message: format!("failed to read file: {}", e),
-            })?;
+        let mut buf = vec![0u8; FILE_BUFFER_SIZE];
+        let mut total_hash = 0u64;
+        let mut out_offset = 0u64;
+        let mut bytes_sent = 0u64;
 
-        // Build signature from server's blocks
-        let signature = DeltaSignature::new(&server_metadata.blocks, BLOCK_SIZE);
-
-        // Compute delta
-        let ops = DeltaEncoder::encode(signature, &data);
-
-        let compressor = if compress {
+        let mut compressor = if compress {
             Some(Compressor::with_default_level())
         } else {
             None
         };
 
-        let mut bytes_sent = 0u64;
-        let mut total_hash = 0u64;
-        let mut offset = 0u64;
+        loop {
+            let n = file.read(&mut buf).map_err(|e| Error::FileTransfer {
+                message: format!("failed to read file: {}", e),
+            })?;
+            if n == 0 {
+                break;
+            }
 
-        // Send delta operations
-        for (i, op) in ops.iter().enumerate() {
-            let is_final = i == ops.len() - 1;
+            let chunk = &buf[..n];
+            // Hash the new file contents for checksum.
+            total_hash ^= hash_xxh64(chunk);
+            encoder.process(chunk);
 
-            let (send_data, flags, advance_by) = match op {
+            let ops = encoder.take_ops();
+            Self::send_delta_ops(
+                transfer_id,
+                stream,
+                &mut compressor,
+                ops,
+                &mut out_offset,
+                false,
+                &mut bytes_sent,
+                progress,
+            )
+            .await?;
+        }
+
+        let final_ops = encoder.finish();
+        Self::send_delta_ops(
+            transfer_id,
+            stream,
+            &mut compressor,
+            final_ops,
+            &mut out_offset,
+            true,
+            &mut bytes_sent,
+            progress,
+        )
+        .await?;
+
+        // Send complete
+        let complete = Message::FileComplete(FileCompletePayload {
+            transfer_id,
+            checksum: total_hash,
+            total_bytes: out_offset,
+        });
+        stream.send(&complete).await?;
+
+        Ok(bytes_sent)
+    }
+
+    /// Send delta operations as file data messages for uploads.
+    async fn send_delta_ops(
+        transfer_id: u64,
+        stream: &mut impl StreamPair,
+        compressor: &mut Option<Compressor>,
+        ops: Vec<DeltaOp>,
+        out_offset: &mut u64,
+        final_batch: bool,
+        bytes_sent: &mut u64,
+        progress: &mut ProgressReporter,
+    ) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+
+        let op_len = ops.len();
+        for (i, op) in ops.into_iter().enumerate() {
+            let is_last = final_batch && i == op_len - 1;
+
+            let (data, flags, advance_by, data_len) = match op {
                 DeltaOp::Copy {
                     source_offset,
                     length,
                 } => {
-                    let start = offset as usize;
-                    let len = (*length) as usize;
-                    let end = start.checked_add(len).ok_or_else(|| Error::FileTransfer {
-                        message: "delta copy offset overflow".into(),
-                    })?;
-
-                    if end > data.len() {
-                        return Err(Error::FileTransfer {
-                            message: "delta copy exceeds local file size".into(),
-                        });
-                    }
-
-                    total_hash ^= hash_xxh64(&data[start..end]);
-
-                    // Send block reference
                     let mut ref_data = Vec::with_capacity(16);
                     ref_data.extend_from_slice(&source_offset.to_le_bytes());
                     ref_data.extend_from_slice(&length.to_le_bytes());
@@ -197,62 +329,56 @@ impl<C: Connection + 'static> FileTransfer<C> {
                         ref_data,
                         DataFlags {
                             compressed: false,
-                            final_block: is_final,
+                            final_block: is_last,
                             block_ref: true,
                         },
-                        *length,
+                        length,
+                        16usize,
                     )
                 }
-                DeltaOp::Literal { data: lit_data } => {
-                    total_hash ^= hash_xxh64(lit_data);
-
-                    let (send, compressed) = if let Some(ref comp) = compressor {
-                        if comp.should_compress(lit_data) {
-                            match comp.compress(lit_data) {
-                                Ok(c) if c.len() < lit_data.len() => (c, true),
-                                _ => (lit_data.clone(), false),
+                DeltaOp::Literal { data } => {
+                    let (send, compressed) = if let Some(comp) = compressor.as_ref() {
+                        if comp.should_compress(&data) {
+                            match comp.compress(&data) {
+                                Ok(c) if c.len() < data.len() => (c, true),
+                                _ => (data.clone(), false),
                             }
                         } else {
-                            (lit_data.clone(), false)
+                            (data.clone(), false)
                         }
                     } else {
-                        (lit_data.clone(), false)
+                        (data.clone(), false)
                     };
+
+                    let data_len = send.len();
 
                     (
                         send,
                         DataFlags {
                             compressed,
-                            final_block: is_final,
+                            final_block: is_last,
                             block_ref: false,
                         },
-                        lit_data.len() as u64,
+                        data.len() as u64,
+                        data_len,
                     )
                 }
             };
 
             let msg = Message::FileData(FileDataPayload {
                 transfer_id,
-                offset,
-                data: send_data.clone(),
+                offset: *out_offset,
+                data,
                 flags,
             });
             stream.send(&msg).await?;
 
-            bytes_sent += send_data.len() as u64;
-            offset += advance_by;
-            progress.update(offset);
+            *bytes_sent += data_len as u64;
+            *out_offset = out_offset.saturating_add(advance_by);
+            progress.update(*out_offset);
         }
 
-        // Send complete
-        let complete = Message::FileComplete(FileCompletePayload {
-            transfer_id,
-            checksum: total_hash,
-            total_bytes: offset,
-        });
-        stream.send(&complete).await?;
-
-        Ok(bytes_sent)
+        Ok(())
     }
 
     /// Send file without delta sync.
@@ -366,16 +492,82 @@ impl<C: Connection + 'static> FileTransfer<C> {
         let (local_blocks, mut source_file) = if options.delta && local_path.exists() {
             match fs::metadata(local_path) {
                 Ok(m) if m.is_file() => {
+                    let size = m.len();
                     let mut file = File::open(local_path).map_err(|e| Error::FileTransfer {
                         message: format!("failed to open local file: {}", e),
                     })?;
-                    let mut data = Vec::new();
-                    file.read_to_end(&mut data)
-                        .map_err(|e| Error::FileTransfer {
+
+                    let mut blocks: Vec<BlockChecksum> = Vec::new();
+                    let mut buf = vec![0u8; BLOCK_SIZE];
+                    let mut offset = 0u64;
+
+                    let report_interval = if size > 0 {
+                        (size / 20).max(1)
+                    } else {
+                        0
+                    };
+                    let mut next_report = report_interval;
+
+                    if size > 0 {
+                        info!(
+                            transfer_id,
+                            local_size = size,
+                            "Computing local checksums for delta download"
+                        );
+                    }
+
+                    loop {
+                        let n = file.read(&mut buf).map_err(|e| Error::FileTransfer {
                             message: format!("failed to read local file: {}", e),
                         })?;
-                    let hasher = BlockHasher::new(BLOCK_SIZE);
-                    let blocks = hasher.compute_checksums(&data);
+                        if n == 0 {
+                            break;
+                        }
+
+                        let weak = BlockHasher::compute_weak(&buf[..n]);
+                        let strong = BlockHasher::compute_strong(&buf[..n]);
+
+                        blocks.push(BlockChecksum {
+                            offset,
+                            weak,
+                            strong,
+                        });
+
+                        offset += n as u64;
+
+                        if size > 0 && offset >= next_report {
+                            let pct = ((offset as f64 / size as f64) * 100.0).min(100.0);
+                            let filled = (pct / 5.0).round() as usize;
+                            let total_slots = 20usize;
+                            let filled_slots = filled.min(total_slots);
+                            let empty_slots = total_slots.saturating_sub(filled_slots);
+                            let bar = format!(
+                                "[{}{}]",
+                                "#".repeat(filled_slots),
+                                "-".repeat(empty_slots)
+                            );
+
+                            info!(
+                                transfer_id,
+                                progress = %bar,
+                                bytes_scanned = offset,
+                                local_size = size,
+                                pct = pct as u32,
+                                "Local checksum scan in progress"
+                            );
+
+                            next_report = offset.saturating_add(report_interval);
+                        }
+                    }
+
+                    if size > 0 {
+                        info!(
+                            transfer_id,
+                            bytes_scanned = offset,
+                            local_size = size,
+                            "Local checksum scan complete"
+                        );
+                    }
 
                     // Rewind for block_ref use during download
                     file.seek(SeekFrom::Start(0))
@@ -459,6 +651,7 @@ impl<C: Connection + 'static> FileTransfer<C> {
         let mut bytes_received = 0u64;
         let mut saw_final_block = false;
         let mut delta_used = false;
+        let mut checksum_ok = true;
 
         // Receive data
         loop {
@@ -544,6 +737,7 @@ impl<C: Connection + 'static> FileTransfer<C> {
                             got = total_hash,
                             "Checksum mismatch"
                         );
+                        checksum_ok = false;
                     }
                     if !saw_final_block {
                         warn!(
@@ -570,6 +764,15 @@ impl<C: Connection + 'static> FileTransfer<C> {
         }
 
         progress.finish();
+
+        if !checksum_ok {
+            // Do not overwrite the existing file with corrupt data.
+            drop(file);
+            let _ = fs::remove_file(&temp_path);
+            return Err(Error::FileTransfer {
+                message: "checksum mismatch during download".into(),
+            });
+        }
 
         // Sync and rename
         file.sync_all().map_err(|e| Error::FileTransfer {
@@ -658,6 +861,13 @@ impl<C: Connection + 'static> FileTransfer<C> {
             }
         };
 
+        info!(
+            transfer_id,
+            remote_size = server_metadata.size,
+            remote_blocks = server_metadata.blocks.len(),
+            "Received server metadata for upload"
+        );
+
         // Set up progress
         let filename = local_path
             .file_name()
@@ -668,6 +878,12 @@ impl<C: Connection + 'static> FileTransfer<C> {
         // Determine if we should use delta
         let use_delta = options.delta && !server_metadata.blocks.is_empty();
         let delta_used = use_delta;
+
+        info!(
+            transfer_id,
+            use_delta,
+            "Upload delta decision"
+        );
 
         // Send file data
         let _bytes_sent = if use_delta {
@@ -1015,6 +1231,7 @@ impl<C: Connection + 'static> FileTransfer<C> {
         let mut bytes_received = 0u64;
         let mut saw_final_block = false;
         let mut delta_used = false;
+        let mut checksum_ok = true;
 
         loop {
             match stream.recv().await {
@@ -1099,6 +1316,7 @@ impl<C: Connection + 'static> FileTransfer<C> {
                             got = total_hash,
                             "Checksum mismatch"
                         );
+                        checksum_ok = false;
                     }
                     if !saw_final_block {
                         warn!(
@@ -1125,6 +1343,15 @@ impl<C: Connection + 'static> FileTransfer<C> {
         }
 
         progress.finish();
+
+        if !checksum_ok {
+            // Avoid overwriting the target with corrupt data.
+            drop(file);
+            let _ = fs::remove_file(&temp_path);
+            return Err(Error::FileTransfer {
+                message: "checksum mismatch during download".into(),
+            });
+        }
 
         file.sync_all().map_err(|e| Error::FileTransfer {
             message: format!("sync failed: {}", e),
@@ -1225,6 +1452,7 @@ impl<C: Connection + 'static> FileTransfer<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn test_transfer_result() {
@@ -1234,5 +1462,33 @@ mod tests {
             delta_used: false,
         };
         assert_eq!(result.bytes, 1000);
+    }
+
+    #[test]
+    fn resolve_upload_empty_remote_uses_basename() {
+        let local = Path::new("/tmp/testfile_5gb.bin");
+        let resolved = resolve_remote_upload_path(local, "", false);
+        assert_eq!(resolved, "testfile_5gb.bin");
+    }
+
+    #[test]
+    fn resolve_upload_directory_appends_basename() {
+        let local = Path::new("/tmp/testfile_5gb.bin");
+        let resolved = resolve_remote_upload_path(local, "folder", true);
+        assert_eq!(resolved, "folder/testfile_5gb.bin");
+    }
+
+    #[test]
+    fn resolve_upload_directory_trailing_slash() {
+        let local = Path::new("/tmp/testfile_5gb.bin");
+        let resolved = resolve_remote_upload_path(local, "folder/", true);
+        assert_eq!(resolved, "folder/testfile_5gb.bin");
+    }
+
+    #[test]
+    fn resolve_upload_non_directory_keeps_path() {
+        let local = Path::new("/tmp/testfile_5gb.bin");
+        let resolved = resolve_remote_upload_path(local, "folder", false);
+        assert_eq!(resolved, "folder");
     }
 }

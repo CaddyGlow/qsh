@@ -288,7 +288,10 @@ impl<C: Connection + 'static> FileHandler<C> {
 
         // Compute block checksums if delta enabled
         let blocks = if request.options.delta {
-            match self.compute_block_checksums(&path, file_size).await {
+            match self
+                .compute_block_checksums(transfer_id, &path, file_size)
+                .await
+            {
                 Ok(b) => b,
                 Err(e) => {
                     warn!(transfer_id, error = %e, "Failed to compute checksums for download");
@@ -377,7 +380,12 @@ impl<C: Connection + 'static> FileHandler<C> {
     }
 
     /// Compute block checksums for delta transfer.
-    async fn compute_block_checksums(&self, path: &Path, _size: u64) -> Result<Vec<BlockChecksum>> {
+    async fn compute_block_checksums(
+        &self,
+        transfer_id: u64,
+        path: &Path,
+        size: u64,
+    ) -> Result<Vec<BlockChecksum>> {
         let path = path.to_path_buf();
 
         tokio::task::spawn_blocking(move || {
@@ -388,6 +396,21 @@ impl<C: Connection + 'static> FileHandler<C> {
             let mut checksums = Vec::new();
             let mut buf = vec![0u8; BLOCK_SIZE];
             let mut offset = 0u64;
+
+            let report_interval = if size > 0 {
+                (size / 20).max(1)
+            } else {
+                0
+            };
+            let mut next_report = report_interval;
+
+            if size > 0 {
+                info!(
+                    transfer_id,
+                    total_bytes = size,
+                    "Computing delta checksums for existing file"
+                );
+            }
 
             loop {
                 let n = file.read(&mut buf).map_err(|e| Error::FileTransfer {
@@ -407,6 +430,39 @@ impl<C: Connection + 'static> FileHandler<C> {
                 });
 
                 offset += n as u64;
+
+                if size > 0 && offset >= next_report {
+                    let pct = ((offset as f64 / size as f64) * 100.0).min(100.0);
+                    let filled = (pct / 5.0).round() as usize; // 20-step bar
+                    let total_slots = 20usize;
+                    let filled_slots = filled.min(total_slots);
+                    let empty_slots = total_slots.saturating_sub(filled_slots);
+                    let bar = format!(
+                        "[{}{}]",
+                        "#".repeat(filled_slots),
+                        "-".repeat(empty_slots)
+                    );
+
+                    info!(
+                        transfer_id,
+                        progress = %bar,
+                        bytes_scanned = offset,
+                        total_bytes = size,
+                        pct = pct as u32,
+                        "Delta checksum scan in progress"
+                    );
+
+                    next_report = offset.saturating_add(report_interval);
+                }
+            }
+
+            if size > 0 {
+                info!(
+                    transfer_id,
+                    bytes_scanned = offset,
+                    total_bytes = size,
+                    "Delta checksum scan complete"
+                );
             }
 
             Ok(checksums)
@@ -771,7 +827,10 @@ impl<C: Connection + 'static> FileHandler<C> {
             match fs::metadata(&path) {
                 Ok(m) if m.is_file() => {
                     let len = m.len();
-                    match self.compute_block_checksums(&path, len).await {
+                    match self
+                        .compute_block_checksums(transfer_id, &path, len)
+                        .await
+                    {
                         Ok(blocks) => (len, blocks),
                         Err(e) => {
                             warn!(transfer_id, error = %e, "Failed to compute existing file checksums for upload");

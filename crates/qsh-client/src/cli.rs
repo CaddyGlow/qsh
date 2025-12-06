@@ -468,9 +468,13 @@ impl CpCli {
             let is_remote = before_colon.contains('@')
                 || (!before_colon.contains('/') && !before_colon.contains('\\'));
 
-            if is_remote && colon_pos + 1 < s.len() {
+            if is_remote {
                 let host_part = before_colon;
-                let path = s[colon_pos + 1..].to_string();
+                let path = if colon_pos + 1 < s.len() {
+                    s[colon_pos + 1..].to_string()
+                } else {
+                    String::new()
+                };
 
                 if let Some(at_pos) = host_part.find('@') {
                     let user = host_part[..at_pos].to_string();
@@ -862,6 +866,58 @@ mod tests {
                 assert!(user.is_none());
                 assert_eq!(host, "host");
                 assert_eq!(path, "/path/to/file");
+            }
+            _ => panic!("expected remote path"),
+        }
+    }
+
+    #[test]
+    fn cp_parse_remote_path_relative_with_user() {
+        let path = CpCli::parse_path("user@host:relative/path");
+        match path {
+            FilePath::Remote { user, host, path } => {
+                assert_eq!(user, Some("user".to_string()));
+                assert_eq!(host, "host");
+                assert_eq!(path, "relative/path");
+            }
+            _ => panic!("expected remote path"),
+        }
+    }
+
+    #[test]
+    fn cp_parse_remote_path_relative_no_user() {
+        let path = CpCli::parse_path("host:relative/path");
+        match path {
+            FilePath::Remote { user, host, path } => {
+                assert!(user.is_none());
+                assert_eq!(host, "host");
+                assert_eq!(path, "relative/path");
+            }
+            _ => panic!("expected remote path"),
+        }
+    }
+
+    #[test]
+    fn cp_parse_remote_path_trailing_colon_with_user() {
+        let path = CpCli::parse_path("user@host:");
+        match path {
+            FilePath::Remote { user, host, path } => {
+                assert_eq!(user, Some("user".to_string()));
+                assert_eq!(host, "host");
+                assert_eq!(path, "");
+            }
+            _ => panic!("expected remote path"),
+        }
+    }
+
+    #[test]
+    fn cp_parse_remote_path_trailing_colon_no_user() {
+        let path = CpCli::parse_path("host:");
+        match path {
+            FilePath::Remote { user, host, path } => {
+                assert!(user.is_none());
+                assert_eq!(host, "host");
+                assert_eq!(path, "");
             }
             _ => panic!("expected remote path"),
         }
