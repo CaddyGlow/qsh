@@ -11,7 +11,7 @@ pub mod compress;
 pub mod delta;
 pub mod types;
 
-pub use checksum::{BlockHasher, RollingChecksum, hash_xxh64};
+pub use checksum::{BlockHasher, RollingChecksum, StreamingHasher, hash_xxh64};
 pub use compress::{Compressor, Decompressor};
 pub use delta::{DeltaDecoder, DeltaEncoder, DeltaOp, DeltaSignature, apply_delta, compute_delta};
 pub use types::{TransferState, TransferStatus};

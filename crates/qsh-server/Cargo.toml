@@ -37,6 +37,7 @@ base64 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+filetime = { workspace = true }
 
 # Standalone mode (optional)
 ssh-key = { workspace = true, optional = true }

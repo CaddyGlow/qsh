@@ -8,8 +8,8 @@ use std::sync::Arc;
 use clap::Parser;
 use tracing::{error, info};
 
-use qsh_client::{ClientConnection, CpCli, FilePath, FileTransfer};
 use qsh_client::file::transfer::resolve_remote_upload_path;
+use qsh_client::{ClientConnection, CpCli, FilePath, FileTransfer};
 use qsh_core::transport::QuicConnection;
 
 #[cfg(feature = "standalone")]
@@ -112,21 +112,22 @@ async fn run_transfer(
             false
         };
 
-        let remote_path =
-            resolve_remote_upload_path(local_path, raw_remote_path, remote_is_dir);
+        let remote_path = resolve_remote_upload_path(local_path, raw_remote_path, remote_is_dir);
 
         info!(local = %local_path.display(), remote = %remote_path, "Starting upload");
-        let result = transfer
-            .upload(local_path, &remote_path, options)
-            .await?;
+        let result = transfer.upload(local_path, &remote_path, options).await?;
 
-        eprintln!(
-            "Uploaded {} in {:.1}s ({}/s){}",
-            format_bytes(result.bytes),
-            result.duration_secs,
-            format_bytes((result.bytes as f64 / result.duration_secs) as u64),
-            if result.delta_used { " [delta]" } else { "" }
-        );
+        if result.skipped {
+            eprintln!("File already up to date, skipped transfer");
+        } else {
+            eprintln!(
+                "Uploaded {} in {:.1}s ({}/s){}",
+                format_bytes(result.bytes),
+                result.duration_secs,
+                format_bytes((result.bytes as f64 / result.duration_secs) as u64),
+                if result.delta_used { " [delta]" } else { "" }
+            );
+        }
     } else {
         let remote_path = match source {
             FilePath::Remote { path, .. } => path.as_str(),
@@ -140,13 +141,17 @@ async fn run_transfer(
         info!(remote = %remote_path, local = %local_path.display(), "Starting download");
         let result = transfer.download(remote_path, local_path, options).await?;
 
-        eprintln!(
-            "Downloaded {} in {:.1}s ({}/s){}",
-            format_bytes(result.bytes),
-            result.duration_secs,
-            format_bytes((result.bytes as f64 / result.duration_secs) as u64),
-            if result.delta_used { " [delta]" } else { "" }
-        );
+        if result.skipped {
+            eprintln!("File already up to date, skipped transfer");
+        } else {
+            eprintln!(
+                "Downloaded {} in {:.1}s ({}/s){}",
+                format_bytes(result.bytes),
+                result.duration_secs,
+                format_bytes((result.bytes as f64 / result.duration_secs) as u64),
+                if result.delta_used { " [delta]" } else { "" }
+            );
+        }
     }
 
     Ok(())

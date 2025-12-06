@@ -716,6 +716,10 @@ pub struct TransferOptions {
     /// Maximum parallel file operations (directories).
     #[serde(default = "default_parallel_files")]
     pub parallel: usize,
+    /// If true, attempt to skip the transfer entirely when the source
+    /// and destination files are already identical (size + mtime + hash match).
+    #[serde(default)]
+    pub skip_if_unchanged: bool,
 }
 
 const fn default_parallel_files() -> usize {
@@ -730,6 +734,7 @@ impl Default for TransferOptions {
             recursive: false,
             preserve_mode: false,
             parallel: default_parallel_files(),
+            skip_if_unchanged: false,
         }
     }
 }
@@ -763,6 +768,22 @@ pub struct FileRequestPayload {
     /// Client-side block checksums for delta downloads (empty if unused).
     #[serde(default)]
     pub client_blocks: Vec<BlockChecksum>,
+    /// Source file modification time (seconds since Unix epoch) for uploads.
+    #[serde(default)]
+    pub source_mtime: Option<u64>,
+    /// Source file modification time nanoseconds (0-999999999) for uploads.
+    #[serde(default)]
+    pub source_mtime_nsec: Option<u32>,
+    /// Source file access time (seconds since Unix epoch) for uploads.
+    #[serde(default)]
+    pub source_atime: Option<u64>,
+    /// Source file access time nanoseconds (0-999999999) for uploads.
+    #[serde(default)]
+    pub source_atime_nsec: Option<u32>,
+    /// Source file size for uploads.
+    /// Used by server to optimize skip_if_unchanged (skip delta computation if sizes match).
+    #[serde(default)]
+    pub source_size: Option<u64>,
 }
 
 /// Block checksum for delta sync.
@@ -791,6 +812,10 @@ pub struct FileMetadataPayload {
     pub blocks: Vec<BlockChecksum>,
     /// Whether this is a directory.
     pub is_dir: bool,
+    /// Optional strong hash (xxHash64) of the entire file contents.
+    /// Present when skip_if_unchanged is enabled and file exists.
+    #[serde(default)]
+    pub file_hash: Option<u64>,
 }
 
 /// Data flags for file data blocks.
@@ -826,6 +851,17 @@ pub struct FileAckPayload {
     pub bytes_received: u64,
 }
 
+/// Completion status for a file transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FileTransferStatus {
+    /// Normal transfer completed; file data was sent/received.
+    #[default]
+    Normal,
+    /// No data was transferred because the file was already up to date
+    /// (size + mtime + hash match).
+    AlreadyUpToDate,
+}
+
 /// File transfer complete payload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileCompletePayload {
@@ -835,6 +871,9 @@ pub struct FileCompletePayload {
     pub checksum: u64,
     /// Total bytes transferred.
     pub total_bytes: u64,
+    /// Completion status for this transfer.
+    #[serde(default)]
+    pub status: FileTransferStatus,
 }
 
 /// File transfer error payload.

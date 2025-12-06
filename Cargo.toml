@@ -69,6 +69,7 @@ uuid = { version = "1.10", features = ["v4"] }
 shell-escape = "0.1"
 shell-words = "1.1"
 libc = "0.2"
+filetime = "0.2"
 
 # Internal crates
 qsh-core = { path = "crates/qsh-core", default-features = false }

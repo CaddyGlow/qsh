@@ -5,6 +5,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
 use serde_json;
 use tokio::sync::{Mutex, Semaphore};
@@ -14,11 +15,12 @@ use tracing::{debug, info, warn};
 use qsh_core::error::{Error, Result};
 use qsh_core::file::{
     BLOCK_SIZE, BlockHasher, Compressor, Decompressor, DeltaEncoder, DeltaOp, DeltaSignature,
-    hash_xxh64,
+    StreamingHasher, hash_xxh64,
 };
 use qsh_core::protocol::{
-    BlockChecksum, DataFlags, FileCompletePayload, FileDataPayload, FileMetadataPayload,
-    FileRequestPayload, FileErrorCode, Message, TransferDirection, TransferOptions,
+    BlockChecksum, DataFlags, FileCompletePayload, FileDataPayload, FileErrorCode,
+    FileMetadataPayload, FileRequestPayload, FileTransferStatus, Message, TransferDirection,
+    TransferOptions,
 };
 use qsh_core::transport::{Connection, StreamPair, StreamType};
 
@@ -46,6 +48,8 @@ pub struct TransferResult {
     pub duration_secs: f64,
     /// Whether delta sync was used.
     pub delta_used: bool,
+    /// Whether the transfer was skipped because the file was already up to date.
+    pub skipped: bool,
 }
 
 /// Resolve the final remote path for an upload (scp-style semantics).
@@ -126,6 +130,7 @@ impl<C: Connection + 'static> FileTransfer<C> {
             recursive: false,
             preserve_mode: false,
             parallel: 1,
+            skip_if_unchanged: false,
         };
 
         let request = Message::FileRequest(FileRequestPayload {
@@ -136,6 +141,11 @@ impl<C: Connection + 'static> FileTransfer<C> {
             options: opts,
             chunk: None,
             client_blocks: Vec::new(),
+            source_mtime: None,
+            source_mtime_nsec: None,
+            source_atime: None,
+            source_atime_nsec: None,
+            source_size: None,
         });
         stream.send(&request).await?;
 
@@ -147,7 +157,7 @@ impl<C: Connection + 'static> FileTransfer<C> {
                 other => {
                     return Err(Error::FileTransfer {
                         message: format!("{}: {}", other, e.message),
-                    })
+                    });
                 }
             },
             other => {
@@ -292,6 +302,7 @@ impl<C: Connection + 'static> FileTransfer<C> {
             transfer_id,
             checksum: total_hash,
             total_bytes: out_offset,
+            status: FileTransferStatus::Normal,
         });
         stream.send(&complete).await?;
 
@@ -459,6 +470,7 @@ impl<C: Connection + 'static> FileTransfer<C> {
             transfer_id,
             checksum: total_hash,
             total_bytes: offset,
+            status: FileTransferStatus::Normal,
         });
         stream.send(&complete).await?;
 
@@ -501,11 +513,7 @@ impl<C: Connection + 'static> FileTransfer<C> {
                     let mut buf = vec![0u8; BLOCK_SIZE];
                     let mut offset = 0u64;
 
-                    let report_interval = if size > 0 {
-                        (size / 20).max(1)
-                    } else {
-                        0
-                    };
+                    let report_interval = if size > 0 { (size / 20).max(1) } else { 0 };
                     let mut next_report = report_interval;
 
                     if size > 0 {
@@ -592,6 +600,11 @@ impl<C: Connection + 'static> FileTransfer<C> {
             options: options.clone(),
             chunk: None,
             client_blocks: local_blocks.clone(),
+            source_mtime: None,
+            source_mtime_nsec: None,
+            source_atime: None,
+            source_atime_nsec: None,
+            source_size: None,
         });
         stream.send(&request).await?;
 
@@ -803,6 +816,7 @@ impl<C: Connection + 'static> FileTransfer<C> {
             bytes: bytes_received,
             duration_secs: duration,
             delta_used,
+            skipped: false,
         })
     }
 
@@ -821,10 +835,28 @@ impl<C: Connection + 'static> FileTransfer<C> {
         })?;
         let file_size = metadata.len();
 
+        // Get the local file's mtime and atime to preserve on the server
+        let (source_mtime, source_mtime_nsec) = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| (Some(d.as_secs()), Some(d.subsec_nanos())))
+            .unwrap_or((None, None));
+
+        let (source_atime, source_atime_nsec) = metadata
+            .accessed()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| (Some(d.as_secs()), Some(d.subsec_nanos())))
+            .unwrap_or((None, None));
+
         debug!(
             transfer_id,
             local = %local_path.display(),
             remote = %remote_path,
+            source_mtime = ?source_mtime,
+            source_mtime_nsec = ?source_mtime_nsec,
+            source_atime = ?source_atime,
             "Starting upload"
         );
 
@@ -843,6 +875,11 @@ impl<C: Connection + 'static> FileTransfer<C> {
             options: options.clone(),
             chunk: None,
             client_blocks: Vec::new(),
+            source_mtime,
+            source_mtime_nsec,
+            source_atime,
+            source_atime_nsec,
+            source_size: Some(file_size),
         });
         stream.send(&request).await?;
 
@@ -865,8 +902,71 @@ impl<C: Connection + 'static> FileTransfer<C> {
             transfer_id,
             remote_size = server_metadata.size,
             remote_blocks = server_metadata.blocks.len(),
+            remote_hash = ?server_metadata.file_hash,
             "Received server metadata for upload"
         );
+
+        // Check for skip_if_unchanged: if enabled and hashes match, skip transfer
+        if options.skip_if_unchanged {
+            if let Some(remote_hash) = server_metadata.file_hash {
+                // Fast pre-check: sizes must match before computing hash.
+                // Note: We don't check mtime because uploaded files will have a different
+                // mtime than the local file (the server creates them with current time).
+                if file_size == server_metadata.size {
+                    info!(
+                        transfer_id,
+                        local_size = file_size,
+                        remote_size = server_metadata.size,
+                        "Size matches, computing local hash for skip_if_unchanged"
+                    );
+
+                    // Compute local file hash
+                    let local_hash = Self::compute_file_hash(local_path, file_size).await?;
+
+                    if local_hash == remote_hash {
+                        info!(
+                            transfer_id,
+                            hash = local_hash,
+                            "File already up to date, skipping transfer"
+                        );
+
+                        // Send AlreadyUpToDate completion
+                        let complete = Message::FileComplete(FileCompletePayload {
+                            transfer_id,
+                            checksum: local_hash,
+                            total_bytes: 0,
+                            status: FileTransferStatus::AlreadyUpToDate,
+                        });
+                        stream.send(&complete).await?;
+
+                        // Wait for server acknowledgment
+                        self.await_upload_complete(&mut stream, transfer_id).await?;
+
+                        let duration = start.elapsed().as_secs_f64();
+                        return Ok(TransferResult {
+                            bytes: 0,
+                            duration_secs: duration,
+                            delta_used: false,
+                            skipped: true,
+                        });
+                    } else {
+                        info!(
+                            transfer_id,
+                            local_hash,
+                            remote_hash,
+                            "Hash mismatch despite same size, proceeding with upload"
+                        );
+                    }
+                } else {
+                    debug!(
+                        transfer_id,
+                        local_size = file_size,
+                        remote_size = server_metadata.size,
+                        "Size mismatch, skipping hash computation"
+                    );
+                }
+            }
+        }
 
         // Set up progress
         let filename = local_path
@@ -879,11 +979,7 @@ impl<C: Connection + 'static> FileTransfer<C> {
         let use_delta = options.delta && !server_metadata.blocks.is_empty();
         let delta_used = use_delta;
 
-        info!(
-            transfer_id,
-            use_delta,
-            "Upload delta decision"
-        );
+        info!(transfer_id, use_delta, "Upload delta decision");
 
         // Send file data
         let _bytes_sent = if use_delta {
@@ -926,7 +1022,75 @@ impl<C: Connection + 'static> FileTransfer<C> {
             bytes: file_size,
             duration_secs: duration,
             delta_used,
+            skipped: false,
         })
+    }
+
+    /// Compute the full file hash (xxHash64) for skip_if_unchanged negotiation.
+    ///
+    /// Uses xxHash64 with streaming to hash the entire file content.
+    async fn compute_file_hash(path: &Path, size: u64) -> Result<u64> {
+        let path = path.to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            let mut file = File::open(&path).map_err(|e| Error::FileTransfer {
+                message: format!("failed to open file for hashing: {}", e),
+            })?;
+
+            let mut hasher = StreamingHasher::new();
+            let mut buf = vec![0u8; FILE_BUFFER_SIZE];
+            let mut offset = 0u64;
+
+            let report_interval = if size > 0 { (size / 20).max(1) } else { 0 };
+            let mut next_report = report_interval;
+
+            if size > 0 {
+                info!(
+                    total_bytes = size,
+                    "Computing file hash for skip_if_unchanged"
+                );
+            }
+
+            loop {
+                let n = file.read(&mut buf).map_err(|e| Error::FileTransfer {
+                    message: format!("failed to read file: {}", e),
+                })?;
+                if n == 0 {
+                    break;
+                }
+
+                hasher.update(&buf[..n]);
+                offset += n as u64;
+
+                if size > 0 && offset >= next_report {
+                    let pct = ((offset as f64 / size as f64) * 100.0).min(100.0);
+                    debug!(
+                        bytes_hashed = offset,
+                        total_bytes = size,
+                        pct = pct as u32,
+                        "File hash computation in progress"
+                    );
+                    next_report = offset.saturating_add(report_interval);
+                }
+            }
+
+            let hash = hasher.finish();
+
+            if size > 0 {
+                debug!(
+                    bytes_hashed = offset,
+                    total_bytes = size,
+                    hash,
+                    "File hash computation complete"
+                );
+            }
+
+            Ok(hash)
+        })
+        .await
+        .map_err(|e| Error::FileTransfer {
+            message: format!("hash task failed: {}", e),
+        })?
     }
 
     /// Wait for server acknowledgment of upload completion.
@@ -1127,6 +1291,7 @@ impl<C: Connection + 'static> FileTransfer<C> {
             bytes: total_bytes,
             duration_secs: duration,
             delta_used,
+            skipped: false,
         })
     }
 
@@ -1180,6 +1345,11 @@ impl<C: Connection + 'static> FileTransfer<C> {
             options: options.clone(),
             chunk: None,
             client_blocks: local_blocks.clone(),
+            source_mtime: None,
+            source_mtime_nsec: None,
+            source_atime: None,
+            source_atime_nsec: None,
+            source_size: None,
         });
         stream.send(&request).await?;
 
@@ -1379,6 +1549,7 @@ impl<C: Connection + 'static> FileTransfer<C> {
             bytes: bytes_received,
             duration_secs: duration,
             delta_used,
+            skipped: false,
         })
     }
 
@@ -1445,6 +1616,7 @@ impl<C: Connection + 'static> FileTransfer<C> {
             bytes: total_bytes,
             duration_secs: duration,
             delta_used,
+            skipped: false,
         })
     }
 }
@@ -1460,8 +1632,10 @@ mod tests {
             bytes: 1000,
             duration_secs: 1.0,
             delta_used: false,
+            skipped: false,
         };
         assert_eq!(result.bytes, 1000);
+        assert!(!result.skipped);
     }
 
     #[test]

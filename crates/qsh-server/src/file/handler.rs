@@ -11,6 +11,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
+use filetime::{self, FileTime};
+
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -18,11 +20,12 @@ use tracing::{debug, error, info, warn};
 use qsh_core::error::{Error, Result};
 use qsh_core::file::{
     BLOCK_SIZE, BlockHasher, Compressor, Decompressor, DeltaEncoder, DeltaOp, DeltaSignature,
-    hash_xxh64,
+    StreamingHasher, hash_xxh64,
 };
 use qsh_core::protocol::{
     BlockChecksum, DataFlags, FileAckPayload, FileCompletePayload, FileDataPayload, FileErrorCode,
-    FileErrorPayload, FileMetadataPayload, FileRequestPayload, Message, TransferDirection,
+    FileErrorPayload, FileMetadataPayload, FileRequestPayload, FileTransferStatus, Message,
+    TransferDirection,
 };
 use qsh_core::transport::{Connection, StreamPair, StreamType};
 
@@ -58,6 +61,15 @@ struct DirEntry {
     size: u64,
     mtime: u64,
     mode: u32,
+}
+
+/// Source file timestamps for upload preservation.
+#[derive(Debug, Clone, Default)]
+struct SourceFileTimes {
+    mtime_secs: Option<u64>,
+    mtime_nsec: Option<u32>,
+    atime_secs: Option<u64>,
+    atime_nsec: Option<u32>,
 }
 
 impl<C: Connection + 'static> FileHandler<C> {
@@ -253,6 +265,7 @@ impl<C: Connection + 'static> FileHandler<C> {
                 mode,
                 blocks: Vec::new(),
                 is_dir: true,
+                file_hash: None,
             });
             stream.send(&metadata_msg).await?;
 
@@ -272,6 +285,7 @@ impl<C: Connection + 'static> FileHandler<C> {
                 transfer_id,
                 checksum,
                 total_bytes: listing_len,
+                status: FileTransferStatus::Normal,
             });
             stream.send(&complete).await?;
             return Ok(());
@@ -309,6 +323,7 @@ impl<C: Connection + 'static> FileHandler<C> {
         };
 
         // Send metadata
+        // Note: file_hash is not computed for downloads (skip_if_unchanged is upload-only)
         let metadata_msg = Message::FileMetadata(FileMetadataPayload {
             transfer_id,
             size: file_size,
@@ -316,6 +331,7 @@ impl<C: Connection + 'static> FileHandler<C> {
             mode,
             blocks,
             is_dir: false,
+            file_hash: None,
         });
         stream.send(&metadata_msg).await?;
 
@@ -379,6 +395,76 @@ impl<C: Connection + 'static> FileHandler<C> {
         Ok(())
     }
 
+    /// Compute the full file hash (xxHash64) for skip_if_unchanged negotiation.
+    ///
+    /// Uses xxHash64 with streaming to hash the entire file content.
+    async fn compute_file_hash(&self, transfer_id: u64, path: &Path, size: u64) -> Result<u64> {
+        let path = path.to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            let mut file = File::open(&path).map_err(|e| Error::FileTransfer {
+                message: format!("failed to open file for hashing: {}", e),
+            })?;
+
+            let mut hasher = StreamingHasher::new();
+            let mut buf = vec![0u8; FILE_BUFFER_SIZE];
+            let mut offset = 0u64;
+
+            let report_interval = if size > 0 { (size / 20).max(1) } else { 0 };
+            let mut next_report = report_interval;
+
+            if size > 0 {
+                info!(
+                    transfer_id,
+                    total_bytes = size,
+                    "Computing file hash for skip_if_unchanged"
+                );
+            }
+
+            loop {
+                let n = file.read(&mut buf).map_err(|e| Error::FileTransfer {
+                    message: format!("failed to read file: {}", e),
+                })?;
+                if n == 0 {
+                    break;
+                }
+
+                hasher.update(&buf[..n]);
+                offset += n as u64;
+
+                if size > 0 && offset >= next_report {
+                    let pct = ((offset as f64 / size as f64) * 100.0).min(100.0);
+                    info!(
+                        transfer_id,
+                        bytes_hashed = offset,
+                        total_bytes = size,
+                        pct = pct as u32,
+                        "File hash computation in progress"
+                    );
+                    next_report = offset.saturating_add(report_interval);
+                }
+            }
+
+            let hash = hasher.finish();
+
+            if size > 0 {
+                info!(
+                    transfer_id,
+                    bytes_hashed = offset,
+                    total_bytes = size,
+                    hash,
+                    "File hash computation complete"
+                );
+            }
+
+            Ok(hash)
+        })
+        .await
+        .map_err(|e| Error::FileTransfer {
+            message: format!("hash task failed: {}", e),
+        })?
+    }
+
     /// Compute block checksums for delta transfer.
     async fn compute_block_checksums(
         &self,
@@ -397,11 +483,7 @@ impl<C: Connection + 'static> FileHandler<C> {
             let mut buf = vec![0u8; BLOCK_SIZE];
             let mut offset = 0u64;
 
-            let report_interval = if size > 0 {
-                (size / 20).max(1)
-            } else {
-                0
-            };
+            let report_interval = if size > 0 { (size / 20).max(1) } else { 0 };
             let mut next_report = report_interval;
 
             if size > 0 {
@@ -437,11 +519,7 @@ impl<C: Connection + 'static> FileHandler<C> {
                     let total_slots = 20usize;
                     let filled_slots = filled.min(total_slots);
                     let empty_slots = total_slots.saturating_sub(filled_slots);
-                    let bar = format!(
-                        "[{}{}]",
-                        "#".repeat(filled_slots),
-                        "-".repeat(empty_slots)
-                    );
+                    let bar = format!("[{}{}]", "#".repeat(filled_slots), "-".repeat(empty_slots));
 
                     info!(
                         transfer_id,
@@ -617,6 +695,7 @@ impl<C: Connection + 'static> FileHandler<C> {
             transfer_id,
             checksum: total_hash,
             total_bytes: offset - start,
+            status: FileTransferStatus::Normal,
         });
         stream.send(&complete).await?;
 
@@ -703,6 +782,7 @@ impl<C: Connection + 'static> FileHandler<C> {
             transfer_id,
             checksum: total_hash,
             total_bytes: file_size,
+            status: FileTransferStatus::Normal,
         });
         stream.send(&complete).await?;
 
@@ -822,43 +902,92 @@ impl<C: Connection + 'static> FileHandler<C> {
             }
         }
 
-        // Check if path exists (for delta)
-        let (existing_size, existing_blocks) = if path.exists() && request.options.delta {
-            match fs::metadata(&path) {
-                Ok(m) if m.is_file() => {
-                    let len = m.len();
-                    match self
-                        .compute_block_checksums(transfer_id, &path, len)
-                        .await
-                    {
-                        Ok(blocks) => (len, blocks),
-                        Err(e) => {
-                            warn!(transfer_id, error = %e, "Failed to compute existing file checksums for upload");
-                            let _ = Self::send_transfer_error(
-                                transfer_id,
-                                FileErrorCode::IoError,
-                                format!("failed to read existing file for delta: {}", e),
-                                &mut stream,
-                            )
-                            .await;
-                            return Ok(());
-                        }
-                    }
-                }
-                _ => (0, Vec::new()),
-            }
+        // Get existing file metadata
+        let existing_metadata = if path.exists() {
+            fs::metadata(&path).ok().filter(|m| m.is_file())
         } else {
-            (0, Vec::new())
+            None
         };
 
-        // Send metadata (with block checksums for delta)
+        // Get existing file size and mtime
+        let (existing_size, existing_mtime, existing_mode) = if let Some(ref m) = existing_metadata
+        {
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            (m.len(), mtime, m.mode())
+        } else {
+            (0, 0, 0o644)
+        };
+
+        // Compute file hash for skip_if_unchanged FIRST if enabled and file exists.
+        // This is prioritized because if hashes match, the transfer will be skipped entirely
+        // and we don't need delta checksums at all.
+        let file_hash = if existing_metadata.is_some() && request.options.skip_if_unchanged {
+            match self
+                .compute_file_hash(transfer_id, &path, existing_size)
+                .await
+            {
+                Ok(hash) => Some(hash),
+                Err(e) => {
+                    // Log warning but continue without hash (fall back to normal transfer)
+                    warn!(transfer_id, error = %e, "Failed to compute file hash, proceeding without skip_if_unchanged");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Check if we can skip delta computation: if skip_if_unchanged is enabled,
+        // file hash was computed, and sizes match, the client will likely skip the transfer.
+        let sizes_match = request.source_size == Some(existing_size);
+        let skip_likely = file_hash.is_some() && sizes_match;
+
+        // Compute block checksums for delta if enabled, but skip if transfer will likely be skipped.
+        let existing_blocks = if existing_metadata.is_some() && request.options.delta && !skip_likely
+        {
+            match self
+                .compute_block_checksums(transfer_id, &path, existing_size)
+                .await
+            {
+                Ok(blocks) => blocks,
+                Err(e) => {
+                    warn!(transfer_id, error = %e, "Failed to compute existing file checksums for upload");
+                    let _ = Self::send_transfer_error(
+                        transfer_id,
+                        FileErrorCode::IoError,
+                        format!("failed to read existing file for delta: {}", e),
+                        &mut stream,
+                    )
+                    .await;
+                    return Ok(());
+                }
+            }
+        } else {
+            if skip_likely && request.options.delta {
+                debug!(
+                    transfer_id,
+                    existing_size,
+                    source_size = ?request.source_size,
+                    "Skipping delta checksum computation - sizes match, skip_if_unchanged likely"
+                );
+            }
+            Vec::new()
+        };
+
+        // Send metadata (with block checksums for delta and file_hash for skip_if_unchanged)
         let metadata_msg = Message::FileMetadata(FileMetadataPayload {
             transfer_id,
             size: existing_size,
-            mtime: 0,
-            mode: 0o644,
+            mtime: existing_mtime,
+            mode: existing_mode,
             blocks: existing_blocks,
             is_dir: false,
+            file_hash,
         });
         stream.send(&metadata_msg).await?;
 
@@ -879,9 +1008,17 @@ impl<C: Connection + 'static> FileHandler<C> {
         // Spawn receiver task
         let active_transfers = Arc::clone(&self.active_transfers);
         let decompress = request.options.compress;
+        let source_times = SourceFileTimes {
+            mtime_secs: request.source_mtime,
+            mtime_nsec: request.source_mtime_nsec,
+            atime_secs: request.source_atime,
+            atime_nsec: request.source_atime_nsec,
+        };
 
         tokio::spawn(async move {
-            if let Err(e) = Self::receive_file(transfer_id, path, decompress, stream).await {
+            if let Err(e) =
+                Self::receive_file(transfer_id, path, decompress, source_times, stream).await
+            {
                 error!(transfer_id, error = %e, "File receive failed");
             }
 
@@ -897,6 +1034,7 @@ impl<C: Connection + 'static> FileHandler<C> {
         transfer_id: u64,
         path: PathBuf,
         decompress: bool,
+        source_times: SourceFileTimes,
         mut stream: impl StreamPair,
     ) -> Result<()> {
         let decompressor = if decompress {
@@ -1009,7 +1147,36 @@ impl<C: Connection + 'static> FileHandler<C> {
                     saw_final_block |= data.flags.final_block;
                 }
                 Ok(Message::FileComplete(complete)) if complete.transfer_id == transfer_id => {
-                    // Verify checksum
+                    // Handle AlreadyUpToDate status - file was identical, no data sent
+                    if complete.status == FileTransferStatus::AlreadyUpToDate {
+                        info!(
+                            transfer_id,
+                            checksum = complete.checksum,
+                            "File already up to date, skipping transfer"
+                        );
+
+                        // Clean up temporary file
+                        drop(file);
+                        let _ = fs::remove_file(&temp_path);
+
+                        // Send completion acknowledgment back to client
+                        let ack = Message::FileComplete(FileCompletePayload {
+                            transfer_id,
+                            checksum: complete.checksum,
+                            total_bytes: 0,
+                            status: FileTransferStatus::AlreadyUpToDate,
+                        });
+                        stream.send(&ack).await?;
+
+                        info!(
+                            transfer_id,
+                            path = %path.display(),
+                            "Upload skipped - file already up to date"
+                        );
+                        return Ok(());
+                    }
+
+                    // Normal completion - verify checksum
                     if complete.checksum != total_hash {
                         warn!(
                             transfer_id,
@@ -1118,11 +1285,50 @@ impl<C: Connection + 'static> FileHandler<C> {
             return Err(err);
         }
 
+        // Apply the source file's timestamps if provided
+        let mtime = source_times.mtime_secs.map(|secs| {
+            FileTime::from_unix_time(secs as i64, source_times.mtime_nsec.unwrap_or(0))
+        });
+        let atime = source_times.atime_secs.map(|secs| {
+            FileTime::from_unix_time(secs as i64, source_times.atime_nsec.unwrap_or(0))
+        });
+
+        if mtime.is_some() || atime.is_some() {
+            // If only one is provided, use current time for the other
+            let current = FileTime::now();
+            let final_atime = atime.unwrap_or(current);
+            let final_mtime = mtime.unwrap_or(current);
+
+            if let Err(e) = filetime::set_file_times(&path, final_atime, final_mtime) {
+                warn!(
+                    transfer_id,
+                    error = %e,
+                    mtime_secs = ?source_times.mtime_secs,
+                    mtime_nsec = ?source_times.mtime_nsec,
+                    atime_secs = ?source_times.atime_secs,
+                    path = %path.display(),
+                    "Failed to set file times"
+                );
+                // Non-fatal: file was uploaded successfully, just times weren't preserved
+            } else {
+                debug!(
+                    transfer_id,
+                    mtime_secs = ?source_times.mtime_secs,
+                    mtime_nsec = ?source_times.mtime_nsec,
+                    atime_secs = ?source_times.atime_secs,
+                    atime_nsec = ?source_times.atime_nsec,
+                    path = %path.display(),
+                    "Set file times from source"
+                );
+            }
+        }
+
         // Notify client of successful upload
         let complete = Message::FileComplete(FileCompletePayload {
             transfer_id,
             checksum: total_hash,
             total_bytes: bytes_received,
+            status: FileTransferStatus::Normal,
         });
         if let Err(e) = stream.send(&complete).await {
             warn!(

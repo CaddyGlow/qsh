@@ -2,7 +2,7 @@
 //!
 //! Uses Adler-32 for weak (rolling) checksum and xxHash64 for strong checksum.
 
-use xxhash_rust::xxh64::xxh64;
+use xxhash_rust::xxh64::{Xxh64, xxh64};
 
 use super::BLOCK_SIZE;
 use crate::protocol::BlockChecksum;
@@ -176,6 +176,45 @@ pub fn hash_xxh64(data: &[u8]) -> u64 {
     xxh64(data, 0)
 }
 
+/// Streaming xxHash64 hasher for large file hashing.
+///
+/// This wraps the xxhash_rust Xxh64 type to provide a streaming
+/// hash computation interface.
+#[derive(Clone)]
+pub struct StreamingHasher {
+    inner: Xxh64,
+}
+
+impl StreamingHasher {
+    /// Create a new streaming hasher.
+    pub fn new() -> Self {
+        Self {
+            inner: Xxh64::new(0),
+        }
+    }
+
+    /// Update the hash with more data.
+    pub fn update(&mut self, data: &[u8]) {
+        self.inner.update(data);
+    }
+
+    /// Finalize and return the hash value.
+    pub fn finish(self) -> u64 {
+        self.inner.digest()
+    }
+
+    /// Reset the hasher to compute a new hash.
+    pub fn reset(&mut self) {
+        self.inner.reset(0);
+    }
+}
+
+impl Default for StreamingHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,5 +336,46 @@ mod tests {
                 start, window
             );
         }
+    }
+
+    #[test]
+    fn test_streaming_hasher_matches_direct() {
+        let data = b"the quick brown fox jumps over the lazy dog";
+
+        // Direct hash
+        let direct = hash_xxh64(data);
+
+        // Streaming hash (single update)
+        let mut hasher = StreamingHasher::new();
+        hasher.update(data);
+        let streaming1 = hasher.finish();
+
+        assert_eq!(direct, streaming1);
+
+        // Streaming hash (multiple updates)
+        let mut hasher2 = StreamingHasher::new();
+        for chunk in data.chunks(10) {
+            hasher2.update(chunk);
+        }
+        let streaming2 = hasher2.finish();
+
+        assert_eq!(direct, streaming2);
+    }
+
+    #[test]
+    fn test_streaming_hasher_reset() {
+        let mut hasher = StreamingHasher::new();
+
+        hasher.update(b"hello");
+        hasher.reset();
+        hasher.update(b"world");
+
+        let hash1 = hasher.finish();
+
+        let mut hasher2 = StreamingHasher::new();
+        hasher2.update(b"world");
+        let hash2 = hasher2.finish();
+
+        assert_eq!(hash1, hash2);
     }
 }

@@ -393,6 +393,10 @@ pub struct CpCli {
     #[arg(long = "resume")]
     pub resume: bool,
 
+    /// Skip transfer if file is already up to date (size + mtime + hash match)
+    #[arg(long = "skip-if-unchanged", short = 'u')]
+    pub skip_if_unchanged: bool,
+
     /// Number of parallel transfers
     #[arg(short = 'j', long = "parallel", default_value = "4")]
     pub parallel: usize,
@@ -538,6 +542,7 @@ impl CpCli {
             recursive: self.recursive,
             preserve_mode: self.preserve,
             parallel: self.parallel.max(1),
+            skip_if_unchanged: self.skip_if_unchanged,
         }
     }
 }
@@ -1056,6 +1061,7 @@ mod tests {
         assert!(!cli.no_compress);
         assert!(!cli.resume);
         assert!(!cli.preserve);
+        assert!(!cli.skip_if_unchanged);
         assert!(cli.identity.is_empty());
         assert!(cli.log_file.is_none());
         #[cfg(feature = "standalone")]
@@ -1067,5 +1073,34 @@ mod tests {
             assert!(!cli.accept_unknown_host);
             assert!(!cli.no_agent);
         }
+    }
+
+    #[test]
+    fn cp_skip_if_unchanged_flag() {
+        let cli = CpCli::try_parse_from([
+            "qsh-cp",
+            "--skip-if-unchanged",
+            "/local/file",
+            "host:/remote/file",
+        ])
+        .unwrap();
+        assert!(cli.skip_if_unchanged);
+
+        let cli2 =
+            CpCli::try_parse_from(["qsh-cp", "-u", "/local/file", "host:/remote/file"]).unwrap();
+        assert!(cli2.skip_if_unchanged);
+    }
+
+    #[test]
+    fn cp_skip_if_unchanged_in_options() {
+        let cli = CpCli::try_parse_from([
+            "qsh-cp",
+            "--skip-if-unchanged",
+            "/local/file",
+            "host:/remote/file",
+        ])
+        .unwrap();
+        let opts = cli.transfer_options();
+        assert!(opts.skip_if_unchanged);
     }
 }
