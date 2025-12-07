@@ -83,6 +83,84 @@ impl DeltaSignature {
     }
 }
 
+/// Streaming delta signature: block checksums that can be built incrementally.
+///
+/// Used for `DeltaAlgo::RollingStreaming` where block checksums arrive
+/// while the delta encoder is already processing.
+#[derive(Debug, Clone)]
+pub struct StreamingDeltaSignature {
+    /// Block checksums indexed by weak checksum for fast lookup.
+    blocks: HashMap<u32, Vec<(u64, u64)>>, // weak -> [(offset, strong), ...]
+    /// Block size used.
+    block_size: usize,
+    /// Whether all blocks have been received.
+    complete: bool,
+}
+
+impl StreamingDeltaSignature {
+    /// Create a new empty streaming signature.
+    pub fn new(block_size: usize) -> Self {
+        Self {
+            blocks: HashMap::new(),
+            block_size,
+            complete: false,
+        }
+    }
+
+    /// Add blocks to the signature.
+    pub fn add_blocks(&mut self, checksums: &[BlockChecksum]) {
+        for checksum in checksums {
+            self.blocks
+                .entry(checksum.weak)
+                .or_default()
+                .push((checksum.offset, checksum.strong));
+        }
+    }
+
+    /// Mark the signature as complete (all blocks received).
+    pub fn mark_complete(&mut self) {
+        self.complete = true;
+    }
+
+    /// Check if the signature is complete.
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    /// Check if a weak checksum exists in the signature.
+    pub fn has_weak(&self, weak: u32) -> bool {
+        self.blocks.contains_key(&weak)
+    }
+
+    /// Find a matching block by weak and strong checksums.
+    pub fn find_match(&self, weak: u32, strong: u64) -> Option<u64> {
+        self.blocks.get(&weak).and_then(|candidates| {
+            candidates
+                .iter()
+                .find(|(_, s)| *s == strong)
+                .map(|(offset, _)| *offset)
+        })
+    }
+
+    /// Get the block size.
+    pub fn block_size(&self) -> usize {
+        self.block_size
+    }
+
+    /// Get the number of blocks in the signature.
+    pub fn block_count(&self) -> usize {
+        self.blocks.values().map(|v| v.len()).sum()
+    }
+
+    /// Convert to a regular DeltaSignature (consumes self).
+    pub fn into_delta_signature(self) -> DeltaSignature {
+        DeltaSignature {
+            blocks: self.blocks,
+            block_size: self.block_size,
+        }
+    }
+}
+
 /// Delta encoder: computes delta operations from source signature and new data.
 #[derive(Debug)]
 pub struct DeltaEncoder {

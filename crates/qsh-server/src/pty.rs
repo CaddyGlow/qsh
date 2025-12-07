@@ -40,18 +40,20 @@ pub struct Pty {
 }
 
 impl Pty {
-    /// Spawn a new PTY with the given shell command.
+    /// Spawn a new PTY with the given shell or command.
     ///
     /// # Arguments
     ///
     /// * `cols` - Terminal columns.
     /// * `rows` - Terminal rows.
-    /// * `shell` - Shell path (e.g., "/bin/bash"). If None, uses $SHELL or /bin/sh.
+    /// * `shell` - Shell path override (e.g., "/bin/zsh"). If None, uses $SHELL or /bin/sh.
+    /// * `command` - Command to execute. If Some, runs `$SHELL -c "command"`.
+    ///               If None, spawns an interactive login shell.
     /// * `env` - Additional environment variables to set.
     ///
     /// # Returns
     ///
-    /// A new PTY instance with the shell running.
+    /// A new PTY instance with the shell/command running.
     ///
     /// # Safety
     ///
@@ -62,6 +64,7 @@ impl Pty {
         cols: u16,
         rows: u16,
         shell: Option<&str>,
+        command: Option<&str>,
         env: &[(String, String)],
     ) -> Result<Self> {
         let winsize = Winsize {
@@ -85,7 +88,11 @@ impl Pty {
             .or_else(|| std::env::var("SHELL").ok())
             .unwrap_or_else(|| "/bin/sh".to_string());
 
-        info!(shell = %shell_path, "Spawning shell");
+        if let Some(cmd) = command {
+            info!(shell = %shell_path, command = %cmd, "Spawning command");
+        } else {
+            info!(shell = %shell_path, "Spawning interactive shell");
+        }
 
         // Prepare arguments for execvp
         let shell_cstr = CString::new(shell_path.clone()).map_err(|e| Error::Pty {
@@ -94,8 +101,14 @@ impl Pty {
 
         let mut args = vec![shell_cstr.clone()];
 
-        // Set login shell flag if it's a common shell
-        if shell_path.ends_with("bash") || shell_path.ends_with("zsh") {
+        if let Some(cmd) = command {
+            // Command execution mode: shell -c "command"
+            args.push(CString::new("-c").unwrap());
+            args.push(CString::new(cmd).map_err(|e| Error::Pty {
+                message: format!("invalid command: {}", e),
+            })?);
+        } else if shell_path.ends_with("bash") || shell_path.ends_with("zsh") {
+            // Interactive login shell for common shells
             args.push(CString::new("-l").unwrap());
         }
 
@@ -474,7 +487,7 @@ mod tests {
     #[tokio::test]
     async fn pty_spawn_default_shell() {
         // This test may fail in CI without a proper TTY
-        let result = Pty::spawn(80, 24, Some("/bin/sh"), &[]);
+        let result = Pty::spawn(80, 24, Some("/bin/sh"), None, &[]);
         if let Err(e) = &result {
             eprintln!("PTY spawn failed (may be expected in CI): {}", e);
         }
@@ -485,8 +498,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pty_spawn_with_command() {
+        // This test may fail in CI without a proper TTY
+        let result = Pty::spawn(80, 24, None, Some("echo hello"), &[]);
+        if let Err(e) = &result {
+            eprintln!("PTY spawn with command failed (may be expected in CI): {}", e);
+        }
+        // Clean up if successful
+        if let Ok(pty) = result {
+            // Wait a bit for echo to complete
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let _ = pty.kill();
+        }
+    }
+
+    #[tokio::test]
     async fn pty_size_tracking() {
-        if let Ok(pty) = Pty::spawn(80, 24, Some("/bin/sh"), &[]) {
+        if let Ok(pty) = Pty::spawn(80, 24, Some("/bin/sh"), None, &[]) {
             assert_eq!(pty.size(), (80, 24));
             let _ = pty.resize(120, 40);
             assert_eq!(pty.size(), (120, 40));

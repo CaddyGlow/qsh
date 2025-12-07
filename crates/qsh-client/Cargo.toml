@@ -14,8 +14,8 @@ name = "qsh"
 path = "src/main.rs"
 
 [[bin]]
-name = "qsh-cp"
-path = "src/bin/qsh-cp.rs"
+name = "qscp"
+path = "src/bin/qscp.rs"
 
 [features]
 default = ["compression"]
@@ -42,6 +42,7 @@ shell-escape = { workspace = true }
 shell-words = { workspace = true }
 libc = { workspace = true }
 rand = { workspace = true }
+indicatif = "0.17"
 
 # Standalone mode (optional)
 ssh-key = { workspace = true, optional = true }

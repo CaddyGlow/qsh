@@ -35,6 +35,10 @@ pub use connection::{
 };
 pub use escape::{EscapeCommand, EscapeHandler, EscapeResult, parse_escape_key};
 pub use file::TransferResult;
+pub use forward::{
+    ForwarderHandle, LocalForwarder, ProxyHandle, RemoteForwarder, RemoteForwarderHandle,
+    Socks5Proxy, parse_dynamic_forward, parse_local_forward, parse_remote_forward,
+};
 pub use ssh::{BootstrapHandle, BootstrapMode, SshConfig, bootstrap};
 pub use terminal::{RawModeGuard, StdinReader, StdoutWriter, get_terminal_size, restore_terminal};
 

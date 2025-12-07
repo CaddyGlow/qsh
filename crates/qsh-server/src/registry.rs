@@ -248,10 +248,11 @@ async fn run_connection_gc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qsh_core::constants::DEFAULT_MAX_FORWARDS;
 
     #[test]
     fn connection_registry_config_default() {
         let config = ConnectionConfig::default();
-        assert_eq!(config.max_forwards, 10);
+        assert_eq!(config.max_forwards, DEFAULT_MAX_FORWARDS);
     }
 }

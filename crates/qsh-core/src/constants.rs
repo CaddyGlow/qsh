@@ -117,6 +117,30 @@ pub const DEFAULT_ROWS: u16 = 24;
 /// Default TERM environment variable.
 pub const DEFAULT_TERM: &str = "xterm-256color";
 
+/// Default maximum forwards per connection.
+pub const DEFAULT_MAX_FORWARDS: u16 = 1024;
+
+/// Default maximum concurrent connections.
+pub const DEFAULT_MAX_CONNECTIONS: u32 = 100;
+
+/// Default maximum channels per connection.
+pub const DEFAULT_MAX_CHANNELS: usize = 200;
+
+/// Default maximum terminal channels per connection.
+pub const DEFAULT_MAX_TERMINALS: usize = 10;
+
+/// Default maximum file transfer channels per connection.
+pub const DEFAULT_MAX_FILE_TRANSFERS: usize = 32;
+
+/// Default linger timeout for detached PTYs (seconds).
+pub const DEFAULT_LINGER_TIMEOUT_SECS: u64 = 60;
+
+/// Default idle timeout for channels (seconds).
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
+
+/// Default session linger duration (seconds) - 2 days.
+pub const DEFAULT_SESSION_LINGER_SECS: u64 = 172800;
+
 /// State history depth for incremental diffs.
 pub const STATE_HISTORY_DEPTH: usize = 100;
 

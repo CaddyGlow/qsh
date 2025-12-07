@@ -7,15 +7,14 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
 
 use tokio::sync::{Mutex, mpsc};
-use tracing::{debug, info, warn};
+use tracing::warn;
 
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
-    ChannelData, ChannelId, ChannelPayload, DataFlags, FileDataData, FileTransferMetadata,
-    Message, TerminalInputData, TerminalOutputData,
+    ChannelData, ChannelId, ChannelPayload, DataFlags, FileCompleteData, FileDataData,
+    FileTransferMetadata, FileTransferStatus, Message, TerminalInputData, TerminalOutputData,
 };
 use qsh_core::terminal::TerminalState;
 use qsh_core::transport::{QuicSender, QuicStream, StreamPair};
@@ -275,6 +274,16 @@ impl FileChannel {
 
     /// Send file data chunk.
     pub async fn send_data(&self, offset: u64, data: Vec<u8>) -> Result<()> {
+        self.send_data_with_flags(offset, data, DataFlags::default()).await
+    }
+
+    /// Send file data chunk with custom flags.
+    pub async fn send_data_with_flags(
+        &self,
+        offset: u64,
+        data: Vec<u8>,
+        flags: DataFlags,
+    ) -> Result<()> {
         if self.inner.closed.load(Ordering::SeqCst) {
             return Err(Error::ConnectionClosed);
         }
@@ -285,13 +294,36 @@ impl FileChannel {
             payload: ChannelPayload::FileData(FileDataData {
                 offset,
                 data,
-                flags: DataFlags::default(),
+                flags,
             }),
         });
 
         self.inner.stream.lock().await.send(&msg).await?;
         self.inner.bytes_transferred.fetch_add(len, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Send file transfer completion message.
+    pub async fn send_complete(
+        &self,
+        checksum: u64,
+        total_bytes: u64,
+        status: FileTransferStatus,
+    ) -> Result<()> {
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return Err(Error::ConnectionClosed);
+        }
+
+        let msg = Message::ChannelDataMsg(ChannelData {
+            channel_id: self.inner.channel_id,
+            payload: ChannelPayload::FileComplete(FileCompleteData {
+                checksum,
+                total_bytes,
+                status,
+            }),
+        });
+
+        self.inner.stream.lock().await.send(&msg).await
     }
 
     /// Receive a message from the file channel.
@@ -333,7 +365,8 @@ struct ForwardChannelInner {
     /// Channel ID.
     channel_id: ChannelId,
     /// Bidirectional stream for forwarded data.
-    stream: Mutex<QuicStream>,
+    /// No outer Mutex needed - QuicStream has internal locks for send/recv.
+    stream: QuicStream,
     /// Target host:port for this forward.
     target: (String, u16),
     /// Whether the channel is closed.
@@ -354,7 +387,7 @@ impl ForwardChannel {
     ) -> Self {
         let inner = Arc::new(ForwardChannelInner {
             channel_id,
-            stream: Mutex::new(stream),
+            stream,
             target: (target_host, target_port),
             closed: AtomicBool::new(false),
             bytes_sent: AtomicU64::new(0),
@@ -381,8 +414,7 @@ impl ForwardChannel {
         }
 
         let len = data.len() as u64;
-        let mut stream = self.inner.stream.lock().await;
-        stream.send_raw(data).await?;
+        self.inner.stream.send_raw(data).await?;
         self.inner.bytes_sent.fetch_add(len, Ordering::SeqCst);
         Ok(())
     }
@@ -393,8 +425,7 @@ impl ForwardChannel {
             return Err(Error::ConnectionClosed);
         }
 
-        let mut stream = self.inner.stream.lock().await;
-        let n = stream.recv_raw(buf).await?;
+        let n = self.inner.stream.recv_raw(buf).await?;
         self.inner.bytes_received.fetch_add(n as u64, Ordering::SeqCst);
         Ok(n)
     }

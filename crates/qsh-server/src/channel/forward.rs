@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
@@ -49,24 +49,28 @@ pub struct ForwardChannel {
 struct ForwardChannelInner {
     /// Channel ID.
     channel_id: ChannelId,
-    /// QUIC connection.
+    /// QUIC connection (for server-initiated streams).
+    #[allow(dead_code)]
     quic: Arc<QuicConnection>,
     /// Forward type.
     forward_type: ForwardType,
     /// Target TCP connection (if connected).
     target_stream: Mutex<Option<TcpStream>>,
-    /// QUIC bidirectional stream.
-    quic_stream: Mutex<Option<QuicStream>>,
     /// Whether the channel is closed.
     closed: AtomicBool,
     /// Relay task handle.
     relay_task: Mutex<Option<JoinHandle<()>>>,
     /// Shutdown signal sender.
     shutdown_tx: Mutex<Option<mpsc::Sender<()>>>,
+    /// Channel to send the client's QUIC stream when it arrives.
+    stream_tx: Mutex<Option<oneshot::Sender<QuicStream>>>,
 }
 
 impl ForwardChannel {
     /// Create a new direct TCP/IP forward channel (-L).
+    ///
+    /// For client-initiated channels, we connect to the target but wait for
+    /// the client's QUIC stream to arrive via `handle_incoming_stream`.
     pub async fn new_direct(
         channel_id: ChannelId,
         params: DirectTcpIpParams,
@@ -92,16 +96,8 @@ impl ForwardChannel {
             "Connected to forward target"
         );
 
-        // Open QUIC bidirectional stream
-        let quic_stream = quic
-            .as_ref()
-            .open_stream(StreamType::ChannelBidi(channel_id))
-            .await
-            .map_err(|e| Error::Transport {
-                message: format!("failed to open forward stream: {}", e),
-            })?;
-
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let (stream_tx, stream_rx) = oneshot::channel();
 
         let inner = Arc::new(ForwardChannelInner {
             channel_id,
@@ -111,15 +107,16 @@ impl ForwardChannel {
                 target_port: params.target_port,
             },
             target_stream: Mutex::new(Some(target_stream)),
-            quic_stream: Mutex::new(Some(quic_stream)),
             closed: AtomicBool::new(false),
             relay_task: Mutex::new(None),
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
+            stream_tx: Mutex::new(Some(stream_tx)),
         });
 
-        // Start relay
         let channel = Self { inner };
-        channel.start_relay(shutdown_rx).await;
+
+        // Start relay task that waits for client's stream
+        channel.start_relay_waiting(shutdown_rx, stream_rx).await;
 
         Ok(channel)
     }
@@ -127,10 +124,13 @@ impl ForwardChannel {
     /// Create a new forwarded TCP/IP channel (-R).
     ///
     /// This is called by the server when a connection arrives on a remote forward listener.
+    /// For server-initiated channels, the server opens the QUIC stream and has the incoming
+    /// TCP connection ready.
     pub async fn new_forwarded(
         channel_id: ChannelId,
         params: ForwardedTcpIpParams,
         quic: Arc<QuicConnection>,
+        tcp_stream: TcpStream,
     ) -> Result<Self> {
         debug!(
             channel_id = %channel_id,
@@ -139,9 +139,7 @@ impl ForwardChannel {
             "Creating forwarded-tcpip channel"
         );
 
-        // For forwarded channels, the target connection is established by the client
-        // We just set up the QUIC stream
-
+        // For forwarded channels, we open the QUIC stream since this is server-initiated
         let quic_stream = quic
             .as_ref()
             .open_stream(StreamType::ChannelBidi(channel_id))
@@ -150,7 +148,13 @@ impl ForwardChannel {
                 message: format!("failed to open forward stream: {}", e),
             })?;
 
-        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+        info!(
+            channel_id = %channel_id,
+            bound = %format!("{}:{}", params.bound_host, params.bound_port),
+            "Forwarded channel ready"
+        );
+
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
         let inner = Arc::new(ForwardChannelInner {
             channel_id,
@@ -159,17 +163,45 @@ impl ForwardChannel {
                 bound_host: params.bound_host,
                 bound_port: params.bound_port,
             },
-            target_stream: Mutex::new(None),
-            quic_stream: Mutex::new(Some(quic_stream)),
+            target_stream: Mutex::new(None), // Not used - we have the stream already
             closed: AtomicBool::new(false),
             relay_task: Mutex::new(None),
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
+            stream_tx: Mutex::new(None), // Not needed for server-initiated
         });
 
-        Ok(Self { inner })
+        let channel = Self { inner };
+
+        // Start relay immediately since we have both the TCP stream and QUIC stream
+        channel.start_relay_immediate(tcp_stream, quic_stream, shutdown_rx).await;
+
+        Ok(channel)
+    }
+
+    /// Start the bidirectional relay immediately with both streams ready.
+    ///
+    /// Used for forwarded-tcpip channels where we have both the incoming TCP
+    /// connection and the QUIC stream ready.
+    async fn start_relay_immediate(
+        &self,
+        tcp_stream: TcpStream,
+        quic_stream: QuicStream,
+        shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        let inner = Arc::clone(&self.inner);
+        let channel_id = inner.channel_id;
+
+        let task = tokio::spawn(async move {
+            debug!(channel_id = %channel_id, "Starting forwarded relay");
+            Self::run_relay(channel_id, tcp_stream, quic_stream, shutdown_rx).await;
+        });
+
+        *self.inner.relay_task.lock().await = Some(task);
     }
 
     /// Create a new dynamic SOCKS5 forward channel (-D).
+    ///
+    /// Same as direct-tcpip: wait for client's QUIC stream.
     pub async fn new_dynamic(
         channel_id: ChannelId,
         params: DynamicForwardParams,
@@ -189,15 +221,14 @@ impl ForwardChannel {
                 message: format!("failed to connect to {}: {}", target, e),
             })?;
 
-        let quic_stream = quic
-            .as_ref()
-            .open_stream(StreamType::ChannelBidi(channel_id))
-            .await
-            .map_err(|e| Error::Transport {
-                message: format!("failed to open forward stream: {}", e),
-            })?;
+        info!(
+            channel_id = %channel_id,
+            target = %target,
+            "Connected to dynamic forward target"
+        );
 
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let (stream_tx, stream_rx) = oneshot::channel();
 
         let inner = Arc::new(ForwardChannelInner {
             channel_id,
@@ -207,47 +238,84 @@ impl ForwardChannel {
                 target_port: params.target_port,
             },
             target_stream: Mutex::new(Some(target_stream)),
-            quic_stream: Mutex::new(Some(quic_stream)),
             closed: AtomicBool::new(false),
             relay_task: Mutex::new(None),
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
+            stream_tx: Mutex::new(Some(stream_tx)),
         });
 
         let channel = Self { inner };
-        channel.start_relay(shutdown_rx).await;
+
+        // Start relay task that waits for client's stream
+        channel.start_relay_waiting(shutdown_rx, stream_rx).await;
 
         Ok(channel)
     }
 
-    /// Start the bidirectional relay.
-    async fn start_relay(&self, mut shutdown_rx: mpsc::Receiver<()>) {
+    /// Start the bidirectional relay, waiting for the client's QUIC stream first.
+    async fn start_relay_waiting(
+        &self,
+        mut shutdown_rx: mpsc::Receiver<()>,
+        stream_rx: oneshot::Receiver<QuicStream>,
+    ) {
         let inner = Arc::clone(&self.inner);
 
         let task = tokio::spawn(async move {
             let channel_id = inner.channel_id;
 
-            // Take ownership of the streams
-            let target_stream = inner.target_stream.lock().await.take();
-            let quic_stream = inner.quic_stream.lock().await.take();
+            // Wait for the client's QUIC stream to arrive
+            debug!(channel_id = %channel_id, "Waiting for client QUIC stream");
 
-            let (target_stream, quic_stream) = match (target_stream, quic_stream) {
-                (Some(t), Some(q)) => (t, q),
-                _ => {
-                    warn!(channel_id = %channel_id, "Missing stream for relay");
+            let quic_stream = tokio::select! {
+                result = stream_rx => {
+                    match result {
+                        Ok(stream) => stream,
+                        Err(_) => {
+                            debug!(channel_id = %channel_id, "Stream channel cancelled");
+                            return;
+                        }
+                    }
+                }
+                _ = shutdown_rx.recv() => {
+                    debug!(channel_id = %channel_id, "Shutdown before stream arrived");
                     return;
                 }
             };
 
-            let (mut target_read, mut target_write) = target_stream.into_split();
-            let (quic_send, quic_recv) = (quic_stream, None::<QuicStream>);
-            let quic_send = Arc::new(Mutex::new(quic_send));
+            debug!(channel_id = %channel_id, "Client QUIC stream received, starting relay");
 
-            // Channel for sending data to QUIC
-            let (to_quic_tx, mut to_quic_rx) = mpsc::channel::<Vec<u8>>(32);
+            // Take ownership of the target stream
+            let target_stream = inner.target_stream.lock().await.take();
 
-            // Task: target -> QUIC
-            let to_quic_tx_clone = to_quic_tx.clone();
-            let target_to_quic = tokio::spawn(async move {
+            let target_stream = match target_stream {
+                Some(t) => t,
+                None => {
+                    warn!(channel_id = %channel_id, "No target stream available");
+                    return;
+                }
+            };
+
+            // Run the bidirectional relay
+            Self::run_relay(channel_id, target_stream, quic_stream, shutdown_rx).await;
+        });
+
+        *self.inner.relay_task.lock().await = Some(task);
+    }
+
+    /// Run the bidirectional relay between target TCP and QUIC stream.
+    async fn run_relay(
+        channel_id: ChannelId,
+        target_stream: TcpStream,
+        mut quic_stream: QuicStream,
+        mut shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        let (mut target_read, mut target_write) = target_stream.into_split();
+
+        // Task: target -> QUIC
+        let quic_sender = quic_stream.sender();
+        let target_to_quic = {
+            let channel_id = channel_id;
+            tokio::spawn(async move {
                 let mut buf = vec![0u8; FORWARD_BUFFER_SIZE];
                 loop {
                     match target_read.read(&mut buf).await {
@@ -256,7 +324,8 @@ impl ForwardChannel {
                             break;
                         }
                         Ok(n) => {
-                            if to_quic_tx_clone.send(buf[..n].to_vec()).await.is_err() {
+                            if let Err(e) = quic_sender.send_raw(&buf[..n]).await {
+                                debug!(channel_id = %channel_id, error = %e, "QUIC send error");
                                 break;
                             }
                         }
@@ -266,46 +335,50 @@ impl ForwardChannel {
                         }
                     }
                 }
-            });
+            })
+        };
 
-            // Task: QUIC send loop
-            let quic_send_clone = Arc::clone(&quic_send);
-            let quic_send_task = tokio::spawn(async move {
-                while let Some(data) = to_quic_rx.recv().await {
-                    let mut stream = quic_send_clone.lock().await;
-                    // Send raw bytes (forwards use raw data, not wrapped messages)
-                    // For channel-based forwards, we use the bidirectional stream directly
-                    if let Err(e) = stream.send_raw(&data).await {
-                        debug!("QUIC send error: {}", e);
-                        break;
+        // Task: QUIC -> target
+        let quic_to_target = {
+            let channel_id = channel_id;
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; FORWARD_BUFFER_SIZE];
+                loop {
+                    match quic_stream.recv_raw(&mut buf).await {
+                        Ok(0) => {
+                            debug!(channel_id = %channel_id, "QUIC EOF");
+                            break;
+                        }
+                        Ok(n) => {
+                            if let Err(e) = target_write.write_all(&buf[..n]).await {
+                                debug!(channel_id = %channel_id, error = %e, "Target write error");
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            debug!(channel_id = %channel_id, error = %e, "QUIC recv error");
+                            break;
+                        }
                     }
                 }
-            });
+                let _ = target_write.shutdown().await;
+            })
+        };
 
-            // Task: QUIC -> target (would need recv_raw on the stream)
-            // For now, this is simplified - full implementation would handle both directions
-
-            // Wait for shutdown or completion
-            tokio::select! {
-                _ = shutdown_rx.recv() => {
-                    debug!(channel_id = %channel_id, "Forward relay shutdown");
-                }
-                _ = target_to_quic => {
-                    debug!(channel_id = %channel_id, "Target->QUIC complete");
-                }
+        // Wait for shutdown or either direction to complete
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                debug!(channel_id = %channel_id, "Forward relay shutdown signal");
             }
+            _ = target_to_quic => {
+                debug!(channel_id = %channel_id, "Target->QUIC complete");
+            }
+            _ = quic_to_target => {
+                debug!(channel_id = %channel_id, "QUIC->Target complete");
+            }
+        }
 
-            // Clean up
-            quic_send_task.abort();
-            let _ = target_write.shutdown().await;
-
-            // Put streams back (in case they need cleanup)
-            drop(quic_recv);
-
-            debug!(channel_id = %channel_id, "Forward relay ended");
-        });
-
-        *self.inner.relay_task.lock().await = Some(task);
+        debug!(channel_id = %channel_id, "Forward relay ended");
     }
 
     /// Get the channel ID.
@@ -319,13 +392,24 @@ impl ForwardChannel {
     }
 
     /// Handle an incoming stream for this channel.
+    ///
+    /// For client-initiated channels (DirectTcpIp, DynamicForward), this is
+    /// where we receive the client's QUIC data stream.
     pub async fn handle_incoming_stream(&self, stream: QuicStream) -> Result<()> {
         if self.inner.closed.load(Ordering::SeqCst) {
             return Err(Error::ConnectionClosed);
         }
 
-        // Store the stream (for forwarded-tcpip channels where client sends data)
-        *self.inner.quic_stream.lock().await = Some(stream);
+        // Send the stream to the waiting relay task
+        if let Some(tx) = self.inner.stream_tx.lock().await.take() {
+            if tx.send(stream).is_err() {
+                warn!(channel_id = %self.inner.channel_id, "Failed to send stream to relay");
+            } else {
+                debug!(channel_id = %self.inner.channel_id, "Delivered client stream to relay");
+            }
+        } else {
+            warn!(channel_id = %self.inner.channel_id, "No stream receiver available");
+        }
 
         Ok(())
     }
@@ -344,11 +428,6 @@ impl ForwardChannel {
         // Cancel relay task
         if let Some(task) = self.inner.relay_task.lock().await.take() {
             task.abort();
-        }
-
-        // Close streams
-        if let Some(mut stream) = self.inner.quic_stream.lock().await.take() {
-            stream.close();
         }
 
         info!(channel_id = %self.inner.channel_id, "Forward channel closed");

@@ -8,9 +8,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use qsh_core::constants::{
+    DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_LINGER_TIMEOUT_SECS, DEFAULT_MAX_CHANNELS,
+    DEFAULT_MAX_FILE_TRANSFERS, DEFAULT_MAX_FORWARDS, DEFAULT_MAX_TERMINALS,
+};
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
     ChannelAcceptData, ChannelAcceptPayload, ChannelClosePayload, ChannelCloseReason, ChannelId,
@@ -49,13 +55,13 @@ pub struct ConnectionConfig {
 impl Default for ConnectionConfig {
     fn default() -> Self {
         Self {
-            max_channels: 100,
-            max_terminals: 10,
-            max_forwards: 10,
-            max_file_transfers: 16,
+            max_channels: DEFAULT_MAX_CHANNELS,
+            max_terminals: DEFAULT_MAX_TERMINALS,
+            max_forwards: DEFAULT_MAX_FORWARDS,
+            max_file_transfers: DEFAULT_MAX_FILE_TRANSFERS,
             allow_remote_forwards: false,
-            linger_timeout: Duration::from_secs(60),
-            idle_timeout: Duration::from_secs(300),
+            linger_timeout: Duration::from_secs(DEFAULT_LINGER_TIMEOUT_SECS),
+            idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
         }
     }
 }
@@ -97,11 +103,11 @@ pub struct ConnectionHandler {
 }
 
 /// Handle for a remote forward listener on the server.
-#[allow(dead_code)]
 struct RemoteForwardListener {
-    bind_host: String,
-    bind_port: u16,
-    shutdown_tx: oneshot::Sender<()>,
+    /// Task running the TCP listener accept loop.
+    listener_task: JoinHandle<()>,
+    /// Send to signal shutdown.
+    shutdown_tx: mpsc::Sender<()>,
 }
 
 impl ConnectionHandler {
@@ -287,9 +293,14 @@ impl ConnectionHandler {
                 }
                 self.open_direct_tcpip_channel(channel_id, params).await
             }
-            ChannelParams::ForwardedTcpIp(params) => {
-                // Server-initiated (from remote forward listener)
-                self.open_forwarded_tcpip_channel(channel_id, params).await
+            ChannelParams::ForwardedTcpIp(_) => {
+                // ForwardedTcpIp is server-initiated, should never come from client
+                self.send_channel_reject(
+                    channel_id,
+                    ChannelRejectCode::UnknownChannelType,
+                    "forwarded-tcpip is server-initiated only",
+                )
+                .await
             }
             ChannelParams::DynamicForward(params) => {
                 if counts.forwards >= self.config.max_forwards as usize {
@@ -539,15 +550,19 @@ impl ConnectionHandler {
         self: &Arc<Self>,
         channel_id: ChannelId,
         params: qsh_core::protocol::ForwardedTcpIpParams,
+        tcp_stream: TcpStream,
     ) -> Result<()> {
         debug!(
             channel_id = %channel_id,
             bound = %format!("{}:{}", params.bound_host, params.bound_port),
+            originator = %format!("{}:{}", params.originator_host, params.originator_port),
             "Opening forwarded-tcpip channel"
         );
 
         // This is server-initiated when a connection arrives on a remote forward
-        match ForwardChannel::new_forwarded(channel_id, params, Arc::clone(&self.quic)).await {
+        match ForwardChannel::new_forwarded(channel_id, params, Arc::clone(&self.quic), tcp_stream)
+            .await
+        {
             Ok(channel) => {
                 {
                     let mut channels = self.channels.write().await;
@@ -620,7 +635,10 @@ impl ConnectionHandler {
     // =========================================================================
 
     /// Handle a GlobalRequest message.
-    pub async fn handle_global_request(&self, payload: GlobalRequestPayload) -> Result<()> {
+    pub async fn handle_global_request(
+        self: &Arc<Self>,
+        payload: GlobalRequestPayload,
+    ) -> Result<()> {
         let request_id = payload.request_id;
         debug!(request_id, request = ?payload.request, "Received GlobalRequest");
 
@@ -640,14 +658,125 @@ impl ConnectionHandler {
                         .await;
                 }
 
-                // TODO: Actually bind the port and track the listener
-                // For now, just acknowledge the request
-                info!(bind_host = %bind_host, bind_port, "Remote forward requested");
+                // Check if we already have a listener for this address
+                {
+                    let listeners = self.remote_forward_listeners.lock().await;
+                    if listeners.contains_key(&(bind_host.clone(), bind_port)) {
+                        return self
+                            .send_global_reply(
+                                request_id,
+                                GlobalReplyResult::Failure {
+                                    message: "forward already exists".to_string(),
+                                },
+                            )
+                            .await;
+                    }
+                }
+
+                // Bind the TCP listener
+                let bind_addr = if bind_host.is_empty() || bind_host == "0.0.0.0" {
+                    format!("0.0.0.0:{}", bind_port)
+                } else if bind_host == "localhost" {
+                    format!("127.0.0.1:{}", bind_port)
+                } else {
+                    format!("{}:{}", bind_host, bind_port)
+                };
+
+                let listener = match TcpListener::bind(&bind_addr).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        warn!(bind_addr = %bind_addr, error = %e, "Failed to bind remote forward");
+                        return self
+                            .send_global_reply(
+                                request_id,
+                                GlobalReplyResult::Failure {
+                                    message: format!("failed to bind: {}", e),
+                                },
+                            )
+                            .await;
+                    }
+                };
+
+                let actual_port = listener.local_addr().map(|a| a.port()).unwrap_or(bind_port);
+                info!(
+                    bind_host = %bind_host,
+                    requested_port = bind_port,
+                    actual_port,
+                    "Remote forward listener bound"
+                );
+
+                // Create shutdown channel and spawn listener task
+                let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+                let handler = Arc::clone(self);
+                let bind_host_clone = bind_host.clone();
+
+                let listener_task = tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = shutdown_rx.recv() => {
+                                debug!(bind_host = %bind_host_clone, port = actual_port, "Remote forward listener shutting down");
+                                break;
+                            }
+                            result = listener.accept() => {
+                                match result {
+                                    Ok((tcp_stream, peer_addr)) => {
+                                        debug!(
+                                            peer = %peer_addr,
+                                            bind_host = %bind_host_clone,
+                                            bind_port = actual_port,
+                                            "Accepted connection on remote forward"
+                                        );
+
+                                        // Allocate a server-side channel ID
+                                        let channel_id = handler.next_channel_id();
+
+                                        let params = qsh_core::protocol::ForwardedTcpIpParams {
+                                            bound_host: bind_host_clone.clone(),
+                                            bound_port: actual_port,
+                                            originator_host: peer_addr.ip().to_string(),
+                                            originator_port: peer_addr.port(),
+                                        };
+
+                                        // Send ChannelOpen to client and set up the forward
+                                        let handler_clone = Arc::clone(&handler);
+                                        tokio::spawn(async move {
+                                            if let Err(e) = handler_clone
+                                                .initiate_forwarded_channel(channel_id, params, tcp_stream)
+                                                .await
+                                            {
+                                                warn!(
+                                                    channel_id = %channel_id,
+                                                    error = %e,
+                                                    "Failed to initiate forwarded channel"
+                                                );
+                                            }
+                                        });
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "Error accepting connection on remote forward");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+
+                // Store the listener handle
+                {
+                    let mut listeners = self.remote_forward_listeners.lock().await;
+                    listeners.insert(
+                        (bind_host, actual_port),
+                        RemoteForwardListener {
+                            listener_task,
+                            shutdown_tx,
+                        },
+                    );
+                }
 
                 self.send_global_reply(
                     request_id,
                     GlobalReplyResult::Success(GlobalReplyData::TcpIpForward {
-                        bound_port: bind_port,
+                        bound_port: actual_port,
                     }),
                 )
                 .await
@@ -657,7 +786,10 @@ impl ConnectionHandler {
                 bind_port,
             } => {
                 let mut listeners = self.remote_forward_listeners.lock().await;
-                if listeners.remove(&(bind_host.clone(), bind_port)).is_some() {
+                if let Some(listener) = listeners.remove(&(bind_host.clone(), bind_port)) {
+                    // Signal shutdown and abort the task
+                    let _ = listener.shutdown_tx.send(()).await;
+                    listener.listener_task.abort();
                     info!(bind_host = %bind_host, bind_port, "Remote forward cancelled");
                     self.send_global_reply(
                         request_id,
@@ -675,6 +807,33 @@ impl ConnectionHandler {
                 }
             }
         }
+    }
+
+    /// Initiate a forwarded-tcpip channel to the client.
+    ///
+    /// This sends ChannelOpen to the client and waits for accept/reject.
+    async fn initiate_forwarded_channel(
+        self: &Arc<Self>,
+        channel_id: ChannelId,
+        params: qsh_core::protocol::ForwardedTcpIpParams,
+        tcp_stream: TcpStream,
+    ) -> Result<()> {
+        // Send ChannelOpen to client
+        let open_payload = ChannelOpenPayload {
+            channel_id,
+            params: ChannelParams::ForwardedTcpIp(params.clone()),
+        };
+
+        {
+            let mut control = self.control.lock().await;
+            control.send(&Message::ChannelOpen(open_payload)).await?;
+        }
+
+        debug!(channel_id = %channel_id, "Sent ChannelOpen for forwarded-tcpip");
+
+        // Now set up the channel (the client will accept/reject)
+        self.open_forwarded_tcpip_channel(channel_id, params, tcp_stream)
+            .await
     }
 
     /// Send a GlobalReply message.
@@ -889,10 +1048,13 @@ mod tests {
     #[test]
     fn test_connection_config_default() {
         let config = ConnectionConfig::default();
-        assert_eq!(config.max_channels, 100);
-        assert_eq!(config.max_terminals, 10);
-        assert_eq!(config.max_forwards, 10);
+        assert_eq!(config.max_channels, DEFAULT_MAX_CHANNELS);
+        assert_eq!(config.max_terminals, DEFAULT_MAX_TERMINALS);
+        assert_eq!(config.max_forwards, DEFAULT_MAX_FORWARDS);
+        assert_eq!(config.max_file_transfers, DEFAULT_MAX_FILE_TRANSFERS);
         assert!(!config.allow_remote_forwards);
+        assert_eq!(config.linger_timeout, Duration::from_secs(DEFAULT_LINGER_TIMEOUT_SECS));
+        assert_eq!(config.idle_timeout, Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS));
     }
 
     #[test]

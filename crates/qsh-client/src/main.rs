@@ -13,8 +13,10 @@ use qsh_client::cli::{OverlayPosition as CliOverlayPosition, SshBootstrapMode};
 use qsh_client::overlay::{ConnectionStatus, OverlayPosition, StatusOverlay};
 use qsh_client::{
     BootstrapMode, ChannelConnection, Cli, ConnectionConfig, EscapeCommand, EscapeHandler,
-    EscapeResult, RawModeGuard, SshConfig, StdinReader, StdoutWriter, TerminalChannel, bootstrap,
-    connect_quic, get_terminal_size, parse_escape_key, restore_terminal,
+    EscapeResult, ForwarderHandle, LocalForwarder, ProxyHandle, RawModeGuard, RemoteForwarder,
+    RemoteForwarderHandle, Socks5Proxy, SshConfig, StdinReader, StdoutWriter, TerminalChannel,
+    bootstrap, connect_quic, get_terminal_size, parse_dynamic_forward, parse_escape_key,
+    parse_local_forward, parse_remote_forward, restore_terminal,
 };
 
 #[cfg(feature = "standalone")]
@@ -163,13 +165,35 @@ async fn run_client_direct(cli: &Cli, host: &str, user: Option<&str>) -> qsh_cor
     let conn = ChannelConnection::from_quic(quic_conn, conn_config).await?;
     info!(rtt = ?conn.rtt(), session_id = ?conn.session_id(), "Connected to server");
 
-    // Open a terminal channel
+    // Open a terminal channel (unless -N forwarding-only mode)
+    if cli.is_forward_only() {
+        info!("Forwarding-only mode (-N), no terminal channel");
+
+        // Wrap connection in Arc for sharing with forwards
+        let conn = std::sync::Arc::new(conn);
+
+        // Start forwards
+        let _forward_handles = start_forwards(cli, &conn).await?;
+
+        // Wait for Ctrl+C
+        info!("Press Ctrl+C to exit");
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(qsh_core::Error::Io)?;
+
+        info!("Shutting down...");
+        conn.shutdown().await?;
+        return Ok(());
+    }
+
     let term_size = get_term_size();
     let terminal_params = qsh_core::protocol::TerminalParams {
         term_size,
         term_type: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
         env: collect_terminal_env(),
-        shell: cli.command_string(),
+        shell: None,
+        command: cli.command_string(),
+        allocate_pty: cli.should_allocate_pty(),
         last_generation: 0,
         last_input_seq: 0,
     };
@@ -257,13 +281,35 @@ async fn run_client_channel_model(
     // Drop the bootstrap handle now that QUIC connection is established
     drop(bootstrap_handle);
 
-    // Open a terminal channel
+    // Open a terminal channel (unless -N forwarding-only mode)
+    if cli.is_forward_only() {
+        info!("Forwarding-only mode (-N), no terminal channel");
+
+        // Wrap connection in Arc for sharing with forwards
+        let conn = std::sync::Arc::new(conn);
+
+        // Start forwards
+        let _forward_handles = start_forwards(cli, &conn).await?;
+
+        // Wait for Ctrl+C
+        info!("Press Ctrl+C to exit");
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(qsh_core::Error::Io)?;
+
+        info!("Shutting down...");
+        conn.shutdown().await?;
+        return Ok(());
+    }
+
     let term_size = get_term_size();
     let terminal_params = qsh_core::protocol::TerminalParams {
         term_size,
         term_type: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
         env: collect_terminal_env(),
-        shell: cli.command_string(),
+        shell: None,
+        command: cli.command_string(),
+        allocate_pty: cli.should_allocate_pty(),
         last_generation: 0,
         last_input_seq: 0,
     };
@@ -375,6 +421,126 @@ fn parse_toggle_key(spec: &str) -> Option<u8> {
     }
 }
 
+/// Forward handles for all active forwards.
+pub struct ForwardHandles {
+    pub local: Vec<ForwarderHandle>,
+    pub socks: Vec<ProxyHandle>,
+    pub remote: Vec<RemoteForwarderHandle>,
+}
+
+/// Start all forwards specified in CLI.
+///
+/// Returns handles that keep the forwards running. Drop them to stop.
+async fn start_forwards(
+    cli: &Cli,
+    conn: &std::sync::Arc<ChannelConnection>,
+) -> qsh_core::Result<ForwardHandles> {
+    let mut local_handles = Vec::new();
+    let mut socks_handles = Vec::new();
+    let mut remote_handles = Vec::new();
+
+    // Start local forwards (-L)
+    for spec in &cli.local_forward {
+        match parse_local_forward(spec) {
+            Ok((bind_addr, target_host, target_port)) => {
+                info!(
+                    bind = %bind_addr,
+                    target = %format!("{}:{}", target_host, target_port),
+                    "Starting local forward"
+                );
+                let forwarder = LocalForwarder::new(
+                    bind_addr,
+                    target_host,
+                    target_port,
+                    std::sync::Arc::clone(conn),
+                );
+                match forwarder.start().await {
+                    Ok(handle) => {
+                        info!(addr = %handle.local_addr(), "Local forward listening");
+                        local_handles.push(handle);
+                    }
+                    Err(e) => {
+                        error!(spec = spec.as_str(), error = %e, "Failed to start local forward");
+                        return Err(e);
+                    }
+                }
+            }
+            Err(e) => {
+                error!(spec = spec.as_str(), error = %e, "Invalid local forward spec");
+                return Err(e);
+            }
+        }
+    }
+
+    // Start dynamic forwards (-D)
+    for spec in &cli.dynamic_forward {
+        match parse_dynamic_forward(spec) {
+            Ok(bind_addr) => {
+                info!(bind = %bind_addr, "Starting SOCKS5 proxy");
+                let proxy = Socks5Proxy::new(bind_addr, std::sync::Arc::clone(conn));
+                match proxy.start().await {
+                    Ok(handle) => {
+                        info!(addr = %handle.local_addr(), "SOCKS5 proxy listening");
+                        socks_handles.push(handle);
+                    }
+                    Err(e) => {
+                        error!(spec = spec.as_str(), error = %e, "Failed to start SOCKS5 proxy");
+                        return Err(e);
+                    }
+                }
+            }
+            Err(e) => {
+                error!(spec = spec.as_str(), error = %e, "Invalid dynamic forward spec");
+                return Err(e);
+            }
+        }
+    }
+
+    // Start remote forwards (-R)
+    for spec in &cli.remote_forward {
+        match parse_remote_forward(spec) {
+            Ok((bind_host, bind_port, target_host, target_port)) => {
+                info!(
+                    bind = %format!("{}:{}", bind_host, bind_port),
+                    target = %format!("{}:{}", target_host, target_port),
+                    "Starting remote forward"
+                );
+                let forwarder = RemoteForwarder::new(
+                    std::sync::Arc::clone(conn),
+                    bind_host,
+                    bind_port,
+                    target_host,
+                    target_port,
+                );
+                match forwarder.start().await {
+                    Ok(handle) => {
+                        info!(
+                            bind_host = %handle.bind_host(),
+                            bound_port = handle.bound_port(),
+                            "Remote forward established on server"
+                        );
+                        remote_handles.push(handle);
+                    }
+                    Err(e) => {
+                        error!(spec = spec.as_str(), error = %e, "Failed to start remote forward");
+                        return Err(e);
+                    }
+                }
+            }
+            Err(e) => {
+                error!(spec = spec.as_str(), error = %e, "Invalid remote forward spec");
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(ForwardHandles {
+        local: local_handles,
+        socks: socks_handles,
+        remote: remote_handles,
+    })
+}
+
 /// Create and configure status overlay from CLI options.
 fn create_status_overlay(cli: &Cli, user_host: Option<String>) -> StatusOverlay {
     let mut overlay = StatusOverlay::new();
@@ -412,6 +578,12 @@ async fn run_channel_session(
         "Server capabilities"
     );
 
+    // Wrap connection in Arc for sharing with forwards
+    let conn = std::sync::Arc::new(conn);
+
+    // Start forwards before entering terminal mode
+    let _forward_handles = start_forwards(cli, &conn).await?;
+
     // Create status overlay
     let mut overlay = create_status_overlay(cli, user_host);
     overlay.set_status(ConnectionStatus::Connected);
@@ -431,16 +603,25 @@ async fn run_channel_session(
     let escape_key = parse_escape_key(&cli.escape_key);
     let mut escape_handler = EscapeHandler::new(escape_key);
 
-    // Enter raw terminal mode
-    let _raw_guard = match RawModeGuard::enter() {
-        Ok(guard) => guard,
-        Err(e) => {
-            warn!(error = %e, "Failed to enter raw mode");
-            return Err(e.into());
-        }
-    };
+    // Determine if we're in interactive mode (PTY allocated)
+    let is_interactive = cli.should_allocate_pty();
 
-    debug!("Entered raw terminal mode (channel model)");
+    // Enter raw terminal mode only for interactive sessions
+    let _raw_guard = if is_interactive {
+        match RawModeGuard::enter() {
+            Ok(guard) => {
+                debug!("Entered raw terminal mode (interactive)");
+                Some(guard)
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to enter raw mode");
+                return Err(e.into());
+            }
+        }
+    } else {
+        debug!("Command mode (non-interactive), skipping raw terminal mode");
+        None
+    };
 
     // Create stdin/stdout handlers
     let mut stdin = StdinReader::new();
@@ -563,7 +744,7 @@ async fn run_channel_session(
 
     // Close the connection
     info!("Shutting down channel model connection...");
-    conn.close().await?;
+    conn.shutdown().await?;
 
     Ok(())
 }

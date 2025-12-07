@@ -7,7 +7,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{ArgAction, Parser, ValueEnum};
-use qsh_core::constants::DEFAULT_QUIC_PORT_RANGE;
+use qsh_core::constants::{
+    DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_FORWARDS, DEFAULT_QUIC_PORT_RANGE,
+    DEFAULT_SESSION_LINGER_SECS,
+};
 
 /// Log output format for CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
@@ -70,11 +73,11 @@ pub struct Cli {
     pub self_signed: bool,
 
     /// Maximum concurrent connections
-    #[arg(long = "max-connections", default_value = "100")]
+    #[arg(long = "max-connections", default_value_t = DEFAULT_MAX_CONNECTIONS)]
     pub max_connections: u32,
 
     /// Maximum forwards per connection (0 = unlimited)
-    #[arg(long = "max-forwards", default_value = "10")]
+    #[arg(long = "max-forwards", default_value_t = DEFAULT_MAX_FORWARDS)]
     pub max_forwards: u16,
 
     /// Allow remote forwards
@@ -130,7 +133,7 @@ pub struct Cli {
     /// Linger duration for detached sessions (seconds).
     #[arg(
         long = "session-linger",
-        default_value = "172800",
+        default_value_t = DEFAULT_SESSION_LINGER_SECS,
         value_name = "SECONDS",
         env = "QSH_SESSION_LINGER_SECS"
     )]
@@ -225,7 +228,7 @@ impl Default for Cli {
             key_file: None,
             self_signed: false,
             max_connections: 100,
-            max_forwards: 10,
+            max_forwards: 1024,
             allow_remote_forwards: false,
             verbose: 0,
             log_file: None,
@@ -273,14 +276,14 @@ mod tests {
         assert_eq!(cli.bind_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(cli.port, 4433);
         assert_eq!(cli.port_range, DEFAULT_QUIC_PORT_RANGE);
-        assert_eq!(cli.max_connections, 100);
-        assert_eq!(cli.max_forwards, 10);
+        assert_eq!(cli.max_connections, DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(cli.max_forwards, DEFAULT_MAX_FORWARDS);
         assert!(!cli.allow_remote_forwards);
         assert_eq!(cli.verbose, 0);
         assert!(!cli.foreground);
         assert!(!cli.compress);
         assert!(!cli.ipv6);
-        assert_eq!(cli.session_linger_secs, 172_800);
+        assert_eq!(cli.session_linger_secs, DEFAULT_SESSION_LINGER_SECS);
     }
 
     #[test]

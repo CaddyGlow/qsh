@@ -74,20 +74,36 @@ pub struct QuicStream {
     recv_buf: Arc<Mutex<BytesMut>>,
 }
 
-/// Map a bidirectional stream ID to StreamType.
-/// In the channel model, only the control stream (ID 0) uses a fixed ID.
-/// Other bidirectional streams are ChannelBidi streams identified by the
-/// channel header sent after opening.
-fn map_bidi_stream_type(stream_id: u64) -> StreamType {
-    if stream_id == 0 {
-        StreamType::Control
-    } else {
-        // For bidirectional streams that aren't control, we need to read
-        // the channel header to determine the channel ID. For now, return
-        // a placeholder that will be resolved after reading the header.
-        // This is handled by the caller reading a ChannelOpen message.
-        StreamType::Control // Will be overridden by caller
+/// Magic byte identifying a channel bidi stream.
+const CHANNEL_BIDI_MAGIC: u8 = 0xC2;
+
+/// Create the 9-byte header for channel bidirectional streams.
+///
+/// Format: [magic (1 byte)] [encoded channel_id (8 bytes LE)]
+fn channel_bidi_header(channel_id: ChannelId) -> [u8; 9] {
+    let mut header = [0u8; 9];
+    header[0] = CHANNEL_BIDI_MAGIC;
+    header[1..9].copy_from_slice(&channel_id.encode().to_le_bytes());
+    header
+}
+
+/// Read and parse a channel bidi stream header.
+///
+/// Returns the ChannelId for this stream.
+async fn read_channel_bidi_header(recv: &mut RecvStream) -> Result<ChannelId> {
+    let mut header = [0u8; 9];
+    recv.read_exact(&mut header).await.map_err(|e| Error::Transport {
+        message: format!("failed to read channel bidi header: {}", e),
+    })?;
+
+    if header[0] != CHANNEL_BIDI_MAGIC {
+        return Err(Error::Protocol {
+            message: format!("invalid channel bidi stream magic: {:#x}", header[0]),
+        });
     }
+
+    let encoded = u64::from_le_bytes(header[1..9].try_into().unwrap());
+    Ok(ChannelId::decode(encoded))
 }
 
 
@@ -159,6 +175,29 @@ impl QuicSender {
         let mut send = send.lock().await;
         send.write_all(&data).await.map_err(|e| Error::Transport {
             message: format!("failed to send message: {}", e),
+        })?;
+        send.flush().await.map_err(|e| Error::Transport {
+            message: format!("failed to flush stream: {}", e),
+        })?;
+        Ok(())
+    }
+
+    /// Send raw bytes without message framing.
+    ///
+    /// Used for forwarding raw TCP data where we don't want the overhead
+    /// of message encoding.
+    pub async fn send_raw(&self, data: &[u8]) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        let Some(send) = &self.send else {
+            return Err(Error::Transport {
+                message: "stream is receive-only".to_string(),
+            });
+        };
+
+        let mut send = send.lock().await;
+        send.write_all(data).await.map_err(|e| Error::Transport {
+            message: format!("failed to send raw data: {}", e),
         })?;
         send.flush().await.map_err(|e| Error::Transport {
             message: format!("failed to flush stream: {}", e),
@@ -262,8 +301,8 @@ impl QuicStream {
     /// Send raw bytes without message framing.
     ///
     /// Used for forwarding raw TCP data where we don't want the overhead
-    /// of message encoding.
-    pub async fn send_raw(&mut self, data: &[u8]) -> Result<()> {
+    /// of message encoding. Takes `&self` to allow concurrent send/recv.
+    pub async fn send_raw(&self, data: &[u8]) -> Result<()> {
         use tokio::io::AsyncWriteExt;
 
         let Some(send) = &self.send else {
@@ -285,8 +324,8 @@ impl QuicStream {
     /// Receive raw bytes without message framing.
     ///
     /// Used for forwarding raw TCP data. Returns the number of bytes read,
-    /// or 0 if the stream has ended.
-    pub async fn recv_raw(&mut self, buf: &mut [u8]) -> Result<usize> {
+    /// or 0 if the stream has ended. Takes `&self` to allow concurrent send/recv.
+    pub async fn recv_raw(&self, buf: &mut [u8]) -> Result<usize> {
         let Some(recv) = &self.recv else {
             return Err(Error::Transport {
                 message: "stream is send-only".to_string(),
@@ -352,17 +391,33 @@ impl Connection for QuicConnection {
 
     async fn open_stream(&self, stream_type: StreamType) -> Result<Self::Stream> {
         match stream_type {
-            StreamType::Control | StreamType::ChannelBidi(_) => {
+            StreamType::Control => {
+                // Control stream: no header needed (first bidi stream)
                 let (send, recv) = self.inner.open_bi().await.map_err(|e| Error::Transport {
-                    message: format!("failed to open bidirectional stream: {}", e),
+                    message: format!("failed to open control stream: {}", e),
+                })?;
+                Ok(QuicStream::new(send, recv))
+            }
+            StreamType::ChannelBidi(channel_id) => {
+                // Channel bidi stream: write header to identify channel
+                let (mut send, recv) = self.inner.open_bi().await.map_err(|e| Error::Transport {
+                    message: format!("failed to open channel bidi stream: {}", e),
+                })?;
+                let header = channel_bidi_header(channel_id);
+                send.write_all(&header).await.map_err(|e| Error::Transport {
+                    message: format!("failed to write channel bidi header: {}", e),
+                })?;
+                // Flush to ensure header is sent immediately
+                send.flush().await.map_err(|e| Error::Transport {
+                    message: format!("failed to flush channel bidi header: {}", e),
                 })?;
                 Ok(QuicStream::new(send, recv))
             }
             StreamType::ChannelIn(channel_id) | StreamType::ChannelOut(channel_id) => {
+                // Unidirectional channel stream: write header
                 let mut send = self.inner.open_uni().await.map_err(|e| Error::Transport {
                     message: format!("failed to open channel stream: {}", e),
                 })?;
-                // Write channel header to identify this stream
                 let header = channel_stream_header(channel_id);
                 send.write_all(&header).await.map_err(|e| Error::Transport {
                     message: format!("failed to write channel header: {}", e),
@@ -375,13 +430,18 @@ impl Connection for QuicConnection {
     async fn accept_stream(&self) -> Result<(StreamType, Self::Stream)> {
         select! {
             bi = self.inner.accept_bi() => {
-                let (send, recv) = bi.map_err(|e| Error::Transport {
+                let (send, mut recv) = bi.map_err(|e| Error::Transport {
                     message: format!("failed to accept stream: {}", e),
                 })?;
-                // Use the full QUIC stream ID (includes initiator + direction bits)
+                // QUIC stream ID 0 is the control stream (no header)
                 let stream_id: u64 = send.id().into();
-                let stream_type = map_bidi_stream_type(stream_id);
-                Ok((stream_type, QuicStream::new(send, recv)))
+                if stream_id == 0 {
+                    Ok((StreamType::Control, QuicStream::new(send, recv)))
+                } else {
+                    // Non-control bidi streams have a channel header
+                    let channel_id = read_channel_bidi_header(&mut recv).await?;
+                    Ok((StreamType::ChannelBidi(channel_id), QuicStream::new(send, recv)))
+                }
             }
             uni = self.inner.accept_uni() => {
                 let mut recv = uni.map_err(|e| Error::Transport {

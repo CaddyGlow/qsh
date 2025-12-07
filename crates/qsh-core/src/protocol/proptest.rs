@@ -109,6 +109,8 @@ prop_compose! {
         term_size in arb_term_size(),
         term_type in "[a-z0-9-]{1,32}",
         env in prop::collection::vec(("[A-Z_]{1,16}", "[a-zA-Z0-9_-]{0,32}"), 0..3),
+        command in prop::option::of("[a-z0-9 -]{1,64}"),
+        allocate_pty in any::<bool>(),
         last_generation in any::<u64>(),
         last_input_seq in any::<u64>(),
     ) -> TerminalParams {
@@ -117,6 +119,8 @@ prop_compose! {
             term_type,
             env: env.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             shell: None,
+            command: command.map(|s| s.to_string()),
+            allocate_pty,
             last_generation,
             last_input_seq,
         }

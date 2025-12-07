@@ -96,14 +96,22 @@ impl TerminalChannel {
         let cols = params.term_size.cols;
         let rows = params.term_size.rows;
 
-        // Spawn PTY
+        // Build environment for the shell/command
         let env: Vec<(String, String)> = params
             .env
             .into_iter()
             .chain(std::iter::once(("TERM".to_string(), params.term_type.clone())))
             .collect();
 
-        let pty = Arc::new(Pty::spawn(cols, rows, params.shell.as_deref(), &env)?);
+        // Spawn PTY with optional command
+        // Note: allocate_pty=false (non-PTY mode) not yet implemented
+        let pty = Arc::new(Pty::spawn(
+            cols,
+            rows,
+            params.shell.as_deref(),
+            params.command.as_deref(),
+            &env,
+        )?);
         let pty_control: Arc<dyn PtyControl> = Arc::new(RealPtyControl { pty: pty.clone() });
 
         // Set up PTY relay
@@ -174,6 +182,21 @@ impl TerminalChannel {
                     }
                 }
             }
+
+            // Mark channel as closed and close the output stream to signal client
+            inner_clone.closed.store(true, Ordering::SeqCst);
+            let mut stream_guard = inner_clone.output_stream.lock().await;
+            if let Some(ref mut stream) = *stream_guard {
+                if let Err(e) = stream.finish().await {
+                    debug!(
+                        channel_id = %inner_clone.channel_id,
+                        error = %e,
+                        "Failed to finish output stream (client may have disconnected)"
+                    );
+                }
+            }
+            *stream_guard = None;
+            info!(channel_id = %inner_clone.channel_id, "Terminal channel closed");
         });
 
         *inner.relay_task.lock().await = Some(relay_task);

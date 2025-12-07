@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
-use qsh_core::constants::SESSION_KEY_LEN;
+use qsh_core::constants::{DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_FORWARDS, SESSION_KEY_LEN};
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
     Capabilities, HelloAckPayload, HelloPayload, Message, SessionId,
@@ -41,11 +41,11 @@ impl Default for SessionConfig {
             capabilities: Capabilities {
                 predictive_echo: true,
                 compression: false,
-                max_forwards: 10,
+                max_forwards: DEFAULT_MAX_FORWARDS,
                 tunnel: false,
             },
-            idle_timeout: Duration::from_secs(300),
-            max_forwards: 10,
+            idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
+            max_forwards: DEFAULT_MAX_FORWARDS,
             allow_remote_forwards: false,
         }
     }
@@ -237,7 +237,7 @@ mod tests {
     fn session_config_default() {
         let config = SessionConfig::default();
         assert!(config.capabilities.predictive_echo);
-        assert_eq!(config.max_forwards, 10);
+        assert_eq!(config.max_forwards, DEFAULT_MAX_FORWARDS);
     }
 
     #[tokio::test]

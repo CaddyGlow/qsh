@@ -334,6 +334,32 @@ impl Cli {
             )
         }
     }
+
+    /// Determine if PTY should be allocated based on flags and command.
+    ///
+    /// Follows SSH semantics:
+    /// - No command + no flags -> PTY (interactive shell)
+    /// - Command + no flags -> no PTY (capture output)
+    /// - `-t` flag -> force PTY (interactive commands like vim)
+    /// - `-T` flag -> no PTY (scripted sessions)
+    /// - `-N` flag -> no PTY, no shell (forwarding only)
+    pub fn should_allocate_pty(&self) -> bool {
+        if self.no_pty || self.disable_pty {
+            // -N or -T: explicitly no PTY
+            return false;
+        }
+        if self.force_pty {
+            // -t: force PTY even with command
+            return true;
+        }
+        // Default: PTY for interactive shell, no PTY for commands
+        self.command.is_empty()
+    }
+
+    /// Check if this is forwarding-only mode (-N with no command).
+    pub fn is_forward_only(&self) -> bool {
+        self.no_pty && self.command.is_empty()
+    }
 }
 
 fn parse_port_range(s: &str) -> Result<(u16, u16), String> {
@@ -358,13 +384,13 @@ fn parse_port_range(s: &str) -> Result<(u16, u16), String> {
 }
 
 // =============================================================================
-// File Transfer CLI (qsh-cp)
+// File Transfer CLI (qscp)
 // =============================================================================
 
-/// File transfer command (qsh cp).
+/// File transfer command (qscp).
 #[derive(Debug, Parser)]
 #[command(
-    name = "qsh-cp",
+    name = "qscp",
     version,
     about = "Copy files to/from remote hosts via qsh"
 )]
@@ -536,9 +562,20 @@ impl CpCli {
 
     /// Build TransferOptions from CLI args.
     pub fn transfer_options(&self) -> qsh_core::protocol::TransferOptions {
+        use qsh_core::protocol::DeltaAlgo;
+
+        // Map deprecated delta flag to delta_algo
+        let delta_algo = if self.no_delta {
+            DeltaAlgo::None
+        } else {
+            // Default to RollingStreaming for best performance
+            DeltaAlgo::RollingStreaming
+        };
+
         qsh_core::protocol::TransferOptions {
             compress: !self.no_compress,
             delta: !self.no_delta,
+            delta_algo,
             recursive: self.recursive,
             preserve_mode: self.preserve,
             parallel: self.parallel.max(1),
@@ -836,6 +873,59 @@ mod tests {
     }
 
     // =========================================================================
+    // PTY Allocation Tests
+    // =========================================================================
+
+    #[test]
+    fn pty_allocation_interactive_shell() {
+        // Interactive shell: PTY allocated
+        let cli = Cli::try_parse_from(["qsh", "example.com"]).unwrap();
+        assert!(cli.should_allocate_pty());
+        assert!(!cli.is_forward_only());
+    }
+
+    #[test]
+    fn pty_allocation_command_no_pty() {
+        // Command without flags: no PTY (SSH semantics)
+        let cli = Cli::try_parse_from(["qsh", "example.com", "ls", "-la"]).unwrap();
+        assert!(!cli.should_allocate_pty());
+        assert!(!cli.is_forward_only());
+    }
+
+    #[test]
+    fn pty_allocation_force_pty_with_command() {
+        // -t flag forces PTY even with command
+        let cli = Cli::try_parse_from(["qsh", "-t", "example.com", "vim", "file.txt"]).unwrap();
+        assert!(cli.should_allocate_pty());
+        assert!(!cli.is_forward_only());
+    }
+
+    #[test]
+    fn pty_allocation_disable_pty() {
+        // -T flag disables PTY for interactive shell
+        let cli = Cli::try_parse_from(["qsh", "-T", "example.com"]).unwrap();
+        assert!(!cli.should_allocate_pty());
+        assert!(!cli.is_forward_only());
+    }
+
+    #[test]
+    fn pty_allocation_forward_only() {
+        // -N flag: no PTY, no shell, forwarding only
+        let cli = Cli::try_parse_from(["qsh", "-N", "example.com"]).unwrap();
+        assert!(!cli.should_allocate_pty());
+        assert!(cli.is_forward_only());
+    }
+
+    #[test]
+    fn pty_allocation_forward_only_with_forward() {
+        // -N with local forward: forwarding only mode
+        let cli =
+            Cli::try_parse_from(["qsh", "-N", "-L", "8080:localhost:80", "example.com"]).unwrap();
+        assert!(!cli.should_allocate_pty());
+        assert!(cli.is_forward_only());
+    }
+
+    // =========================================================================
     // CpCli Tests
     // =========================================================================
 
@@ -937,7 +1027,7 @@ mod tests {
     #[test]
     fn cp_is_upload() {
         let cli =
-            CpCli::try_parse_from(["qsh-cp", "/local/file.txt", "user@host:/remote/file.txt"])
+            CpCli::try_parse_from(["qscp", "/local/file.txt", "user@host:/remote/file.txt"])
                 .unwrap();
         assert!(cli.is_upload());
         assert!(!cli.is_download());
@@ -946,7 +1036,7 @@ mod tests {
     #[test]
     fn cp_is_download() {
         let cli =
-            CpCli::try_parse_from(["qsh-cp", "user@host:/remote/file.txt", "/local/file.txt"])
+            CpCli::try_parse_from(["qscp", "user@host:/remote/file.txt", "/local/file.txt"])
                 .unwrap();
         assert!(cli.is_download());
         assert!(!cli.is_upload());
@@ -955,7 +1045,7 @@ mod tests {
     #[test]
     fn cp_remote_host_upload() {
         let cli = CpCli::try_parse_from([
-            "qsh-cp",
+            "qscp",
             "/local/file.txt",
             "admin@server.example.com:/remote/path",
         ])
@@ -968,7 +1058,7 @@ mod tests {
     #[test]
     fn cp_remote_host_download() {
         let cli =
-            CpCli::try_parse_from(["qsh-cp", "server.example.com:/remote/path", "/local/path"])
+            CpCli::try_parse_from(["qscp", "server.example.com:/remote/path", "/local/path"])
                 .unwrap();
         let (host, user) = cli.remote_host().unwrap();
         assert_eq!(host, "server.example.com");
@@ -977,7 +1067,7 @@ mod tests {
 
     #[test]
     fn cp_transfer_options_defaults() {
-        let cli = CpCli::try_parse_from(["qsh-cp", "/local/file", "host:/remote/file"]).unwrap();
+        let cli = CpCli::try_parse_from(["qscp", "/local/file", "host:/remote/file"]).unwrap();
         let opts = cli.transfer_options();
         assert!(opts.compress);
         assert!(opts.delta);
@@ -989,7 +1079,7 @@ mod tests {
     #[test]
     fn cp_transfer_options_custom() {
         let cli = CpCli::try_parse_from([
-            "qsh-cp",
+            "qscp",
             "-r",
             "-p",
             "--no-delta",
@@ -1008,7 +1098,7 @@ mod tests {
 
     #[test]
     fn cp_parallel_flag() {
-        let cli = CpCli::try_parse_from(["qsh-cp", "-j", "8", "/local/file", "host:/remote/file"])
+        let cli = CpCli::try_parse_from(["qscp", "-j", "8", "/local/file", "host:/remote/file"])
             .unwrap();
         assert_eq!(cli.parallel, 8);
     }
@@ -1016,7 +1106,7 @@ mod tests {
     #[test]
     fn cp_port_flag() {
         let cli =
-            CpCli::try_parse_from(["qsh-cp", "-P", "2222", "/local/file", "host:/remote/file"])
+            CpCli::try_parse_from(["qscp", "-P", "2222", "/local/file", "host:/remote/file"])
                 .unwrap();
         assert_eq!(cli.port, 2222);
     }
@@ -1024,14 +1114,14 @@ mod tests {
     #[test]
     fn cp_verbose_flag() {
         let cli =
-            CpCli::try_parse_from(["qsh-cp", "-vvv", "/local/file", "host:/remote/file"]).unwrap();
+            CpCli::try_parse_from(["qscp", "-vvv", "/local/file", "host:/remote/file"]).unwrap();
         assert_eq!(cli.verbose, 3);
     }
 
     #[test]
     fn cp_identity_files() {
         let cli = CpCli::try_parse_from([
-            "qsh-cp",
+            "qscp",
             "-i",
             "~/.ssh/id_rsa",
             "-i",
@@ -1045,14 +1135,14 @@ mod tests {
 
     #[test]
     fn cp_resume_flag() {
-        let cli = CpCli::try_parse_from(["qsh-cp", "--resume", "/local/file", "host:/remote/file"])
+        let cli = CpCli::try_parse_from(["qscp", "--resume", "/local/file", "host:/remote/file"])
             .unwrap();
         assert!(cli.resume);
     }
 
     #[test]
     fn cp_defaults() {
-        let cli = CpCli::try_parse_from(["qsh-cp", "/local/file", "host:/remote/file"]).unwrap();
+        let cli = CpCli::try_parse_from(["qscp", "/local/file", "host:/remote/file"]).unwrap();
         assert_eq!(cli.port, 22);
         assert_eq!(cli.parallel, 4);
         assert_eq!(cli.verbose, 0);
@@ -1078,7 +1168,7 @@ mod tests {
     #[test]
     fn cp_skip_if_unchanged_flag() {
         let cli = CpCli::try_parse_from([
-            "qsh-cp",
+            "qscp",
             "--skip-if-unchanged",
             "/local/file",
             "host:/remote/file",
@@ -1087,14 +1177,14 @@ mod tests {
         assert!(cli.skip_if_unchanged);
 
         let cli2 =
-            CpCli::try_parse_from(["qsh-cp", "-u", "/local/file", "host:/remote/file"]).unwrap();
+            CpCli::try_parse_from(["qscp", "-u", "/local/file", "host:/remote/file"]).unwrap();
         assert!(cli2.skip_if_unchanged);
     }
 
     #[test]
     fn cp_skip_if_unchanged_in_options() {
         let cli = CpCli::try_parse_from([
-            "qsh-cp",
+            "qscp",
             "--skip-if-unchanged",
             "/local/file",
             "host:/remote/file",

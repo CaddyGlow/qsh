@@ -228,12 +228,25 @@ pub struct TerminalParams {
     pub env: Vec<(String, String)>,
     /// Specific shell to run (None = user's default shell).
     pub shell: Option<String>,
+    /// Command to execute (None = interactive shell).
+    /// When set, the server runs `$SHELL -c "command"` instead of an interactive shell.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Whether to allocate a PTY for this session.
+    /// - true: allocate PTY (interactive shell or `-t` flag)
+    /// - false: use pipes instead (command execution or `-T`/`-N` flags)
+    #[serde(default = "default_allocate_pty")]
+    pub allocate_pty: bool,
     /// For reconnection: last confirmed state generation (0 if new session).
     #[serde(default)]
     pub last_generation: u64,
     /// For reconnection: last confirmed input sequence.
     #[serde(default)]
     pub last_input_seq: u64,
+}
+
+fn default_allocate_pty() -> bool {
+    true
 }
 
 impl Default for TerminalParams {
@@ -243,6 +256,8 @@ impl Default for TerminalParams {
             term_type: "xterm-256color".to_string(),
             env: Vec::new(),
             shell: None,
+            command: None,
+            allocate_pty: true,
             last_generation: 0,
             last_input_seq: 0,
         }
@@ -571,6 +586,8 @@ pub enum ChannelPayload {
     FileAck(FileAckData),
     FileComplete(FileCompleteData),
     FileError(FileErrorData),
+    /// Streaming block checksums for delta sync.
+    FileBlocks(FileBlocksPayload),
 
     // Tunnel payloads (IP packets)
     #[cfg(feature = "tunnel")]
@@ -644,6 +661,18 @@ pub struct FileErrorData {
     pub code: FileErrorCode,
     /// Human-readable error message.
     pub message: String,
+}
+
+/// Streaming block checksums for delta sync.
+///
+/// Used in `DeltaAlgo::RollingStreaming` mode to send block checksums
+/// incrementally as the existing file is scanned.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileBlocksPayload {
+    /// Block checksums (partial signature).
+    pub blocks: Vec<BlockChecksum>,
+    /// True if this is the final chunk of blocks.
+    pub final_chunk: bool,
 }
 
 /// IP tunnel packet.
@@ -1215,13 +1244,39 @@ pub enum TransferDirection {
     Download,
 }
 
+/// Delta transfer algorithm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum DeltaAlgo {
+    /// No delta; send/receive full file (optionally compressed).
+    #[default]
+    None,
+    /// Simple fixed-block hash comparison:
+    /// - Both sides read in fixed-size blocks.
+    /// - Compare per-block hashes; send full blocks that differ.
+    /// - Very streaming-friendly but sensitive to insertions/deletions.
+    SimpleBlock,
+    /// Rsync-style rolling delta with a full precomputed signature:
+    /// - Receiver computes complete BlockChecksum table up front.
+    /// - Sender runs rolling checksum over the new file.
+    RollingClassic,
+    /// Rsync-style rolling delta with streaming signatures:
+    /// - Signatures arrive incrementally via FileBlocks.
+    /// - Sender may start rolling delta before the full signature is known.
+    RollingStreaming,
+}
+
 /// Transfer options.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TransferOptions {
     /// Enable compression.
     pub compress: bool,
     /// Enable delta sync (only send changed blocks).
+    /// Deprecated: use `delta_algo` instead.
+    #[serde(default)]
     pub delta: bool,
+    /// Delta transfer algorithm to use.
+    #[serde(default)]
+    pub delta_algo: DeltaAlgo,
     /// Recursive directory transfer.
     pub recursive: bool,
     /// Preserve file mode/permissions.
@@ -1244,6 +1299,7 @@ impl Default for TransferOptions {
         Self {
             compress: false,
             delta: false,
+            delta_algo: DeltaAlgo::None,
             recursive: false,
             preserve_mode: false,
             parallel: default_parallel_files(),

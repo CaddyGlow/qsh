@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use quinn::{ClientConfig, Endpoint, IdleTimeout, TransportConfig};
 use tracing::{debug, info};
 
+use qsh_core::constants::DEFAULT_MAX_FORWARDS;
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
     Capabilities, HelloPayload, Message, ResizePayload, ShutdownPayload, ShutdownReason, TermSize,
@@ -249,14 +250,27 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 
 use qsh_core::protocol::{
-    ChannelAcceptData, ChannelClosePayload, ChannelCloseReason, ChannelId, ChannelOpenPayload,
-    ChannelParams, ChannelRejectCode, DirectTcpIpParams, DynamicForwardParams,
-    FileTransferParams, GlobalReplyData, GlobalReplyResult, GlobalRequest, GlobalRequestPayload,
-    SessionId, TerminalParams,
+    ChannelAcceptData, ChannelAcceptPayload, ChannelClosePayload, ChannelCloseReason, ChannelId,
+    ChannelOpenPayload, ChannelParams, ChannelRejectCode, ChannelRejectPayload, DirectTcpIpParams,
+    DynamicForwardParams, FileTransferParams, ForwardedTcpIpParams, GlobalReplyData,
+    GlobalReplyResult, GlobalRequest, GlobalRequestPayload, SessionId, TerminalParams,
 };
 use qsh_core::transport::StreamType;
+use tokio::net::TcpStream;
 
 use crate::channel::{FileChannel, ForwardChannel, TerminalChannel};
+
+/// Target for a remote forward.
+///
+/// When the server notifies us of an incoming connection on a remote forward,
+/// we need to know which local target to connect to.
+#[derive(Debug, Clone)]
+pub struct RemoteForwardTarget {
+    /// Local target host to connect to.
+    pub target_host: String,
+    /// Local target port to connect to.
+    pub target_port: u16,
+}
 
 /// Channel-model connection for SSH-style multiplexing.
 ///
@@ -281,6 +295,8 @@ pub struct ChannelConnection {
     pending_global_requests: tokio::sync::Mutex<StdHashMap<u32, tokio::sync::oneshot::Sender<GlobalReplyResult>>>,
     /// Next global request ID.
     next_global_request_id: std::sync::atomic::AtomicU32,
+    /// Remote forward targets: (bind_host, bind_port) -> target info.
+    remote_forwards: RwLock<StdHashMap<(String, u16), RemoteForwardTarget>>,
 }
 
 /// Handle for an active channel (client-side).
@@ -320,7 +336,7 @@ impl ChannelConnection {
             capabilities: Capabilities {
                 predictive_echo: config.predictive_echo,
                 compression: false,
-                max_forwards: 10,
+                max_forwards: DEFAULT_MAX_FORWARDS,
                 tunnel: false,
             },
             resume_session: None,
@@ -358,6 +374,7 @@ impl ChannelConnection {
             next_channel_id: AtomicU64::new(0),
             pending_global_requests: tokio::sync::Mutex::new(StdHashMap::new()),
             next_global_request_id: std::sync::atomic::AtomicU32::new(0),
+            remote_forwards: RwLock::new(StdHashMap::new()),
         })
     }
 
@@ -556,8 +573,17 @@ impl ChannelConnection {
 
     /// Request a remote port forward (-R).
     ///
+    /// - `bind_host`, `bind_port`: Address to bind on the server
+    /// - `target_host`, `target_port`: Local target to connect to when server gets a connection
+    ///
     /// Returns the actual bound port (may differ if 0 was requested).
-    pub async fn request_remote_forward(&self, bind_host: &str, bind_port: u16) -> Result<u16> {
+    pub async fn request_remote_forward(
+        &self,
+        bind_host: &str,
+        bind_port: u16,
+        target_host: &str,
+        target_port: u16,
+    ) -> Result<u16> {
         let request_id = self
             .next_global_request_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -588,16 +614,37 @@ impl ChannelConnection {
 
         match result {
             GlobalReplyResult::Success(GlobalReplyData::TcpIpForward { bound_port: bp }) => {
-                info!(bind_host, bind_port, bound_port = bp, "Remote forward established");
+                // Store the target info so we can connect when the server notifies us
+                self.remote_forwards.write().await.insert(
+                    (bind_host.to_string(), bp),
+                    RemoteForwardTarget {
+                        target_host: target_host.to_string(),
+                        target_port,
+                    },
+                );
+                info!(
+                    bind_host,
+                    bind_port,
+                    bound_port = bp,
+                    target_host,
+                    target_port,
+                    "Remote forward established"
+                );
                 Ok(bp)
             }
             GlobalReplyResult::Success(_) => {
                 // Unexpected reply data type, but treat as success
+                // Still store the target
+                self.remote_forwards.write().await.insert(
+                    (bind_host.to_string(), bind_port),
+                    RemoteForwardTarget {
+                        target_host: target_host.to_string(),
+                        target_port,
+                    },
+                );
                 Ok(bind_port)
             }
-            GlobalReplyResult::Failure { message } => Err(Error::Forward {
-                message,
-            }),
+            GlobalReplyResult::Failure { message } => Err(Error::Forward { message }),
         }
     }
 
@@ -632,12 +679,15 @@ impl ChannelConnection {
 
         match result {
             GlobalReplyResult::Success(_) => {
+                // Remove from our tracking map
+                self.remote_forwards
+                    .write()
+                    .await
+                    .remove(&(bind_host.to_string(), bind_port));
                 info!(bind_host, bind_port, "Remote forward cancelled");
                 Ok(())
             }
-            GlobalReplyResult::Failure { message } => Err(Error::Forward {
-                message,
-            }),
+            GlobalReplyResult::Failure { message } => Err(Error::Forward { message }),
         }
     }
 
@@ -664,6 +714,178 @@ impl ChannelConnection {
 
         info!(?channel_id, "Channel closed");
         Ok(())
+    }
+
+    /// Handle an incoming ChannelOpen::ForwardedTcpIp from the server.
+    ///
+    /// This is called when the server has accepted a connection on a remote forward
+    /// listener and wants us to connect to the local target.
+    pub async fn handle_forwarded_channel_open(
+        &self,
+        channel_id: ChannelId,
+        params: ForwardedTcpIpParams,
+    ) -> Result<()> {
+        debug!(
+            channel_id = %channel_id,
+            bound = %format!("{}:{}", params.bound_host, params.bound_port),
+            originator = %format!("{}:{}", params.originator_host, params.originator_port),
+            "Received forwarded-tcpip channel open"
+        );
+
+        // Look up the target for this remote forward
+        let target = {
+            let forwards = self.remote_forwards.read().await;
+            forwards
+                .get(&(params.bound_host.clone(), params.bound_port))
+                .cloned()
+        };
+
+        let target = match target {
+            Some(t) => t,
+            None => {
+                // Unknown forward - reject
+                debug!(
+                    channel_id = %channel_id,
+                    bound_host = %params.bound_host,
+                    bound_port = params.bound_port,
+                    "No target found for forwarded channel"
+                );
+                self.send_channel_reject(
+                    channel_id,
+                    ChannelRejectCode::AdministrativelyProhibited,
+                    "unknown remote forward",
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        // Connect to local target
+        let target_addr = format!("{}:{}", target.target_host, target.target_port);
+        let tcp_stream = match TcpStream::connect(&target_addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                debug!(
+                    channel_id = %channel_id,
+                    target = %target_addr,
+                    error = %e,
+                    "Failed to connect to local target"
+                );
+                self.send_channel_reject(
+                    channel_id,
+                    ChannelRejectCode::ConnectFailed,
+                    &format!("failed to connect to {}: {}", target_addr, e),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        info!(
+            channel_id = %channel_id,
+            target = %target_addr,
+            "Connected to local target for remote forward"
+        );
+
+        // Send ChannelAccept
+        {
+            let mut control = self.control.lock().await;
+            control
+                .send(&Message::ChannelAccept(ChannelAcceptPayload {
+                    channel_id,
+                    data: ChannelAcceptData::ForwardedTcpIp,
+                }))
+                .await?;
+        }
+
+        // Accept the QUIC stream from server
+        let quic_stream = loop {
+            let (ty, stream) = self.quic.accept_stream().await?;
+            if matches!(ty, StreamType::ChannelBidi(id) if id == channel_id) {
+                break stream;
+            }
+            debug!(?ty, "Ignoring stream while waiting for forwarded channel bidi");
+        };
+
+        // Spawn relay tasks directly - no need for ForwardChannel wrapper
+        Self::spawn_forwarded_relay(channel_id, tcp_stream, quic_stream);
+
+        info!(?channel_id, "Forwarded channel relay started");
+        Ok(())
+    }
+
+    /// Spawn bidirectional relay tasks for a forwarded-tcpip channel.
+    fn spawn_forwarded_relay(channel_id: ChannelId, tcp_stream: TcpStream, mut quic_stream: QuicStream) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
+        let quic_sender = quic_stream.sender();
+
+        // Task: TCP -> QUIC
+        tokio::spawn(async move {
+            const BUFFER_SIZE: usize = 32 * 1024;
+            let mut buf = vec![0u8; BUFFER_SIZE];
+            loop {
+                match tcp_read.read(&mut buf).await {
+                    Ok(0) => {
+                        debug!(channel_id = %channel_id, "TCP EOF (forwarded)");
+                        break;
+                    }
+                    Ok(n) => {
+                        if let Err(e) = quic_sender.send_raw(&buf[..n]).await {
+                            debug!(channel_id = %channel_id, error = %e, "QUIC send error (forwarded)");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        debug!(channel_id = %channel_id, error = %e, "TCP read error (forwarded)");
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Task: QUIC -> TCP
+        tokio::spawn(async move {
+            const BUFFER_SIZE: usize = 32 * 1024;
+            let mut buf = vec![0u8; BUFFER_SIZE];
+            loop {
+                match quic_stream.recv_raw(&mut buf).await {
+                    Ok(0) => {
+                        debug!(channel_id = %channel_id, "QUIC EOF (forwarded)");
+                        break;
+                    }
+                    Ok(n) => {
+                        if let Err(e) = tcp_write.write_all(&buf[..n]).await {
+                            debug!(channel_id = %channel_id, error = %e, "TCP write error (forwarded)");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        debug!(channel_id = %channel_id, error = %e, "QUIC recv error (forwarded)");
+                        break;
+                    }
+                }
+            }
+            let _ = tcp_write.shutdown().await;
+        });
+    }
+
+    /// Send a ChannelReject message.
+    async fn send_channel_reject(
+        &self,
+        channel_id: ChannelId,
+        code: ChannelRejectCode,
+        message: &str,
+    ) -> Result<()> {
+        let mut control = self.control.lock().await;
+        control
+            .send(&Message::ChannelReject(ChannelRejectPayload {
+                channel_id,
+                code,
+                message: message.to_string(),
+            }))
+            .await
     }
 
     /// Wait for ChannelAccept or ChannelReject.
@@ -718,6 +940,11 @@ impl ChannelConnection {
 
     /// Close the connection gracefully.
     pub async fn close(self) -> Result<()> {
+        self.shutdown().await
+    }
+
+    /// Shutdown the connection gracefully (callable on &self or Arc<Self>).
+    pub async fn shutdown(&self) -> Result<()> {
         // Close all channels
         for (id, handle) in self.channels.write().await.drain() {
             match handle {
