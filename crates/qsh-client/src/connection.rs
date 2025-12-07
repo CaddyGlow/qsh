@@ -20,7 +20,7 @@ use qsh_core::protocol::{
     Capabilities, HelloPayload, Message, ResizePayload, ShutdownPayload, ShutdownReason, TermSize,
 };
 use qsh_core::transport::{
-    Connection, QuicConnection, QuicStream, StreamPair, client_crypto_config,
+    Connection, QuicConnection, QuicSender, QuicStream, StreamPair, client_crypto_config,
 };
 
 // ============================================================================
@@ -281,6 +281,8 @@ pub struct ChannelConnection {
     quic: Arc<QuicConnection>,
     /// Control stream for protocol messages.
     control: tokio::sync::Mutex<QuicStream>,
+    /// Control sender (allows sending without holding control lock).
+    control_sender: QuicSender,
     /// Connection configuration.
     config: ConnectionConfig,
     /// Session ID from server.
@@ -364,9 +366,13 @@ impl ChannelConnection {
             "Channel model session established"
         );
 
+        // Extract sender before wrapping in Mutex (allows concurrent send/recv)
+        let control_sender = control.sender();
+
         Ok(Self {
             quic,
             control: tokio::sync::Mutex::new(control),
+            control_sender,
             config,
             session_id: hello_ack.session_id,
             server_caps: hello_ack.capabilities,
@@ -413,11 +419,7 @@ impl ChannelConnection {
             channel_id,
             params: ChannelParams::Terminal(params),
         };
-
-        {
-            let mut control = self.control.lock().await;
-            control.send(&Message::ChannelOpen(open)).await?;
-        }
+        self.send_control(&Message::ChannelOpen(open)).await?;
 
         // Wait for ChannelAccept or ChannelReject
         let (accept_data, _) = self.wait_channel_accept(channel_id).await?;
@@ -465,11 +467,7 @@ impl ChannelConnection {
             channel_id,
             params: ChannelParams::FileTransfer(params),
         };
-
-        {
-            let mut control = self.control.lock().await;
-            control.send(&Message::ChannelOpen(open)).await?;
-        }
+        self.send_control(&Message::ChannelOpen(open)).await?;
 
         // Wait for ChannelAccept or ChannelReject
         let (accept_data, _) = self.wait_channel_accept(channel_id).await?;
@@ -508,11 +506,7 @@ impl ChannelConnection {
             channel_id,
             params: ChannelParams::DirectTcpIp(params),
         };
-
-        {
-            let mut control = self.control.lock().await;
-            control.send(&Message::ChannelOpen(open)).await?;
-        }
+        self.send_control(&Message::ChannelOpen(open)).await?;
 
         // Wait for ChannelAccept or ChannelReject
         self.wait_channel_accept(channel_id).await?;
@@ -546,11 +540,7 @@ impl ChannelConnection {
             channel_id,
             params: ChannelParams::DynamicForward(params),
         };
-
-        {
-            let mut control = self.control.lock().await;
-            control.send(&Message::ChannelOpen(open)).await?;
-        }
+        self.send_control(&Message::ChannelOpen(open)).await?;
 
         // Wait for ChannelAccept
         self.wait_channel_accept(channel_id).await?;
@@ -726,9 +716,7 @@ impl ChannelConnection {
 
         // Send ChannelClose
         let close = ChannelClosePayload { channel_id, reason };
-
-        let mut control = self.control.lock().await;
-        control.send(&Message::ChannelClose(close)).await?;
+        self.send_control(&Message::ChannelClose(close)).await?;
 
         info!(?channel_id, "Channel closed");
         Ok(())
@@ -805,16 +793,12 @@ impl ChannelConnection {
             "Connected to local target for remote forward"
         );
 
-        // Send ChannelAccept
-        {
-            let mut control = self.control.lock().await;
-            control
-                .send(&Message::ChannelAccept(ChannelAcceptPayload {
-                    channel_id,
-                    data: ChannelAcceptData::ForwardedTcpIp,
-                }))
-                .await?;
-        }
+        // Send ChannelAccept (uses sender to avoid deadlock with recv loop)
+        self.send_control(&Message::ChannelAccept(ChannelAcceptPayload {
+            channel_id,
+            data: ChannelAcceptData::ForwardedTcpIp,
+        }))
+        .await?;
 
         // Accept the QUIC stream from server
         let quic_stream = loop {
@@ -833,7 +817,7 @@ impl ChannelConnection {
     }
 
     /// Spawn bidirectional relay tasks for a forwarded-tcpip channel.
-    fn spawn_forwarded_relay(channel_id: ChannelId, tcp_stream: TcpStream, mut quic_stream: QuicStream) {
+    fn spawn_forwarded_relay(channel_id: ChannelId, tcp_stream: TcpStream, quic_stream: QuicStream) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
@@ -860,6 +844,10 @@ impl ChannelConnection {
                         break;
                     }
                 }
+            }
+            // Send FIN to signal EOF to the remote peer
+            if let Err(e) = quic_sender.finish().await {
+                debug!(channel_id = %channel_id, error = %e, "QUIC finish error (forwarded)");
             }
         });
 
@@ -896,14 +884,12 @@ impl ChannelConnection {
         code: ChannelRejectCode,
         message: &str,
     ) -> Result<()> {
-        let mut control = self.control.lock().await;
-        control
-            .send(&Message::ChannelReject(ChannelRejectPayload {
-                channel_id,
-                code,
-                message: message.to_string(),
-            }))
-            .await
+        self.send_control(&Message::ChannelReject(ChannelRejectPayload {
+            channel_id,
+            code,
+            message: message.to_string(),
+        }))
+        .await
     }
 
     /// Wait for ChannelAccept or ChannelReject.
@@ -944,16 +930,19 @@ impl ChannelConnection {
         self.control.lock().await.recv().await
     }
 
+    /// Send a control message (uses sender to avoid blocking recv).
+    pub async fn send_control(&self, msg: &Message) -> Result<()> {
+        self.control_sender.send(msg).await
+    }
+
     /// Send a resize notification for a terminal channel.
     pub async fn send_resize(&self, channel_id: ChannelId, cols: u16, rows: u16) -> Result<()> {
-        let mut control = self.control.lock().await;
-        control
-            .send(&Message::Resize(ResizePayload {
-                channel_id: Some(channel_id),
-                cols,
-                rows,
-            }))
-            .await
+        self.send_control(&Message::Resize(ResizePayload {
+            channel_id: Some(channel_id),
+            cols,
+            rows,
+        }))
+        .await
     }
 
     /// Close the connection gracefully.
@@ -973,16 +962,15 @@ impl ChannelConnection {
             debug!(?id, "Channel marked closed");
         }
 
-        // Send shutdown
-        let mut control = self.control.lock().await;
-        control
-            .send(&Message::Shutdown(ShutdownPayload {
-                reason: ShutdownReason::UserRequested,
-                message: Some("client disconnect".to_string()),
-            }))
-            .await?;
+        // Send shutdown (uses sender to avoid deadlock)
+        self.send_control(&Message::Shutdown(ShutdownPayload {
+            reason: ShutdownReason::UserRequested,
+            message: Some("client disconnect".to_string()),
+        }))
+        .await?;
 
-        control.close();
+        // Close the control stream
+        self.control.lock().await.close();
         Ok(())
     }
 }

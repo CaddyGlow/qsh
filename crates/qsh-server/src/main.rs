@@ -498,6 +498,16 @@ async fn handle_channel_model_session(
                             error!(error = %e, "Failed to handle ChannelClose");
                         }
                     }
+                    Ok(Message::ChannelAccept(payload)) => {
+                        if let Err(e) = handler_clone.handle_channel_accept(payload).await {
+                            error!(error = %e, "Failed to handle ChannelAccept");
+                        }
+                    }
+                    Ok(Message::ChannelReject(payload)) => {
+                        if let Err(e) = handler_clone.handle_channel_reject(payload).await {
+                            error!(error = %e, "Failed to handle ChannelReject");
+                        }
+                    }
                     Ok(Message::GlobalRequest(payload)) => {
                         if let Err(e) = handler_clone.handle_global_request(payload).await {
                             error!(error = %e, "Failed to handle GlobalRequest");

@@ -306,13 +306,14 @@ impl ForwardChannel {
     async fn run_relay(
         channel_id: ChannelId,
         target_stream: TcpStream,
-        mut quic_stream: QuicStream,
+        quic_stream: QuicStream,
         mut shutdown_rx: mpsc::Receiver<()>,
     ) {
         let (mut target_read, mut target_write) = target_stream.into_split();
 
-        // Task: target -> QUIC
+        // Task: target -> QUIC (returns the sender so we can finish it)
         let quic_sender = quic_stream.sender();
+        let quic_sender_for_finish = quic_sender.clone();
         let target_to_quic = {
             let channel_id = channel_id;
             tokio::spawn(async move {
@@ -334,6 +335,10 @@ impl ForwardChannel {
                             break;
                         }
                     }
+                }
+                // Send FIN to signal EOF to the remote peer
+                if let Err(e) = quic_sender.finish().await {
+                    debug!(channel_id = %channel_id, error = %e, "QUIC finish error");
                 }
             })
         };
@@ -369,6 +374,8 @@ impl ForwardChannel {
         tokio::select! {
             _ = shutdown_rx.recv() => {
                 debug!(channel_id = %channel_id, "Forward relay shutdown signal");
+                // Finish the QUIC stream to signal EOF
+                let _ = quic_sender_for_finish.finish().await;
             }
             _ = target_to_quic => {
                 debug!(channel_id = %channel_id, "Target->QUIC complete");

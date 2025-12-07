@@ -18,9 +18,10 @@ use tracing::{debug, error, info, warn};
 use qsh_client::{BootstrapMode, ChannelConnection, CpCli, FileChannel, FilePath, SshConfig, bootstrap};
 use qsh_core::file::checksum::StreamingHasher;
 use qsh_core::file::compress::{Compressor, Decompressor, is_compressed_extension};
+use qsh_core::file::delta::{DeltaEncoder, DeltaOp, DeltaSignature};
 use qsh_core::protocol::{
-    ChannelData, ChannelPayload, DataFlags, FileTransferMetadata, FileTransferStatus, Message,
-    TransferOptions,
+    ChannelData, ChannelPayload, DataFlags, DeltaAlgo, FileTransferMetadata, FileTransferStatus,
+    Message, TransferOptions,
 };
 
 #[cfg(feature = "standalone")]
@@ -30,6 +31,9 @@ use qsh_client::{DirectAuthenticator, DirectConfig, connect_quic};
 
 /// Chunk size for file data (32KB).
 const FILE_CHUNK_SIZE: usize = 32 * 1024;
+
+/// Block size for delta sync (128KB) - must match server.
+const DELTA_BLOCK_SIZE: usize = 128 * 1024;
 
 fn main() {
     let cli = CpCli::parse();
@@ -468,6 +472,25 @@ async fn do_upload(
         }
     }
 
+    // Check if server provided block checksums for delta sync
+    let use_delta = options.delta_algo != DeltaAlgo::None
+        && channel.metadata().map(|m| !m.blocks.is_empty()).unwrap_or(false);
+
+    if use_delta {
+        do_upload_delta(channel, local_path, remote_path, options, file_size).await
+    } else {
+        do_upload_full(channel, local_path, remote_path, options, file_size).await
+    }
+}
+
+/// Upload a file using full transfer (no delta).
+async fn do_upload_full(
+    channel: &FileChannel,
+    local_path: &Path,
+    remote_path: &str,
+    options: &TransferOptions,
+    file_size: u64,
+) -> qsh_core::Result<TransferStats> {
     // Open local file
     let mut file = File::open(local_path).await.map_err(|e| qsh_core::Error::FileTransfer {
         message: format!("failed to open local file: {}", e),
@@ -534,6 +557,142 @@ async fn do_upload(
     let checksum = hasher.finish();
 
     // Wait for server completion
+    wait_for_upload_complete(channel, checksum, offset).await
+}
+
+/// Upload a file using delta encoding.
+async fn do_upload_delta(
+    channel: &FileChannel,
+    local_path: &Path,
+    remote_path: &str,
+    options: &TransferOptions,
+    file_size: u64,
+) -> qsh_core::Result<TransferStats> {
+    let server_meta = channel.metadata().ok_or_else(|| qsh_core::Error::FileTransfer {
+        message: "delta upload requires server metadata".to_string(),
+    })?;
+
+    info!(
+        blocks = server_meta.blocks.len(),
+        "Using delta sync with {} blocks from server",
+        server_meta.blocks.len()
+    );
+
+    // Build delta signature from server blocks
+    let signature = DeltaSignature::new(&server_meta.blocks, DELTA_BLOCK_SIZE);
+
+    // Read local file into memory for delta encoding
+    // TODO: For very large files, implement streaming delta
+    let local_data = fs::read(local_path).await.map_err(|e| qsh_core::Error::FileTransfer {
+        message: format!("failed to read local file: {}", e),
+    })?;
+
+    // Compute delta operations
+    let ops = DeltaEncoder::encode(signature, &local_data);
+
+    // Calculate how much data we'll send
+    let literal_bytes: usize = ops.iter().filter_map(|op| {
+        match op {
+            DeltaOp::Literal { data } => Some(data.len()),
+            _ => None,
+        }
+    }).sum();
+    let copy_count = ops.iter().filter(|op| matches!(op, DeltaOp::Copy { .. })).count();
+
+    info!(
+        ops = ops.len(),
+        literal_bytes = literal_bytes,
+        copy_ops = copy_count,
+        savings = format!("{:.1}%", (1.0 - literal_bytes as f64 / file_size as f64) * 100.0),
+        "Delta computed"
+    );
+
+    // Setup compression if enabled
+    let local_path_str = local_path.to_string_lossy();
+    let use_compression = options.compress && !is_compressed_extension(&local_path_str);
+    let compressor = if use_compression {
+        Some(Compressor::with_default_level())
+    } else {
+        None
+    };
+
+    // Setup progress bar (based on literal bytes we'll send)
+    let pb = create_progress_bar(literal_bytes as u64, remote_path);
+    pb.set_message(format!("{} (delta)", remote_path));
+
+    // Compute checksum of full file (server will verify this)
+    let mut hasher = StreamingHasher::new();
+    hasher.update(&local_data);
+    let checksum = hasher.finish();
+
+    // Send delta operations
+    let mut bytes_sent = 0u64;
+    let mut offset = 0u64;
+
+    for (i, op) in ops.iter().enumerate() {
+        let is_final = i == ops.len() - 1;
+
+        match op {
+            DeltaOp::Copy { source_offset, length } => {
+                // Send a block reference - the server will copy from existing file
+                // Encode block ref as: source_offset (8 bytes) + length (8 bytes)
+                let mut ref_data = Vec::with_capacity(16);
+                ref_data.extend_from_slice(&source_offset.to_le_bytes());
+                ref_data.extend_from_slice(&length.to_le_bytes());
+
+                channel.send_data_with_flags(
+                    offset,
+                    ref_data,
+                    DataFlags {
+                        compressed: false,
+                        final_block: is_final,
+                        block_ref: true,
+                    },
+                ).await?;
+
+                offset += *length;
+            }
+            DeltaOp::Literal { data } => {
+                // Send literal data
+                let (send_data, is_compressed) = if let Some(ref comp) = compressor {
+                    if comp.should_compress(data) {
+                        (comp.compress(data)?, true)
+                    } else {
+                        (data.clone(), false)
+                    }
+                } else {
+                    (data.clone(), false)
+                };
+
+                channel.send_data_with_flags(
+                    offset,
+                    send_data,
+                    DataFlags {
+                        compressed: is_compressed,
+                        final_block: is_final,
+                        block_ref: false,
+                    },
+                ).await?;
+
+                bytes_sent += data.len() as u64;
+                offset += data.len() as u64;
+                pb.set_position(bytes_sent);
+            }
+        }
+    }
+
+    pb.finish_with_message("sent (delta)");
+
+    // Wait for server completion
+    wait_for_upload_complete(channel, checksum, file_size).await
+}
+
+/// Wait for server to confirm upload completion.
+async fn wait_for_upload_complete(
+    channel: &FileChannel,
+    checksum: u64,
+    total_bytes: u64,
+) -> qsh_core::Result<TransferStats> {
     loop {
         let msg = channel.recv().await?;
         match msg {
@@ -549,7 +708,7 @@ async fn do_upload(
                         ),
                     });
                 }
-                return Ok(TransferStats { bytes: offset, skipped: false });
+                return Ok(TransferStats { bytes: total_bytes, skipped: false });
             }
             Message::ChannelDataMsg(ChannelData {
                 payload: ChannelPayload::FileAck(_),

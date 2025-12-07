@@ -25,7 +25,7 @@ use qsh_core::protocol::{
     Message, ResizePayload, SessionId, StateAckPayload,
 };
 use qsh_core::terminal::TerminalState;
-use qsh_core::transport::{Connection, QuicConnection, QuicStream, StreamPair, StreamType};
+use qsh_core::transport::{Connection, QuicConnection, QuicSender, QuicStream, StreamPair, StreamType};
 
 use crate::channel::{ChannelHandle, FileTransferChannel, ForwardChannel, TerminalChannel};
 
@@ -80,8 +80,10 @@ impl Default for ConnectionConfig {
 pub struct ConnectionHandler {
     /// Underlying QUIC connection.
     quic: Arc<QuicConnection>,
-    /// Control stream for lifecycle messages.
+    /// Control stream for lifecycle messages (recv side).
     control: Mutex<QuicStream>,
+    /// Control stream sender (can be used concurrently with recv).
+    control_sender: QuicSender,
     /// Active channels keyed by ChannelId.
     channels: RwLock<HashMap<ChannelId, ChannelHandle>>,
     /// Next server-assigned channel ID.
@@ -94,6 +96,8 @@ pub struct ConnectionHandler {
     pending_global_requests: Mutex<HashMap<u32, oneshot::Sender<GlobalReplyResult>>>,
     /// Next global request ID.
     next_global_request_id: std::sync::atomic::AtomicU32,
+    /// Pending server-initiated channel opens awaiting accept/reject.
+    pending_channel_opens: Mutex<HashMap<ChannelId, oneshot::Sender<Result<()>>>>,
     /// Remote forward listeners (bind_host:bind_port -> listener handle).
     remote_forward_listeners: Mutex<HashMap<(String, u16), RemoteForwardListener>>,
     /// Channel for signaling connection shutdown.
@@ -120,15 +124,20 @@ impl ConnectionHandler {
     ) -> (Arc<Self>, mpsc::Receiver<()>) {
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
+        // Extract sender before wrapping stream - allows concurrent send/recv
+        let control_sender = control.sender();
+
         let handler = Arc::new(Self {
             quic: Arc::new(quic),
             control: Mutex::new(control),
+            control_sender,
             channels: RwLock::new(HashMap::new()),
             next_server_channel_id: std::sync::atomic::AtomicU64::new(0),
             config,
             session_id,
             pending_global_requests: Mutex::new(HashMap::new()),
             next_global_request_id: std::sync::atomic::AtomicU32::new(0),
+            pending_channel_opens: Mutex::new(HashMap::new()),
             remote_forward_listeners: Mutex::new(HashMap::new()),
             shutdown_tx,
             last_activity: Mutex::new(Instant::now()),
@@ -204,7 +213,7 @@ impl ConnectionHandler {
     /// Send a message on the control stream.
     pub async fn send_control(&self, msg: &Message) -> Result<()> {
         self.touch().await;
-        self.control.lock().await.send(msg).await
+        self.control_sender.send(msg).await
     }
 
     /// Receive a message from the control stream.
@@ -356,6 +365,43 @@ impl ConnectionHandler {
                 Ok(())
             }
         }
+    }
+
+    /// Handle a ChannelAccept from the client (for server-initiated channels).
+    pub async fn handle_channel_accept(&self, payload: ChannelAcceptPayload) -> Result<()> {
+        let channel_id = payload.channel_id;
+        debug!(channel_id = %channel_id, "Received ChannelAccept");
+
+        // Notify waiting task
+        if let Some(tx) = self.pending_channel_opens.lock().await.remove(&channel_id) {
+            let _ = tx.send(Ok(()));
+        } else {
+            warn!(channel_id = %channel_id, "ChannelAccept for unknown pending channel");
+        }
+
+        Ok(())
+    }
+
+    /// Handle a ChannelReject from the client (for server-initiated channels).
+    pub async fn handle_channel_reject(&self, payload: ChannelRejectPayload) -> Result<()> {
+        let channel_id = payload.channel_id;
+        debug!(
+            channel_id = %channel_id,
+            code = ?payload.code,
+            message = %payload.message,
+            "Received ChannelReject"
+        );
+
+        // Notify waiting task
+        if let Some(tx) = self.pending_channel_opens.lock().await.remove(&channel_id) {
+            let _ = tx.send(Err(Error::Forward {
+                message: payload.message,
+            }));
+        } else {
+            warn!(channel_id = %channel_id, "ChannelReject for unknown pending channel");
+        }
+
+        Ok(())
     }
 
     /// Handle a Resize message.
@@ -808,40 +854,35 @@ impl ConnectionHandler {
         params: qsh_core::protocol::ForwardedTcpIpParams,
         tcp_stream: TcpStream,
     ) -> Result<()> {
-        // Send ChannelOpen to client
+        // Set up oneshot channel to receive accept/reject notification
+        let (tx, rx) = oneshot::channel();
+        self.pending_channel_opens
+            .lock()
+            .await
+            .insert(channel_id, tx);
+
+        // Send ChannelOpen to client (uses control_sender, doesn't block recv)
         let open_payload = ChannelOpenPayload {
             channel_id,
             params: ChannelParams::ForwardedTcpIp(params.clone()),
         };
+        self.control_sender
+            .send(&Message::ChannelOpen(open_payload))
+            .await?;
+        debug!(channel_id = %channel_id, "Sent ChannelOpen for forwarded-tcpip, waiting for accept");
 
-        // Send ChannelOpen and wait for ChannelAccept within the same lock scope
-        {
-            let mut control = self.control.lock().await;
-            control.send(&Message::ChannelOpen(open_payload)).await?;
-            debug!(channel_id = %channel_id, "Sent ChannelOpen for forwarded-tcpip, waiting for accept");
-
-            // Wait for ChannelAccept from client
-            loop {
-                match control.recv().await? {
-                    Message::ChannelAccept(accept) if accept.channel_id == channel_id => {
-                        debug!(channel_id = %channel_id, "Received ChannelAccept for forwarded-tcpip");
-                        break;
-                    }
-                    Message::ChannelReject(reject) if reject.channel_id == channel_id => {
-                        warn!(
-                            channel_id = %channel_id,
-                            code = ?reject.code,
-                            message = %reject.message,
-                            "Client rejected forwarded channel"
-                        );
-                        return Err(Error::Forward {
-                            message: format!("client rejected: {}", reject.message),
-                        });
-                    }
-                    other => {
-                        debug!(?other, "Ignoring message while waiting for ChannelAccept");
-                    }
-                }
+        // Wait for accept/reject (main loop will dispatch to us)
+        match rx.await {
+            Ok(Ok(())) => {
+                debug!(channel_id = %channel_id, "Received ChannelAccept for forwarded-tcpip");
+            }
+            Ok(Err(e)) => {
+                warn!(channel_id = %channel_id, error = %e, "Client rejected forwarded channel");
+                return Err(e);
+            }
+            Err(_) => {
+                warn!(channel_id = %channel_id, "Channel open cancelled");
+                return Err(Error::ConnectionClosed);
             }
         }
 
@@ -923,6 +964,18 @@ impl ConnectionHandler {
     /// Signal connection shutdown.
     pub async fn shutdown(&self) {
         let _ = self.shutdown_tx.send(()).await;
+
+        // Shutdown all remote forward listeners
+        let listeners: Vec<_> = {
+            let mut guard = self.remote_forward_listeners.lock().await;
+            guard.drain().collect()
+        };
+        for ((host, port), listener) in listeners {
+            debug!(bind_host = %host, bind_port = port, "Shutting down remote forward listener");
+            let _ = listener.shutdown_tx.send(()).await;
+            listener.listener_task.abort();
+        }
+
         self.close_all_channels(ChannelCloseReason::ConnectionClosed)
             .await;
     }

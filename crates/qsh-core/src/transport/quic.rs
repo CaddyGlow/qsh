@@ -204,6 +204,24 @@ impl QuicSender {
         })?;
         Ok(())
     }
+
+    /// Gracefully finish the send side of the stream.
+    ///
+    /// This sends a FIN to signal the remote peer that no more data will
+    /// be sent, causing their recv to return EOF.
+    pub async fn finish(&self) -> Result<()> {
+        let Some(send) = &self.send else {
+            return Err(Error::Transport {
+                message: "stream is receive-only".to_string(),
+            });
+        };
+
+        let mut guard = send.lock().await;
+        guard.finish().map_err(|e| Error::Transport {
+            message: format!("failed to finish stream: {}", e),
+        })?;
+        Ok(())
+    }
 }
 
 impl StreamPair for QuicStream {

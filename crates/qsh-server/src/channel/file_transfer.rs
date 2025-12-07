@@ -12,17 +12,20 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use qsh_core::error::{Error, Result};
-use qsh_core::file::checksum::StreamingHasher;
+use qsh_core::file::checksum::{BlockHasher, StreamingHasher};
 use qsh_core::file::compress::{Compressor, Decompressor, is_compressed_extension};
 use qsh_core::protocol::{
-    ChannelData, ChannelId, ChannelPayload, DataFlags, FileAckData, FileCompleteData,
-    FileDataData, FileErrorCode, FileTransferMetadata, FileTransferParams,
-    FileTransferStatus, Message, TransferDirection,
+    BlockChecksum, ChannelData, ChannelId, ChannelPayload, DataFlags, DeltaAlgo,
+    FileAckData, FileCompleteData, FileDataData, FileErrorCode, FileTransferMetadata,
+    FileTransferParams, FileTransferStatus, Message, TransferDirection,
 };
 use qsh_core::transport::{QuicConnection, QuicStream, StreamPair};
 
 /// Chunk size for file data (32KB).
 const FILE_CHUNK_SIZE: usize = 32 * 1024;
+
+/// Block size for delta sync (128KB).
+const DELTA_BLOCK_SIZE: usize = 128 * 1024;
 
 /// File transfer channel managing upload/download operations.
 #[derive(Clone)]
@@ -66,16 +69,20 @@ impl FileTransferChannel {
         let path = PathBuf::from(&params.path);
 
         // For downloads, pre-fetch file metadata
-        // For uploads, check if existing file exists (for skip-if-unchanged)
+        // For uploads, check if existing file exists (for skip-if-unchanged or delta)
         let metadata = match params.direction {
             TransferDirection::Download => {
                 // Get metadata for the file to send
-                Some(Self::get_file_metadata(&path, params.options.skip_if_unchanged).await?)
+                Some(Self::get_file_metadata(&path, params.options.skip_if_unchanged, DeltaAlgo::None).await?)
             }
             TransferDirection::Upload => {
-                // Get metadata for existing file (if any) for skip-if-unchanged
-                if params.options.skip_if_unchanged {
-                    Self::get_file_metadata(&path, true).await.ok()
+                // Get metadata for existing file (if any) for skip-if-unchanged or delta
+                let need_metadata = params.options.skip_if_unchanged
+                    || params.options.delta_algo != DeltaAlgo::None;
+                if need_metadata {
+                    let compute_hash = params.options.skip_if_unchanged;
+                    let delta_algo = params.options.delta_algo;
+                    Self::get_file_metadata(&path, compute_hash, delta_algo).await.ok()
                 } else {
                     None
                 }
@@ -96,7 +103,7 @@ impl FileTransferChannel {
     }
 
     /// Get file metadata for a path.
-    async fn get_file_metadata(path: &PathBuf, compute_hash: bool) -> Result<FileTransferMetadata> {
+    async fn get_file_metadata(path: &PathBuf, compute_hash: bool, delta_algo: DeltaAlgo) -> Result<FileTransferMetadata> {
         let meta = fs::metadata(path).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 Error::FileTransfer {
@@ -129,15 +136,65 @@ impl FileTransferChannel {
             None
         };
 
+        // Compute block checksums for delta sync if requested
+        let blocks = if delta_algo != DeltaAlgo::None && meta.is_file() && meta.len() > 0 {
+            Self::compute_block_checksums(path).await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        if !blocks.is_empty() {
+            debug!(
+                path = %path.display(),
+                block_count = blocks.len(),
+                "Computed block checksums for delta sync"
+            );
+        }
+
         Ok(FileTransferMetadata {
             size: meta.len(),
             mtime,
             mode,
-            blocks: Vec::new(), // Delta sync blocks computed separately
+            blocks,
             is_dir: meta.is_dir(),
             file_hash,
             partial_checksum: None, // Computed on demand for resume
         })
+    }
+
+    /// Compute block checksums for delta sync.
+    async fn compute_block_checksums(path: &PathBuf) -> Result<Vec<BlockChecksum>> {
+        let mut file = File::open(path).await.map_err(|e| Error::FileTransfer {
+            message: format!("failed to open file for block hashing: {}", e),
+        })?;
+
+        let mut blocks = Vec::new();
+        let mut buf = vec![0u8; DELTA_BLOCK_SIZE];
+        let mut offset = 0u64;
+
+        loop {
+            let n = file.read(&mut buf).await.map_err(|e| Error::FileTransfer {
+                message: format!("failed to read file for block hashing: {}", e),
+            })?;
+
+            if n == 0 {
+                break;
+            }
+
+            let chunk = &buf[..n];
+            let weak = BlockHasher::compute_weak(chunk);
+            let strong = BlockHasher::compute_strong(chunk);
+
+            blocks.push(BlockChecksum {
+                offset,
+                weak,
+                strong,
+            });
+
+            offset += n as u64;
+        }
+
+        Ok(blocks)
     }
 
     /// Compute xxHash64 for a file.
@@ -235,10 +292,15 @@ impl FileTransferChannel {
         let temp_path = path.with_extension("qscp.tmp");
         let resume_offset = self.inner.params.resume_from.unwrap_or(0);
 
+        // Check if delta sync is enabled and we have blocks
+        let use_delta = self.inner.params.options.delta_algo != DeltaAlgo::None
+            && self.inner.metadata.as_ref().map(|m| !m.blocks.is_empty()).unwrap_or(false);
+
         info!(
             channel_id = %self.inner.channel_id,
             path = %path.display(),
             resume_from = resume_offset,
+            delta = use_delta,
             "Starting upload receive"
         );
 
@@ -248,6 +310,15 @@ impl FileTransferChannel {
                 message: format!("failed to create directory: {}", e),
             })?;
         }
+
+        // Open existing file for delta sync (if it exists and delta is enabled)
+        let mut existing_file = if use_delta && path.exists() {
+            Some(File::open(&path).await.map_err(|e| Error::FileTransfer {
+                message: format!("failed to open existing file for delta: {}", e),
+            })?)
+        } else {
+            None
+        };
 
         // Handle resume: check if temp file exists and matches resume offset
         let (mut file, mut hasher, mut total_bytes) = if resume_offset > 0 {
@@ -369,8 +440,44 @@ impl FileTransferChannel {
                             })?;
                     }
 
-                    // Decompress data if needed
-                    let write_data = if data.flags.compressed {
+                    // Handle block references (delta sync)
+                    let write_data = if data.flags.block_ref {
+                        // Data contains source_offset (8 bytes) + length (8 bytes)
+                        if data.data.len() != 16 {
+                            return Err(Error::FileTransfer {
+                                message: format!("invalid block ref size: {}", data.data.len()),
+                            });
+                        }
+
+                        let source_offset = u64::from_le_bytes(data.data[0..8].try_into().unwrap());
+                        let length = u64::from_le_bytes(data.data[8..16].try_into().unwrap());
+
+                        // Read from existing file
+                        let existing = existing_file.as_mut().ok_or_else(|| Error::FileTransfer {
+                            message: "block ref but no existing file".to_string(),
+                        })?;
+
+                        existing.seek(std::io::SeekFrom::Start(source_offset))
+                            .await
+                            .map_err(|e| Error::FileTransfer {
+                                message: format!("failed to seek in source file: {}", e),
+                            })?;
+
+                        let mut buf = vec![0u8; length as usize];
+                        existing.read_exact(&mut buf).await.map_err(|e| Error::FileTransfer {
+                            message: format!("failed to read from source file: {}", e),
+                        })?;
+
+                        debug!(
+                            channel_id = %self.inner.channel_id,
+                            source_offset = source_offset,
+                            length = length,
+                            "Applied block reference from existing file"
+                        );
+
+                        buf
+                    } else if data.flags.compressed {
+                        // Decompress data
                         decompressor.decompress(&data.data)?
                     } else {
                         data.data
@@ -506,14 +613,32 @@ impl FileTransferChannel {
         })?;
         let file_size = metadata.len();
 
-        // Handle resume
+        // Handle resume - need to hash the entire file for checksum verification
         let start_offset = self.inner.params.resume_from.unwrap_or(0);
+        let mut hasher = StreamingHasher::new();
+        let mut buf = vec![0u8; FILE_CHUNK_SIZE];
+
+        // If resuming, first hash the bytes before the resume point
+        // This ensures the final checksum covers the entire file
         if start_offset > 0 {
-            file.seek(std::io::SeekFrom::Start(start_offset))
-                .await
-                .map_err(|e| Error::FileTransfer {
-                    message: format!("failed to seek for resume: {}", e),
+            let mut remaining = start_offset;
+            while remaining > 0 {
+                let to_read = (remaining as usize).min(FILE_CHUNK_SIZE);
+                let n = file.read(&mut buf[..to_read]).await.map_err(|e| Error::FileTransfer {
+                    message: format!("failed to read file for resume hash: {}", e),
                 })?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                remaining -= n as u64;
+            }
+            debug!(
+                channel_id = %self.inner.channel_id,
+                resume_offset = start_offset,
+                "Hashed bytes before resume point"
+            );
+            // File position is now at start_offset, ready to send
         }
 
         // Determine if we should compress
@@ -525,8 +650,6 @@ impl FileTransferChannel {
             None
         };
 
-        let mut hasher = StreamingHasher::new();
-        let mut buf = vec![0u8; FILE_CHUNK_SIZE];
         let mut offset = start_offset;
 
         // Get stream

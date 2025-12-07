@@ -208,16 +208,19 @@ async fn run_client_direct(cli: &Cli, host: &str, user: Option<&str>) -> qsh_cor
         // Spawn control message handler for server-initiated channels (remote forwards)
         let conn_clone = std::sync::Arc::clone(&conn);
         let control_task = tokio::spawn(async move {
+            info!("Control message handler started");
             loop {
+                debug!("Waiting for control message...");
                 match conn_clone.recv_control().await {
                     Ok(msg) => {
+                        info!(?msg, "Received control message");
                         if let Err(e) = handle_control_message(&conn_clone, msg).await {
                             warn!(error = %e, "Error handling control message");
                             break;
                         }
                     }
                     Err(e) => {
-                        debug!(error = %e, "Control stream ended");
+                        warn!(error = %e, "Control stream ended");
                         break;
                     }
                 }
@@ -344,16 +347,19 @@ async fn run_client_channel_model(
         // Spawn control message handler for server-initiated channels (remote forwards)
         let conn_clone = std::sync::Arc::clone(&conn);
         let control_task = tokio::spawn(async move {
+            info!("Control message handler started");
             loop {
+                debug!("Waiting for control message...");
                 match conn_clone.recv_control().await {
                     Ok(msg) => {
+                        info!(?msg, "Received control message");
                         if let Err(e) = handle_control_message(&conn_clone, msg).await {
                             warn!(error = %e, "Error handling control message");
                             break;
                         }
                     }
                     Err(e) => {
-                        debug!(error = %e, "Control stream ended");
+                        warn!(error = %e, "Control stream ended");
                         break;
                     }
                 }
