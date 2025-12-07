@@ -102,14 +102,18 @@ impl Codec {
 mod tests {
     use super::*;
     use crate::protocol::{
-        Capabilities, HelloAckPayload, HelloPayload, ResizePayload, ShutdownPayload,
+        Capabilities, HelloAckPayload, HelloPayload, ResizePayload, SessionId, ShutdownPayload,
         ShutdownReason, StateAckPayload, TermSize, TerminalInputPayload,
     };
     use crate::terminal::TerminalState;
 
     #[test]
     fn encode_decode_roundtrip_resize() {
-        let msg = Message::Resize(ResizePayload { cols: 80, rows: 24 });
+        let msg = Message::Resize(ResizePayload {
+            channel_id: None,
+            cols: 80,
+            rows: 24,
+        });
         let encoded = Codec::encode(&msg).unwrap();
         let decoded = Codec::decode_slice(&encoded).unwrap().unwrap();
         assert_eq!(msg, decoded);
@@ -122,6 +126,7 @@ mod tests {
             session_key: [0xAB; 32],
             client_nonce: 12345,
             capabilities: Capabilities::default(),
+            resume_session: None,
             term_size: TermSize::default(),
             term_type: "xterm-256color".into(),
             env: vec![("COLORTERM".into(), "truecolor".into())],
@@ -143,6 +148,8 @@ mod tests {
             accepted: true,
             reject_reason: None,
             capabilities: Capabilities::default(),
+            session_id: SessionId::from_bytes([0; 16]),
+            server_nonce: 0,
             initial_state: Some(state),
             zero_rtt_available: false,
         });
@@ -152,6 +159,7 @@ mod tests {
         assert_eq!(msg, decoded);
     }
 
+    #[allow(deprecated)]
     #[test]
     fn encode_decode_roundtrip_terminal_input() {
         let msg = Message::TerminalInput(TerminalInputPayload {
@@ -168,6 +176,7 @@ mod tests {
     #[test]
     fn decode_partial_returns_none() {
         let msg = Message::Resize(ResizePayload {
+            channel_id: None,
             cols: 120,
             rows: 40,
         });
@@ -222,6 +231,7 @@ mod tests {
     #[test]
     fn encode_creates_length_prefix() {
         let msg = Message::Resize(ResizePayload {
+            channel_id: None,
             cols: 200,
             rows: 50,
         });
@@ -236,12 +246,19 @@ mod tests {
 
     #[test]
     fn multiple_messages_in_buffer() {
-        let msg1 = Message::Resize(ResizePayload { cols: 80, rows: 24 });
+        let msg1 = Message::Resize(ResizePayload {
+            channel_id: None,
+            cols: 80,
+            rows: 24,
+        });
         let msg2 = Message::Shutdown(ShutdownPayload {
             reason: ShutdownReason::UserRequested,
             message: Some("bye".into()),
         });
-        let msg3 = Message::StateAck(StateAckPayload { generation: 3 });
+        let msg3 = Message::StateAck(StateAckPayload {
+            channel_id: None,
+            generation: 3,
+        });
 
         let enc1 = Codec::encode(&msg1).unwrap();
         let enc2 = Codec::encode(&msg2).unwrap();
@@ -269,7 +286,11 @@ mod tests {
 
     #[test]
     fn decode_advances_buffer_only_on_success() {
-        let msg = Message::Resize(ResizePayload { cols: 20, rows: 10 });
+        let msg = Message::Resize(ResizePayload {
+            channel_id: None,
+            cols: 20,
+            rows: 10,
+        });
         let encoded = Codec::encode(&msg).unwrap();
 
         let mut buf = BytesMut::from(&encoded[..]);

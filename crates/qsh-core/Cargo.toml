@@ -30,6 +30,7 @@ quinn = { workspace = true }
 rustls = { workspace = true }
 sha2 = "0.10"
 rand = { workspace = true }
+getrandom = "0.2"
 
 # File transfer dependencies
 xxhash-rust = { version = "0.8", features = ["xxh64"] }

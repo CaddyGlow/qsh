@@ -56,6 +56,14 @@ pub enum Error {
     /// File transfer error.
     #[error("file transfer error: {message}")]
     FileTransfer { message: String },
+
+    /// Port forward error.
+    #[error("forward error: {message}")]
+    Forward { message: String },
+
+    /// Channel error.
+    #[error("channel error: {message}")]
+    Channel { message: String },
 }
 
 /// Convenience result type for qsh operations.

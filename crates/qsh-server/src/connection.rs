@@ -1,0 +1,923 @@
+//! Connection-level handler for qsh server.
+//!
+//! Manages a single QUIC connection with multiplexed channels.
+//! This is the SSH-style channel model implementation for qsh.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
+
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tracing::{debug, error, info, warn};
+
+use qsh_core::error::{Error, Result};
+use qsh_core::protocol::{
+    ChannelAcceptData, ChannelAcceptPayload, ChannelClosePayload, ChannelCloseReason, ChannelId,
+    ChannelOpenPayload, ChannelParams, ChannelRejectCode, ChannelRejectPayload,
+    GlobalReplyData, GlobalReplyPayload, GlobalReplyResult, GlobalRequest, GlobalRequestPayload,
+    Message, ResizePayload, SessionId, StateAckPayload,
+};
+use qsh_core::terminal::TerminalState;
+use qsh_core::transport::{Connection, QuicConnection, QuicStream, StreamPair, StreamType};
+
+use crate::channel::{ChannelHandle, FileTransferChannel, ForwardChannel, TerminalChannel};
+
+// =============================================================================
+// Connection Configuration
+// =============================================================================
+
+/// Configuration for connection-level limits.
+#[derive(Debug, Clone)]
+pub struct ConnectionConfig {
+    /// Maximum total channels per connection.
+    pub max_channels: usize,
+    /// Maximum terminal channels per connection.
+    pub max_terminals: usize,
+    /// Maximum port forward channels per connection.
+    pub max_forwards: u16,
+    /// Maximum file transfer channels per connection.
+    pub max_file_transfers: usize,
+    /// Allow remote port forwards (-R).
+    pub allow_remote_forwards: bool,
+    /// Session linger timeout (keep PTY alive after disconnect).
+    pub linger_timeout: Duration,
+    /// Idle timeout for channels.
+    pub idle_timeout: Duration,
+}
+
+impl Default for ConnectionConfig {
+    fn default() -> Self {
+        Self {
+            max_channels: 100,
+            max_terminals: 10,
+            max_forwards: 10,
+            max_file_transfers: 16,
+            allow_remote_forwards: false,
+            linger_timeout: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(300),
+        }
+    }
+}
+
+// =============================================================================
+// Connection Handler
+// =============================================================================
+
+/// Handles a single QUIC connection with multiplexed channels.
+///
+/// This implements the SSH-style channel model where:
+/// - Hello/HelloAck establishes the authenticated connection
+/// - Either side sends ChannelOpen to create any resource
+/// - Receiver responds with ChannelAccept or ChannelReject
+/// - Either side can send ChannelClose to tear down a channel
+pub struct ConnectionHandler {
+    /// Underlying QUIC connection.
+    quic: Arc<QuicConnection>,
+    /// Control stream for lifecycle messages.
+    control: Mutex<QuicStream>,
+    /// Active channels keyed by ChannelId.
+    channels: RwLock<HashMap<ChannelId, ChannelHandle>>,
+    /// Next server-assigned channel ID.
+    next_server_channel_id: std::sync::atomic::AtomicU64,
+    /// Connection configuration.
+    config: ConnectionConfig,
+    /// Session ID for this connection.
+    session_id: SessionId,
+    /// Pending global requests awaiting reply (request_id -> reply sender).
+    pending_global_requests: Mutex<HashMap<u32, oneshot::Sender<GlobalReplyResult>>>,
+    /// Next global request ID.
+    next_global_request_id: std::sync::atomic::AtomicU32,
+    /// Remote forward listeners (bind_host:bind_port -> listener handle).
+    remote_forward_listeners: Mutex<HashMap<(String, u16), RemoteForwardListener>>,
+    /// Channel for signaling connection shutdown.
+    shutdown_tx: mpsc::Sender<()>,
+    /// Last activity timestamp.
+    last_activity: Mutex<Instant>,
+}
+
+/// Handle for a remote forward listener on the server.
+#[allow(dead_code)]
+struct RemoteForwardListener {
+    bind_host: String,
+    bind_port: u16,
+    shutdown_tx: oneshot::Sender<()>,
+}
+
+impl ConnectionHandler {
+    /// Create a new connection handler.
+    pub fn new(
+        quic: QuicConnection,
+        control: QuicStream,
+        session_id: SessionId,
+        config: ConnectionConfig,
+    ) -> (Arc<Self>, mpsc::Receiver<()>) {
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+
+        let handler = Arc::new(Self {
+            quic: Arc::new(quic),
+            control: Mutex::new(control),
+            channels: RwLock::new(HashMap::new()),
+            next_server_channel_id: std::sync::atomic::AtomicU64::new(0),
+            config,
+            session_id,
+            pending_global_requests: Mutex::new(HashMap::new()),
+            next_global_request_id: std::sync::atomic::AtomicU32::new(0),
+            remote_forward_listeners: Mutex::new(HashMap::new()),
+            shutdown_tx,
+            last_activity: Mutex::new(Instant::now()),
+        });
+
+        (handler, shutdown_rx)
+    }
+
+    /// Get the session ID.
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    /// Get the remote peer address.
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.quic.remote_addr()
+    }
+
+    /// Get a reference to the underlying QUIC connection.
+    pub fn quic(&self) -> &Arc<QuicConnection> {
+        &self.quic
+    }
+
+    /// Get the connection configuration.
+    pub fn config(&self) -> &ConnectionConfig {
+        &self.config
+    }
+
+    /// Get the current RTT estimate.
+    pub fn rtt(&self) -> Duration {
+        self.quic.rtt()
+    }
+
+    /// Update last activity timestamp.
+    pub async fn touch(&self) {
+        *self.last_activity.lock().await = Instant::now();
+    }
+
+    /// Get the idle duration.
+    pub async fn idle_duration(&self) -> Duration {
+        self.last_activity.lock().await.elapsed()
+    }
+
+    /// Allocate a new server-initiated channel ID.
+    pub fn next_channel_id(&self) -> ChannelId {
+        let id = self
+            .next_server_channel_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ChannelId::server(id)
+    }
+
+    /// Get the number of active channels.
+    pub async fn channel_count(&self) -> usize {
+        self.channels.read().await.len()
+    }
+
+    /// Count channels by type.
+    pub async fn channel_counts(&self) -> ChannelCounts {
+        let channels = self.channels.read().await;
+        let mut counts = ChannelCounts::default();
+
+        for handle in channels.values() {
+            match handle {
+                ChannelHandle::Terminal(_) => counts.terminals += 1,
+                ChannelHandle::FileTransfer(_) => counts.file_transfers += 1,
+                ChannelHandle::Forward(_) => counts.forwards += 1,
+            }
+        }
+
+        counts
+    }
+
+    /// Send a message on the control stream.
+    pub async fn send_control(&self, msg: &Message) -> Result<()> {
+        self.touch().await;
+        self.control.lock().await.send(msg).await
+    }
+
+    /// Receive a message from the control stream.
+    pub async fn recv_control(&self) -> Result<Message> {
+        self.touch().await;
+        self.control.lock().await.recv().await
+    }
+
+    // =========================================================================
+    // Channel Management
+    // =========================================================================
+
+    /// Handle a ChannelOpen request.
+    pub async fn handle_channel_open(
+        self: &Arc<Self>,
+        payload: ChannelOpenPayload,
+    ) -> Result<()> {
+        let channel_id = payload.channel_id;
+        debug!(
+            channel_id = %channel_id,
+            channel_type = %payload.params.channel_type(),
+            "Received ChannelOpen request"
+        );
+
+        // Check if channel ID already exists
+        {
+            let channels = self.channels.read().await;
+            if channels.contains_key(&channel_id) {
+                return self
+                    .send_channel_reject(
+                        channel_id,
+                        ChannelRejectCode::InvalidChannelId,
+                        "channel ID already in use",
+                    )
+                    .await;
+            }
+        }
+
+        // Check connection-level limits
+        let counts = self.channel_counts().await;
+        if counts.total() >= self.config.max_channels {
+            return self
+                .send_channel_reject(
+                    channel_id,
+                    ChannelRejectCode::ResourceShortage,
+                    "max channels exceeded",
+                )
+                .await;
+        }
+
+        // Dispatch by channel type
+        match payload.params {
+            ChannelParams::Terminal(params) => {
+                if counts.terminals >= self.config.max_terminals {
+                    return self
+                        .send_channel_reject(
+                            channel_id,
+                            ChannelRejectCode::ResourceShortage,
+                            "max terminals exceeded",
+                        )
+                        .await;
+                }
+                self.open_terminal_channel(channel_id, params).await
+            }
+            ChannelParams::FileTransfer(params) => {
+                if counts.file_transfers >= self.config.max_file_transfers {
+                    return self
+                        .send_channel_reject(
+                            channel_id,
+                            ChannelRejectCode::ResourceShortage,
+                            "max file transfers exceeded",
+                        )
+                        .await;
+                }
+                self.open_file_transfer_channel(channel_id, params).await
+            }
+            ChannelParams::DirectTcpIp(params) => {
+                if counts.forwards >= self.config.max_forwards as usize {
+                    return self
+                        .send_channel_reject(
+                            channel_id,
+                            ChannelRejectCode::ResourceShortage,
+                            "max forwards exceeded",
+                        )
+                        .await;
+                }
+                self.open_direct_tcpip_channel(channel_id, params).await
+            }
+            ChannelParams::ForwardedTcpIp(params) => {
+                // Server-initiated (from remote forward listener)
+                self.open_forwarded_tcpip_channel(channel_id, params).await
+            }
+            ChannelParams::DynamicForward(params) => {
+                if counts.forwards >= self.config.max_forwards as usize {
+                    return self
+                        .send_channel_reject(
+                            channel_id,
+                            ChannelRejectCode::ResourceShortage,
+                            "max forwards exceeded",
+                        )
+                        .await;
+                }
+                self.open_dynamic_forward_channel(channel_id, params).await
+            }
+            #[cfg(feature = "tunnel")]
+            ChannelParams::Tunnel(params) => {
+                self.open_tunnel_channel(channel_id, params).await
+            }
+        }
+    }
+
+    /// Handle a ChannelClose request.
+    pub async fn handle_channel_close(&self, payload: ChannelClosePayload) -> Result<()> {
+        let channel_id = payload.channel_id;
+        debug!(
+            channel_id = %channel_id,
+            reason = %payload.reason,
+            "Received ChannelClose"
+        );
+
+        // Remove and get the channel
+        let channel = {
+            let mut channels = self.channels.write().await;
+            channels.remove(&channel_id)
+        };
+
+        match channel {
+            Some(handle) => {
+                // Clean up channel resources
+                handle.close().await;
+
+                // Send close confirmation (SSH-style handshake)
+                let confirm = Message::ChannelClose(ChannelClosePayload {
+                    channel_id,
+                    reason: ChannelCloseReason::Normal,
+                });
+                self.send_control(&confirm).await?;
+
+                info!(channel_id = %channel_id, "Channel closed");
+                Ok(())
+            }
+            None => {
+                warn!(channel_id = %channel_id, "ChannelClose for unknown channel");
+                Ok(())
+            }
+        }
+    }
+
+    /// Handle a Resize message.
+    pub async fn handle_resize(&self, payload: ResizePayload) -> Result<()> {
+        let channel_id = match payload.channel_id {
+            Some(id) => id,
+            None => {
+                // Legacy: resize applies to first terminal channel
+                let channels = self.channels.read().await;
+                if let Some((id, _)) = channels.iter().find(|(_, h)| matches!(h, ChannelHandle::Terminal(_))) {
+                    *id
+                } else {
+                    warn!("Resize without channel_id and no terminal channels");
+                    return Ok(());
+                }
+            }
+        };
+
+        let channels = self.channels.read().await;
+        if let Some(ChannelHandle::Terminal(terminal)) = channels.get(&channel_id) {
+            terminal.resize(payload.cols, payload.rows).await?;
+        } else {
+            warn!(channel_id = %channel_id, "Resize for non-terminal or unknown channel");
+        }
+
+        Ok(())
+    }
+
+    /// Handle a StateAck message.
+    pub async fn handle_state_ack(&self, payload: StateAckPayload) -> Result<()> {
+        let channel_id = match payload.channel_id {
+            Some(id) => id,
+            None => {
+                // Legacy: ack applies to first terminal channel
+                let channels = self.channels.read().await;
+                if let Some((id, _)) = channels.iter().find(|(_, h)| matches!(h, ChannelHandle::Terminal(_))) {
+                    *id
+                } else {
+                    return Ok(());
+                }
+            }
+        };
+
+        let channels = self.channels.read().await;
+        if let Some(ChannelHandle::Terminal(terminal)) = channels.get(&channel_id) {
+            terminal.handle_state_ack(payload.generation).await;
+        }
+
+        Ok(())
+    }
+
+    /// Send a ChannelReject message.
+    pub async fn send_channel_reject(
+        &self,
+        channel_id: ChannelId,
+        code: ChannelRejectCode,
+        message: &str,
+    ) -> Result<()> {
+        let reject = Message::ChannelReject(ChannelRejectPayload {
+            channel_id,
+            code,
+            message: message.to_string(),
+        });
+        self.send_control(&reject).await
+    }
+
+    /// Send a ChannelAccept message.
+    pub async fn send_channel_accept(
+        &self,
+        channel_id: ChannelId,
+        data: ChannelAcceptData,
+    ) -> Result<()> {
+        let accept = Message::ChannelAccept(ChannelAcceptPayload { channel_id, data });
+        self.send_control(&accept).await
+    }
+
+    // =========================================================================
+    // Channel Type Handlers (placeholders - will be implemented with channel structs)
+    // =========================================================================
+
+    async fn open_terminal_channel(
+        self: &Arc<Self>,
+        channel_id: ChannelId,
+        params: qsh_core::protocol::TerminalParams,
+    ) -> Result<()> {
+        debug!(channel_id = %channel_id, "Opening terminal channel");
+
+        // Create terminal channel
+        match TerminalChannel::new(
+            channel_id,
+            params,
+            Arc::clone(&self.quic),
+            Arc::clone(self),
+        )
+        .await
+        {
+            Ok((channel, initial_state)) => {
+                // Register channel
+                {
+                    let mut channels = self.channels.write().await;
+                    channels.insert(channel_id, ChannelHandle::Terminal(channel));
+                }
+
+                // Send accept with initial state
+                self.send_channel_accept(
+                    channel_id,
+                    ChannelAcceptData::Terminal { initial_state },
+                )
+                .await
+            }
+            Err(e) => {
+                error!(channel_id = %channel_id, error = %e, "Failed to create terminal channel");
+                self.send_channel_reject(
+                    channel_id,
+                    ChannelRejectCode::InternalError,
+                    &e.to_string(),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn open_file_transfer_channel(
+        self: &Arc<Self>,
+        channel_id: ChannelId,
+        params: qsh_core::protocol::FileTransferParams,
+    ) -> Result<()> {
+        debug!(channel_id = %channel_id, path = %params.path, "Opening file transfer channel");
+
+        match FileTransferChannel::new(channel_id, params, Arc::clone(&self.quic)).await {
+            Ok((channel, metadata)) => {
+                {
+                    let mut channels = self.channels.write().await;
+                    channels.insert(channel_id, ChannelHandle::FileTransfer(channel));
+                }
+
+                self.send_channel_accept(
+                    channel_id,
+                    ChannelAcceptData::FileTransfer { metadata },
+                )
+                .await
+            }
+            Err(e) => {
+                let code = match &e {
+                    Error::FileTransfer { message } if message.contains("not found") => {
+                        ChannelRejectCode::NotFound
+                    }
+                    Error::FileTransfer { message } if message.contains("permission") => {
+                        ChannelRejectCode::PermissionDenied
+                    }
+                    _ => ChannelRejectCode::InternalError,
+                };
+                self.send_channel_reject(channel_id, code, &e.to_string())
+                    .await
+            }
+        }
+    }
+
+    async fn open_direct_tcpip_channel(
+        self: &Arc<Self>,
+        channel_id: ChannelId,
+        params: qsh_core::protocol::DirectTcpIpParams,
+    ) -> Result<()> {
+        debug!(
+            channel_id = %channel_id,
+            target = %format!("{}:{}", params.target_host, params.target_port),
+            "Opening direct-tcpip channel"
+        );
+
+        match ForwardChannel::new_direct(channel_id, params, Arc::clone(&self.quic)).await {
+            Ok(channel) => {
+                {
+                    let mut channels = self.channels.write().await;
+                    channels.insert(channel_id, ChannelHandle::Forward(channel));
+                }
+
+                self.send_channel_accept(channel_id, ChannelAcceptData::DirectTcpIp)
+                    .await
+            }
+            Err(e) => {
+                self.send_channel_reject(
+                    channel_id,
+                    ChannelRejectCode::ConnectFailed,
+                    &e.to_string(),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn open_forwarded_tcpip_channel(
+        self: &Arc<Self>,
+        channel_id: ChannelId,
+        params: qsh_core::protocol::ForwardedTcpIpParams,
+    ) -> Result<()> {
+        debug!(
+            channel_id = %channel_id,
+            bound = %format!("{}:{}", params.bound_host, params.bound_port),
+            "Opening forwarded-tcpip channel"
+        );
+
+        // This is server-initiated when a connection arrives on a remote forward
+        match ForwardChannel::new_forwarded(channel_id, params, Arc::clone(&self.quic)).await {
+            Ok(channel) => {
+                {
+                    let mut channels = self.channels.write().await;
+                    channels.insert(channel_id, ChannelHandle::Forward(channel));
+                }
+
+                self.send_channel_accept(channel_id, ChannelAcceptData::ForwardedTcpIp)
+                    .await
+            }
+            Err(e) => {
+                self.send_channel_reject(
+                    channel_id,
+                    ChannelRejectCode::ConnectFailed,
+                    &e.to_string(),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn open_dynamic_forward_channel(
+        self: &Arc<Self>,
+        channel_id: ChannelId,
+        params: qsh_core::protocol::DynamicForwardParams,
+    ) -> Result<()> {
+        debug!(
+            channel_id = %channel_id,
+            target = %format!("{}:{}", params.target_host, params.target_port),
+            "Opening dynamic forward channel"
+        );
+
+        match ForwardChannel::new_dynamic(channel_id, params, Arc::clone(&self.quic)).await {
+            Ok(channel) => {
+                {
+                    let mut channels = self.channels.write().await;
+                    channels.insert(channel_id, ChannelHandle::Forward(channel));
+                }
+
+                self.send_channel_accept(channel_id, ChannelAcceptData::DynamicForward)
+                    .await
+            }
+            Err(e) => {
+                self.send_channel_reject(
+                    channel_id,
+                    ChannelRejectCode::ConnectFailed,
+                    &e.to_string(),
+                )
+                .await
+            }
+        }
+    }
+
+    #[cfg(feature = "tunnel")]
+    async fn open_tunnel_channel(
+        self: &Arc<Self>,
+        channel_id: ChannelId,
+        _params: qsh_core::protocol::TunnelParams,
+    ) -> Result<()> {
+        // Tunnel channels are not yet implemented
+        self.send_channel_reject(
+            channel_id,
+            ChannelRejectCode::UnknownChannelType,
+            "tunnel channels not yet implemented",
+        )
+        .await
+    }
+
+    // =========================================================================
+    // Global Request Handling
+    // =========================================================================
+
+    /// Handle a GlobalRequest message.
+    pub async fn handle_global_request(&self, payload: GlobalRequestPayload) -> Result<()> {
+        let request_id = payload.request_id;
+        debug!(request_id, request = ?payload.request, "Received GlobalRequest");
+
+        match payload.request {
+            GlobalRequest::TcpIpForward {
+                bind_host,
+                bind_port,
+            } => {
+                if !self.config.allow_remote_forwards {
+                    return self
+                        .send_global_reply(
+                            request_id,
+                            GlobalReplyResult::Failure {
+                                message: "remote forwards not allowed".to_string(),
+                            },
+                        )
+                        .await;
+                }
+
+                // TODO: Actually bind the port and track the listener
+                // For now, just acknowledge the request
+                info!(bind_host = %bind_host, bind_port, "Remote forward requested");
+
+                self.send_global_reply(
+                    request_id,
+                    GlobalReplyResult::Success(GlobalReplyData::TcpIpForward {
+                        bound_port: bind_port,
+                    }),
+                )
+                .await
+            }
+            GlobalRequest::CancelTcpIpForward {
+                bind_host,
+                bind_port,
+            } => {
+                let mut listeners = self.remote_forward_listeners.lock().await;
+                if listeners.remove(&(bind_host.clone(), bind_port)).is_some() {
+                    info!(bind_host = %bind_host, bind_port, "Remote forward cancelled");
+                    self.send_global_reply(
+                        request_id,
+                        GlobalReplyResult::Success(GlobalReplyData::CancelTcpIpForward),
+                    )
+                    .await
+                } else {
+                    self.send_global_reply(
+                        request_id,
+                        GlobalReplyResult::Failure {
+                            message: "no such forward".to_string(),
+                        },
+                    )
+                    .await
+                }
+            }
+        }
+    }
+
+    /// Send a GlobalReply message.
+    async fn send_global_reply(
+        &self,
+        request_id: u32,
+        result: GlobalReplyResult,
+    ) -> Result<()> {
+        let reply = Message::GlobalReply(GlobalReplyPayload { request_id, result });
+        self.send_control(&reply).await
+    }
+
+    // =========================================================================
+    // Stream Handling
+    // =========================================================================
+
+    /// Route an incoming stream to the appropriate channel.
+    pub async fn handle_incoming_stream(
+        &self,
+        stream_type: StreamType,
+        stream: QuicStream,
+    ) -> Result<()> {
+        match stream_type {
+            StreamType::ChannelIn(channel_id) | StreamType::ChannelBidi(channel_id) => {
+                let channels = self.channels.read().await;
+                if let Some(handle) = channels.get(&channel_id) {
+                    handle.handle_incoming_stream(stream).await
+                } else {
+                    warn!(channel_id = %channel_id, "Stream for unknown channel");
+                    Err(Error::Protocol {
+                        message: format!("unknown channel: {}", channel_id),
+                    })
+                }
+            }
+            // Legacy stream types - dispatch to appropriate handler
+            StreamType::TerminalIn => {
+                // Find the first terminal channel
+                let channels = self.channels.read().await;
+                for handle in channels.values() {
+                    if let ChannelHandle::Terminal(terminal) = handle {
+                        return terminal.handle_legacy_input_stream(stream).await;
+                    }
+                }
+                warn!("Terminal input stream but no terminal channel");
+                Ok(())
+            }
+            StreamType::Forward(id) => {
+                // Legacy forward stream
+                debug!(forward_id = id, "Legacy forward stream");
+                Ok(())
+            }
+            StreamType::FileTransfer(id) => {
+                // Legacy file transfer stream
+                debug!(transfer_id = id, "Legacy file transfer stream");
+                Ok(())
+            }
+            other => {
+                warn!(stream_type = ?other, "Unexpected stream type");
+                Ok(())
+            }
+        }
+    }
+
+    // =========================================================================
+    // Connection Lifecycle
+    // =========================================================================
+
+    /// Close all channels and clean up.
+    pub async fn close_all_channels(&self, reason: ChannelCloseReason) {
+        let channels: Vec<_> = {
+            let mut guard = self.channels.write().await;
+            guard.drain().collect()
+        };
+
+        for (channel_id, handle) in channels {
+            debug!(channel_id = %channel_id, "Closing channel");
+            handle.close().await;
+
+            // Best-effort send close notification
+            let _ = self
+                .send_control(&Message::ChannelClose(ChannelClosePayload {
+                    channel_id,
+                    reason: reason.clone(),
+                }))
+                .await;
+        }
+    }
+
+    /// Signal connection shutdown.
+    pub async fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(()).await;
+        self.close_all_channels(ChannelCloseReason::ConnectionClosed)
+            .await;
+    }
+
+    /// Get a terminal channel by ID (for legacy code paths).
+    pub async fn get_terminal_channel(&self, channel_id: ChannelId) -> Option<TerminalChannel> {
+        let channels = self.channels.read().await;
+        if let Some(ChannelHandle::Terminal(terminal)) = channels.get(&channel_id) {
+            Some(terminal.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Get the first terminal channel (for legacy code paths).
+    pub async fn get_first_terminal_channel(&self) -> Option<(ChannelId, TerminalChannel)> {
+        let channels = self.channels.read().await;
+        for (id, handle) in channels.iter() {
+            if let ChannelHandle::Terminal(terminal) = handle {
+                return Some((*id, terminal.clone()));
+            }
+        }
+        None
+    }
+}
+
+// =============================================================================
+// Channel Counts
+// =============================================================================
+
+/// Channel counts by type.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ChannelCounts {
+    pub terminals: usize,
+    pub file_transfers: usize,
+    pub forwards: usize,
+}
+
+impl ChannelCounts {
+    /// Total channel count.
+    pub fn total(&self) -> usize {
+        self.terminals + self.file_transfers + self.forwards
+    }
+}
+
+// =============================================================================
+// Connection Session
+// =============================================================================
+
+/// Logical session that persists across QUIC connection lifetimes.
+///
+/// This tracks session state for reconnection support:
+/// - Session ID (opaque identifier)
+/// - Session key (for authentication)
+/// - Terminal states that can be resumed
+pub struct ConnectionSession {
+    /// Session ID.
+    pub session_id: SessionId,
+    /// Session key (32 bytes, for authentication).
+    pub session_key: [u8; 32],
+    /// When this session was created.
+    pub created_at: SystemTime,
+    /// Last activity timestamp.
+    pub last_active_at: Mutex<SystemTime>,
+    /// Client address (may change on reconnect).
+    pub client_addr: Mutex<SocketAddr>,
+    /// The current connection handler (None if disconnected but lingering).
+    pub handler: Mutex<Option<Arc<ConnectionHandler>>>,
+    /// Terminal states that can be resumed (channel_id -> state).
+    pub terminal_states: RwLock<HashMap<u64, TerminalState>>,
+}
+
+impl ConnectionSession {
+    /// Create a new session.
+    pub fn new(session_key: [u8; 32], client_addr: SocketAddr) -> Self {
+        Self {
+            session_id: SessionId::new(),
+            session_key,
+            created_at: SystemTime::now(),
+            last_active_at: Mutex::new(SystemTime::now()),
+            client_addr: Mutex::new(client_addr),
+            handler: Mutex::new(None),
+            terminal_states: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Attach a connection handler to this session.
+    pub async fn attach(&self, handler: Arc<ConnectionHandler>, addr: SocketAddr) {
+        *self.handler.lock().await = Some(handler);
+        *self.client_addr.lock().await = addr;
+        *self.last_active_at.lock().await = SystemTime::now();
+    }
+
+    /// Detach the connection handler (client disconnected).
+    pub async fn detach(&self) {
+        *self.handler.lock().await = None;
+    }
+
+    /// Check if a handler is attached.
+    pub async fn is_attached(&self) -> bool {
+        self.handler.lock().await.is_some()
+    }
+
+    /// Update activity timestamp.
+    pub async fn touch(&self) {
+        *self.last_active_at.lock().await = SystemTime::now();
+    }
+
+    /// Get time since last activity.
+    pub async fn idle_duration(&self) -> Duration {
+        self.last_active_at
+            .lock()
+            .await
+            .elapsed()
+            .unwrap_or_default()
+    }
+
+    /// Save terminal state for reconnection.
+    pub async fn save_terminal_state(&self, channel_seq: u64, state: TerminalState) {
+        self.terminal_states.write().await.insert(channel_seq, state);
+    }
+
+    /// Get saved terminal state.
+    pub async fn get_terminal_state(&self, channel_seq: u64) -> Option<TerminalState> {
+        self.terminal_states.read().await.get(&channel_seq).cloned()
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_connection_config_default() {
+        let config = ConnectionConfig::default();
+        assert_eq!(config.max_channels, 100);
+        assert_eq!(config.max_terminals, 10);
+        assert_eq!(config.max_forwards, 10);
+        assert!(!config.allow_remote_forwards);
+    }
+
+    #[test]
+    fn test_channel_counts() {
+        let counts = ChannelCounts {
+            terminals: 2,
+            file_transfers: 3,
+            forwards: 5,
+        };
+        assert_eq!(counts.total(), 10);
+    }
+}

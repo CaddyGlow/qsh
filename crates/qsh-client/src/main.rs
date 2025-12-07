@@ -15,9 +15,10 @@ use qsh_client::cli::{OverlayPosition as CliOverlayPosition, SshBootstrapMode};
 use qsh_client::overlay::{ConnectionStatus, OverlayPosition, PredictionOverlay, StatusOverlay};
 use qsh_client::render::StateRenderer;
 use qsh_client::{
-    BootstrapMode, Cli, ClientConnection, ConnectionConfig, EscapeCommand, EscapeHandler,
-    EscapeResult, LocalForwarder, RawModeGuard, Socks5Proxy, SshConfig, StdinReader, StdoutWriter,
-    bootstrap, get_terminal_size, parse_escape_key, restore_terminal,
+    BootstrapMode, ChannelConnection, Cli, ClientConnection, ConnectionConfig, EscapeCommand,
+    EscapeHandler, EscapeResult, LocalForwarder, RawModeGuard, Socks5Proxy, SshConfig, StdinReader,
+    StdoutWriter, TerminalChannel, bootstrap, get_terminal_size, parse_escape_key,
+    restore_terminal,
 };
 
 #[cfg(feature = "standalone")]
@@ -174,10 +175,110 @@ async fn run_client_direct(cli: &Cli, host: &str, user: Option<&str>) -> qsh_cor
     run_session(conn, cli, Some(user_host)).await
 }
 
+/// Run client using the SSH-style channel model (experimental).
+///
+/// This uses `ChannelConnection` which does not open a terminal automatically.
+/// Instead, we explicitly open a terminal channel after the handshake.
+async fn run_client_channel_model(
+    cli: &Cli,
+    host: &str,
+    user: Option<&str>,
+) -> qsh_core::Result<()> {
+    info!("Using channel model...");
+
+    // Build SSH config from CLI options
+    let ssh_config = SshConfig {
+        connect_timeout: std::time::Duration::from_secs(30),
+        identity_file: cli.identity.first().cloned(),
+        skip_host_key_check: false,
+        port_range: cli.bootstrap_port_range,
+        server_args: cli.bootstrap_server_args.clone(),
+        mode: match cli.ssh_bootstrap_mode {
+            SshBootstrapMode::Ssh => BootstrapMode::SshCli,
+            SshBootstrapMode::Russh => BootstrapMode::Russh,
+        },
+    };
+
+    // Bootstrap returns a handle that keeps the SSH process alive
+    let bootstrap_handle = bootstrap(host, cli.port, user, &ssh_config).await?;
+    let server_info = &bootstrap_handle.server_info;
+
+    // Use bootstrap info to connect
+    let connect_host = if server_info.address == "0.0.0.0"
+        || server_info.address == "::"
+        || server_info.address.starts_with("0.")
+    {
+        host.to_string()
+    } else {
+        server_info.address.clone()
+    };
+
+    let addr = format!("{}:{}", connect_host, server_info.port)
+        .to_socket_addrs()
+        .map_err(|e| qsh_core::Error::Transport {
+            message: format!("failed to resolve server address: {}", e),
+        })?
+        .next()
+        .ok_or_else(|| qsh_core::Error::Transport {
+            message: "no addresses found for server".to_string(),
+        })?;
+
+    let session_key = server_info.decode_session_key()?;
+    let cert_hash = server_info.decode_cert_hash().ok();
+
+    let config = ConnectionConfig {
+        server_addr: addr,
+        session_key,
+        cert_hash,
+        term_size: get_term_size(),
+        term_type: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
+        env: collect_terminal_env(),
+        predictive_echo: !cli.no_prediction,
+        connect_timeout: cli.connect_timeout(),
+        zero_rtt_available: false,
+        keep_alive_interval: cli.keep_alive_interval(),
+        max_idle_timeout: cli.max_idle_timeout(),
+    };
+
+    // Connect using the channel model (no implicit terminal)
+    let conn = ChannelConnection::connect(config).await?;
+    info!(
+        rtt = ?conn.rtt(),
+        session_id = ?conn.session_id(),
+        "Channel model connection established"
+    );
+
+    // Drop the bootstrap handle now that QUIC connection is established
+    drop(bootstrap_handle);
+
+    // Open a terminal channel
+    let term_size = get_term_size();
+    let terminal_params = qsh_core::protocol::TerminalParams {
+        term_size,
+        term_type: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
+        env: collect_terminal_env(),
+        shell: cli.command_string(),
+        last_generation: 0,
+        last_input_seq: 0,
+    };
+
+    let terminal = conn.open_terminal(terminal_params).await?;
+    info!(channel_id = ?terminal.channel_id(), "Terminal channel opened");
+
+    // Run the channel session
+    let user_host = format_user_host(user, host);
+    run_channel_session(conn, terminal, cli, Some(user_host)).await
+}
+
 async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Result<()> {
     #[cfg(feature = "standalone")]
     if cli.direct {
         return run_client_direct(cli, host, user).await;
+    }
+
+    // Use channel model if requested (experimental)
+    if cli.channel_model {
+        return run_client_channel_model(cli, host, user).await;
     }
 
     // Step 1: Bootstrap via SSH to get QUIC endpoint info
@@ -976,4 +1077,175 @@ fn create_status_overlay(cli: &Cli, user_host: Option<String>) -> StatusOverlay 
     }
 
     overlay
+}
+
+/// Run a terminal session using the channel model (experimental).
+///
+/// This is a simplified version of run_session that works with TerminalChannel
+/// instead of ClientConnection.
+async fn run_channel_session(
+    conn: ChannelConnection,
+    terminal: TerminalChannel,
+    cli: &Cli,
+    user_host: Option<String>,
+) -> qsh_core::Result<()> {
+    info!(
+        caps = ?conn.server_capabilities(),
+        "Server capabilities"
+    );
+
+    // Create status overlay
+    let mut overlay = create_status_overlay(cli, user_host);
+    overlay.set_status(ConnectionStatus::Connected);
+
+    // Initialize RTT from connection
+    overlay.metrics_mut().update_rtt(conn.rtt());
+    overlay.metrics_mut().record_heard();
+
+    // Overlay refresh interval
+    let mut overlay_refresh = tokio::time::interval(Duration::from_secs(2));
+    overlay_refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    // Parse toggle key
+    let toggle_key = parse_toggle_key(&cli.overlay_key);
+
+    // Parse escape key and create handler
+    let escape_key = parse_escape_key(&cli.escape_key);
+    let mut escape_handler = EscapeHandler::new(escape_key);
+
+    // Enter raw terminal mode
+    let _raw_guard = match RawModeGuard::enter() {
+        Ok(guard) => guard,
+        Err(e) => {
+            warn!(error = %e, "Failed to enter raw mode");
+            return Err(e.into());
+        }
+    };
+
+    debug!("Entered raw terminal mode (channel model)");
+
+    // Create stdin/stdout handlers
+    let mut stdin = StdinReader::new();
+    let mut stdout = StdoutWriter::new();
+
+    // Set up SIGWINCH signal handler
+    #[cfg(unix)]
+    let mut sigwinch =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+            .map_err(qsh_core::Error::Io)?;
+
+    // Main session loop
+    loop {
+        #[cfg(unix)]
+        let resize_event = sigwinch.recv();
+        #[cfg(not(unix))]
+        let resize_event = std::future::pending::<Option<()>>();
+
+        tokio::select! {
+            biased;
+
+            // Handle terminal resize
+            _ = resize_event => {
+                if let Ok(new_size) = get_terminal_size() {
+                    debug!(cols = new_size.cols, rows = new_size.rows, "Terminal resized");
+                    // TODO: Send resize message to server through channel
+                }
+            }
+
+            // Handle user input
+            result = stdin.read() => {
+                let data = match result {
+                    Some(data) => data,
+                    None => {
+                        info!("EOF on stdin");
+                        break;
+                    }
+                };
+
+                // Check toggle key (only if overlay is allowed)
+                if let (Some(key), true) = (toggle_key, data.len() == 1) {
+                    if data[0] == key {
+                        let visible = overlay.is_visible();
+                        overlay.set_visible(!visible);
+                        render_overlay_if_visible(&overlay, &mut stdout).await;
+                        continue;
+                    }
+                }
+
+                // Check escape sequence
+                match escape_handler.process(&data) {
+                    EscapeResult::Command(EscapeCommand::Disconnect) => {
+                        info!("Escape sequence: disconnect");
+                        break;
+                    }
+                    EscapeResult::Command(EscapeCommand::ToggleOverlay) => {
+                        let visible = overlay.is_visible();
+                        overlay.set_visible(!visible);
+                        render_overlay_if_visible(&overlay, &mut stdout).await;
+                        continue;
+                    }
+                    EscapeResult::Command(EscapeCommand::SendEscapeKey) => {
+                        // Send the escape character itself
+                        let _ = terminal.queue_input(&[escape_key.unwrap_or(0x1e)], false);
+                        continue;
+                    }
+                    EscapeResult::Waiting => {
+                        // Waiting for command key, don't send anything yet
+                        continue;
+                    }
+                    EscapeResult::PassThrough(pass_data) => {
+                        // Queue the input
+                        if let Err(e) = terminal.queue_input(&pass_data, false) {
+                            warn!(error = %e, "Failed to queue input");
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Handle terminal output
+            result = terminal.recv_output() => {
+                match result {
+                    Ok(output) => {
+                        overlay.metrics_mut().record_heard();
+
+                        // Output the data
+                        if let Err(e) = stdout.write(&output.data).await {
+                            warn!(error = %e, "stdout write error");
+                            break;
+                        }
+
+                        // Render status overlay
+                        render_overlay_if_visible(&overlay, &mut stdout).await;
+                    }
+                    Err(qsh_core::Error::ConnectionClosed) => {
+                        info!("Channel closed");
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "recv_output error");
+                        break;
+                    }
+                }
+            }
+
+            // Overlay refresh
+            _ = overlay_refresh.tick() => {
+                overlay.metrics_mut().update_rtt(conn.rtt());
+                render_overlay_if_visible(&overlay, &mut stdout).await;
+            }
+        }
+    }
+
+    // Restore terminal
+    restore_terminal();
+
+    // Close the terminal channel
+    terminal.mark_closed();
+
+    // Close the connection
+    info!("Shutting down channel model connection...");
+    conn.close().await?;
+
+    Ok(())
 }

@@ -29,6 +29,9 @@ pub struct QuicStream {
 }
 
 /// Map a bidirectional stream ID to StreamType.
+/// Note: This is legacy behavior for backward compatibility. New code should use
+/// the channel model where stream type is determined by the channel open handshake.
+#[allow(deprecated)]
 async fn map_bidi_stream_type(stream_id: u64, next_forward_id: &Arc<Mutex<u32>>) -> StreamType {
     match stream_id {
         0 => StreamType::Control,
@@ -44,6 +47,9 @@ async fn map_bidi_stream_type(stream_id: u64, next_forward_id: &Arc<Mutex<u32>>)
 }
 
 /// Map a unidirectional stream ID to StreamType based on initiator.
+/// Note: This is legacy behavior for backward compatibility. New code should use
+/// the channel model where stream type is determined by the channel open handshake.
+#[allow(deprecated)]
 fn map_uni_stream_type(stream_id: u64) -> StreamType {
     // QUIC stream ID bit0 = initiator (0 client, 1 server), bit1 = direction (0 bidirectional, 1 unidirectional)
     let initiator_server = stream_id & 0x1 == 1;
@@ -159,7 +165,7 @@ impl StreamPair for QuicStream {
         let recv_opt = self.recv.as_ref().map(Arc::clone);
         let recv_buf = Arc::clone(&self.recv_buf);
 
-        let fut = async move {
+        async move {
             let Some(recv) = recv_opt else {
                 return Err(Error::Transport {
                     message: "stream is send-only".to_string(),
@@ -192,11 +198,6 @@ impl StreamPair for QuicStream {
                     }
                 }
             }
-        };
-
-        async move {
-            let result = fut.await;
-            result
         }
     }
 
@@ -224,6 +225,58 @@ impl QuicStream {
             })?;
         }
         Ok(())
+    }
+
+    /// Send raw bytes without message framing.
+    ///
+    /// Used for forwarding raw TCP data where we don't want the overhead
+    /// of message encoding.
+    pub async fn send_raw(&mut self, data: &[u8]) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        let Some(send) = &self.send else {
+            return Err(Error::Transport {
+                message: "stream is receive-only".to_string(),
+            });
+        };
+
+        let mut send = send.lock().await;
+        send.write_all(data).await.map_err(|e| Error::Transport {
+            message: format!("failed to send raw data: {}", e),
+        })?;
+        send.flush().await.map_err(|e| Error::Transport {
+            message: format!("failed to flush stream: {}", e),
+        })?;
+        Ok(())
+    }
+
+    /// Receive raw bytes without message framing.
+    ///
+    /// Used for forwarding raw TCP data. Returns the number of bytes read,
+    /// or 0 if the stream has ended.
+    pub async fn recv_raw(&mut self, buf: &mut [u8]) -> Result<usize> {
+        let Some(recv) = &self.recv else {
+            return Err(Error::Transport {
+                message: "stream is send-only".to_string(),
+            });
+        };
+
+        let mut recv = recv.lock().await;
+        // quinn's RecvStream::read returns Option<usize> where None = EOF
+        match recv.read(buf).await {
+            Ok(Some(n)) => Ok(n),
+            Ok(None) => Ok(0), // EOF
+            Err(e) => Err(Error::Transport {
+                message: format!("failed to receive raw data: {}", e),
+            }),
+        }
+    }
+
+    /// Close the stream.
+    pub fn close(&mut self) {
+        // Drop the stream handles, which will send FIN
+        self.send.take();
+        self.recv.take();
     }
 }
 
@@ -270,9 +323,30 @@ impl QuicConnection {
 impl Connection for QuicConnection {
     type Stream = QuicStream;
 
+    #[allow(deprecated)]
     async fn open_stream(&self, stream_type: StreamType) -> Result<Self::Stream> {
         match stream_type {
-            StreamType::Control | StreamType::Tunnel => {
+            // New channel model stream types
+            StreamType::Control | StreamType::ChannelBidi(_) => {
+                let (send, recv) = self.inner.open_bi().await.map_err(|e| Error::Transport {
+                    message: format!("failed to open bidirectional stream: {}", e),
+                })?;
+                Ok(QuicStream::new(send, recv))
+            }
+            StreamType::ChannelIn(_) => {
+                let send = self.inner.open_uni().await.map_err(|e| Error::Transport {
+                    message: format!("failed to open channel input stream: {}", e),
+                })?;
+                Ok(QuicStream::from_send(send))
+            }
+            StreamType::ChannelOut(_) => {
+                let send = self.inner.open_uni().await.map_err(|e| Error::Transport {
+                    message: format!("failed to open channel output stream: {}", e),
+                })?;
+                Ok(QuicStream::from_send(send))
+            }
+            // Legacy stream types
+            StreamType::Tunnel => {
                 let (send, recv) = self.inner.open_bi().await.map_err(|e| Error::Transport {
                     message: format!("failed to open bidirectional stream: {}", e),
                 })?;

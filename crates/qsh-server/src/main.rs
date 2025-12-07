@@ -516,7 +516,7 @@ async fn handle_session(
             // Handle control messages (resize, shutdown)
             msg = session.process_control() => {
                 match msg {
-                    Ok(Some(Message::Resize(ResizePayload { cols, rows }))) => {
+                    Ok(Some(Message::Resize(ResizePayload { cols, rows, .. }))) => {
                         debug!(cols, rows, "Terminal resize requested");
                         if let Err(e) = entry.resize(cols, rows) {
                             warn!(error = %e, "Failed to resize PTY");
@@ -665,4 +665,182 @@ async fn dispatch_dynamic_stream<C: Connection + 'static>(
             warn!(?stream_type, msg = ?other, "Unexpected first message on dynamic stream");
         }
     }
+}
+
+// =============================================================================
+// Channel Model Handler (SSH-style multiplexing)
+// =============================================================================
+
+/// Handle a connection using the SSH-style channel model.
+///
+/// This is an alternative to `handle_connection` that uses `ConnectionHandler`
+/// for multiplexed channels instead of a single terminal session per connection.
+#[allow(dead_code)]
+async fn handle_connection_channel_model(
+    incoming: quinn::Incoming,
+    session_config: SessionConfig,
+    conn_config: qsh_server::ConnectionConfig,
+    _registry: Arc<qsh_server::ConnectionRegistry>,
+    authorizer: Option<Arc<SessionAuthorizer>>,
+    #[allow(unused_variables)] standalone_auth: Option<StandaloneAuth>,
+) -> qsh_core::Result<()> {
+    let addr = incoming.remote_address();
+    info!(addr = %addr, "Incoming connection (channel model)");
+
+    let conn = incoming.await.map_err(|e| qsh_core::Error::Transport {
+        message: format!("connection failed: {}", e),
+    })?;
+
+    // If standalone mode is enabled, perform mutual SSH key authentication
+    #[cfg(feature = "standalone")]
+    if let Some(auth) = standalone_auth {
+        use qsh_server::standalone::{AuthResult, authenticate_connection, send_auth_failure};
+
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| qsh_core::Error::Transport {
+                message: format!("failed to open auth stream: {}", e),
+            })?;
+
+        match authenticate_connection(auth.as_ref(), &mut send, &mut recv).await {
+            AuthResult::Success { client_fingerprint } => {
+                info!(%client_fingerprint, "Standalone client authenticated (channel model)");
+            }
+            AuthResult::Failure {
+                code,
+                internal_message,
+            } => {
+                error!(
+                    code = ?code,
+                    message = %internal_message,
+                    "Standalone authentication failed"
+                );
+                if let Err(e) = send_auth_failure(&mut send, code, &internal_message).await {
+                    warn!(error = %e, "Failed to send AuthFailure to client");
+                }
+                return Err(qsh_core::Error::AuthenticationFailed);
+            }
+        }
+    }
+
+    let quic = qsh_core::transport::QuicConnection::new(conn);
+
+    // Perform Hello/HelloAck handshake and create connection handler
+    let pending = PendingSession::new(quic, authorizer, session_config).await?;
+    let (handler, mut shutdown_rx) = pending.accept_channel_model(conn_config).await?;
+
+    // Handle the connection using the channel model
+    handle_channel_model_session(handler, shutdown_rx).await
+}
+
+/// Handle a channel-model session.
+///
+/// This processes control messages (ChannelOpen, ChannelClose, GlobalRequest, etc.)
+/// and routes streams to appropriate channels.
+async fn handle_channel_model_session(
+    handler: std::sync::Arc<qsh_server::ConnectionHandler>,
+    mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
+) -> qsh_core::Result<()> {
+    info!(
+        session_id = ?handler.session_id(),
+        addr = %handler.remote_addr(),
+        rtt = ?handler.rtt(),
+        "Channel model session started"
+    );
+
+    let quic = handler.quic().clone();
+    let handler_clone = handler.clone();
+
+    // Spawn stream acceptor task
+    let accept_handler = handler.clone();
+    let accept_task = tokio::spawn(async move {
+        loop {
+            match quic.accept_stream().await {
+                Ok((stream_type, stream)) => {
+                    let h = accept_handler.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = h.handle_incoming_stream(stream_type, stream).await {
+                            warn!(error = %e, "Failed to handle incoming stream");
+                        }
+                    });
+                }
+                Err(qsh_core::Error::ConnectionClosed) => break,
+                Err(e) => {
+                    warn!(error = %e, "Failed to accept stream");
+                    break;
+                }
+            }
+        }
+    });
+
+    // Main control message loop
+    loop {
+        tokio::select! {
+            biased;
+
+            // Handle shutdown signal
+            _ = shutdown_rx.recv() => {
+                debug!("Shutdown signal received");
+                break;
+            }
+
+            // Handle control messages
+            msg = handler_clone.recv_control() => {
+                match msg {
+                    Ok(Message::ChannelOpen(payload)) => {
+                        if let Err(e) = handler_clone.handle_channel_open(payload).await {
+                            error!(error = %e, "Failed to handle ChannelOpen");
+                        }
+                    }
+                    Ok(Message::ChannelClose(payload)) => {
+                        if let Err(e) = handler_clone.handle_channel_close(payload).await {
+                            error!(error = %e, "Failed to handle ChannelClose");
+                        }
+                    }
+                    Ok(Message::GlobalRequest(payload)) => {
+                        if let Err(e) = handler_clone.handle_global_request(payload).await {
+                            error!(error = %e, "Failed to handle GlobalRequest");
+                        }
+                    }
+                    Ok(Message::Resize(payload)) => {
+                        if let Err(e) = handler_clone.handle_resize(payload).await {
+                            warn!(error = %e, "Failed to handle Resize");
+                        }
+                    }
+                    Ok(Message::StateAck(payload)) => {
+                        if let Err(e) = handler_clone.handle_state_ack(payload).await {
+                            warn!(error = %e, "Failed to handle StateAck");
+                        }
+                    }
+                    Ok(Message::Shutdown(payload)) => {
+                        info!(reason = ?payload.reason, "Client requested shutdown");
+                        break;
+                    }
+                    Ok(other) => {
+                        warn!(msg = ?other, "Unexpected control message");
+                    }
+                    Err(qsh_core::Error::ConnectionClosed) => {
+                        info!("Connection closed");
+                        break;
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Control stream error");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Cleanup
+    accept_task.abort();
+    handler.shutdown().await;
+
+    info!(
+        session_id = ?handler.session_id(),
+        "Channel model session ended"
+    );
+
+    Ok(())
 }

@@ -10,8 +10,10 @@
 //! - File transfer client
 //! - Connection management
 //! - Raw terminal mode handling
+//! - Channel-based multiplexing (SSH-style)
 //! - Direct connection mode with SSH key authentication (feature-gated)
 
+pub mod channel;
 pub mod cli;
 pub mod connection;
 pub mod escape;
@@ -26,8 +28,12 @@ pub mod terminal;
 #[cfg(feature = "standalone")]
 pub mod standalone;
 
+pub use channel::{FileChannel, ForwardChannel, TerminalChannel};
 pub use cli::{Cli, CpCli, FilePath};
-pub use connection::{ClientConnection, ConnectionConfig, LatencyStats, LatencyTracker};
+pub use connection::{
+    ChannelConnection, ChannelHandle, ClientConnection, ConnectionConfig, LatencyStats,
+    LatencyTracker,
+};
 pub use escape::{EscapeCommand, EscapeHandler, EscapeResult, parse_escape_key};
 pub use file::{FileTransfer, TransferResult};
 pub use forward::{LocalForwarder, Socks5Proxy};

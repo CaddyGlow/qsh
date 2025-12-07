@@ -17,13 +17,15 @@ use tracing::{debug, info, warn};
 use qsh_core::constants::SESSION_KEY_LEN;
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
-    Capabilities, HelloAckPayload, HelloPayload, Message, ShutdownPayload, ShutdownReason,
-    StateDiff, StateUpdatePayload, TerminalOutputPayload,
+    Capabilities, HelloAckPayload, HelloPayload, Message, SessionId, ShutdownPayload,
+    ShutdownReason, StateDiff, StateUpdatePayload, TerminalOutputPayload,
 };
 use qsh_core::session::SessionState;
 use qsh_core::terminal::{TerminalParser, TerminalState};
 use qsh_core::transport::{Connection, QuicConnection, QuicStream, StreamPair, StreamType};
 use rand::Rng;
+
+use crate::connection::{ConnectionConfig, ConnectionHandler};
 
 /// Server session configuration.
 #[derive(Debug, Clone)]
@@ -162,6 +164,8 @@ impl PendingSession {
                     hello.protocol_version
                 )),
                 capabilities: config.capabilities.clone(),
+                session_id: SessionId::new(),
+                server_nonce: 0,
                 initial_state: None,
                 zero_rtt_available: false,
             };
@@ -180,6 +184,8 @@ impl PendingSession {
                 accepted: false,
                 reject_reason: Some("invalid session key".to_string()),
                 capabilities: config.capabilities.clone(),
+                session_id: SessionId::new(),
+                server_nonce: 0,
                 initial_state: None,
                 zero_rtt_available: false,
             };
@@ -207,6 +213,8 @@ impl PendingSession {
             accepted: false,
             reject_reason: Some(reason),
             capabilities: self.config.capabilities.clone(),
+            session_id: SessionId::new(),
+            server_nonce: 0,
             initial_state: None,
             zero_rtt_available: false,
         };
@@ -228,6 +236,8 @@ impl PendingSession {
             accepted: true,
             reject_reason: None,
             capabilities: self.config.capabilities.clone(),
+            session_id: SessionId::new(),
+            server_nonce: rand::random(),
             initial_state: Some(initial_state.clone()),
             zero_rtt_available: true,
         };
@@ -272,6 +282,43 @@ impl PendingSession {
             term_size: actual_size,
             last_sent_state: Some(initial_state),
         })
+    }
+
+    /// Finalize the handshake and build a [`ConnectionHandler`] for the channel model.
+    ///
+    /// This is the SSH-style channel model where channels are created dynamically
+    /// after the connection is established, rather than having a single terminal
+    /// session per connection.
+    pub async fn accept_channel_model(
+        mut self,
+        conn_config: ConnectionConfig,
+    ) -> Result<(Arc<ConnectionHandler>, tokio::sync::mpsc::Receiver<()>)> {
+        let session_id = SessionId::new();
+
+        // Send HelloAck (no initial terminal state - channels created separately)
+        let ack = HelloAckPayload {
+            protocol_version: 1,
+            accepted: true,
+            reject_reason: None,
+            capabilities: self.config.capabilities.clone(),
+            session_id,
+            server_nonce: rand::random(),
+            initial_state: None, // No implicit terminal in channel model
+            zero_rtt_available: true,
+        };
+        self.control.send(&Message::HelloAck(ack)).await?;
+
+        info!(
+            session_id = ?session_id,
+            addr = %self.quic.remote_addr(),
+            "Connection established (channel model)"
+        );
+
+        // Create the connection handler
+        let (handler, shutdown_rx) =
+            ConnectionHandler::new(self.quic, self.control, session_id, conn_config);
+
+        Ok((handler, shutdown_rx))
     }
 }
 

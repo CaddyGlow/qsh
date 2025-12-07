@@ -68,6 +68,7 @@ prop_compose! {
             session_key,
             client_nonce,
             capabilities,
+            resume_session: None,
             term_size,
             term_type,
             env: env.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
@@ -179,18 +180,26 @@ prop_compose! {
 }
 
 /// Generate an arbitrary Message (base messages without feature-gated variants)
+#[allow(deprecated)]
 fn arb_message_base() -> impl Strategy<Value = Message> {
     prop_oneof![
         // Control messages
         arb_hello().prop_map(Message::Hello),
         (any::<u16>(), any::<u16>())
-            .prop_map(|(cols, rows)| Message::Resize(ResizePayload { cols, rows })),
+            .prop_map(|(cols, rows)| Message::Resize(ResizePayload {
+                channel_id: None,
+                cols,
+                rows,
+            })),
         (arb_shutdown_reason(), any::<Option<String>>())
             .prop_map(|(reason, message)| Message::Shutdown(ShutdownPayload { reason, message })),
-        // Terminal messages
+        // Terminal messages (legacy)
         arb_terminal_input().prop_map(Message::TerminalInput),
-        any::<u64>().prop_map(|g| Message::StateAck(StateAckPayload { generation: g })),
-        // Forward messages
+        any::<u64>().prop_map(|g| Message::StateAck(StateAckPayload {
+            channel_id: None,
+            generation: g,
+        })),
+        // Forward messages (legacy)
         (any::<u64>(), arb_forward_spec()).prop_map(|(id, spec)| {
             Message::ForwardRequest(ForwardRequestPayload {
                 forward_id: id,
@@ -253,6 +262,7 @@ proptest! {
         prop_assert_eq!(msg, decoded);
     }
 
+    #[allow(deprecated)]
     #[test]
     fn roundtrip_terminal_input(
         seq in any::<u64>(),

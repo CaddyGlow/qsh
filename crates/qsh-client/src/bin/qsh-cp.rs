@@ -9,7 +9,7 @@ use clap::Parser;
 use tracing::{error, info};
 
 use qsh_client::file::transfer::resolve_remote_upload_path;
-use qsh_client::{ClientConnection, CpCli, FilePath, FileTransfer};
+use qsh_client::{ChannelConnection, ClientConnection, CpCli, FilePath, FileTransfer};
 use qsh_core::transport::QuicConnection;
 
 #[cfg(feature = "standalone")]
@@ -60,7 +60,12 @@ fn main() {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
 
     let result = rt.block_on(async {
-        run_transfer(&cli, &remote_host, remote_user.as_deref(), &source, &dest).await
+        if cli.channel_model {
+            run_transfer_channel_model(&cli, &remote_host, remote_user.as_deref(), &source, &dest)
+                .await
+        } else {
+            run_transfer(&cli, &remote_host, remote_user.as_deref(), &source, &dest).await
+        }
     });
 
     if let Err(e) = result {
@@ -304,6 +309,155 @@ async fn connect(
 
     let quic = conn.quic_connection();
     Ok((conn, quic))
+}
+
+/// Run file transfer using the SSH-style channel model (experimental).
+async fn run_transfer_channel_model(
+    cli: &CpCli,
+    host: &str,
+    user: Option<&str>,
+    source: &FilePath,
+    dest: &FilePath,
+) -> qsh_core::Result<()> {
+    use qsh_client::{BootstrapMode, SshConfig, bootstrap};
+
+    info!("Using channel model for file transfer");
+
+    // Bootstrap via SSH
+    let ssh_config = SshConfig {
+        connect_timeout: std::time::Duration::from_secs(30),
+        identity_file: cli.identity.first().cloned(),
+        skip_host_key_check: false,
+        port_range: None,
+        server_args: None,
+        mode: BootstrapMode::SshCli,
+    };
+
+    let handle = bootstrap(host, cli.port, user, &ssh_config).await?;
+    let server_info = &handle.server_info;
+
+    // Use bootstrap info to connect
+    let connect_host = if server_info.address == "0.0.0.0"
+        || server_info.address == "::"
+        || server_info.address.starts_with("0.")
+    {
+        host.to_string()
+    } else {
+        server_info.address.clone()
+    };
+
+    let addr = format!("{}:{}", connect_host, server_info.port)
+        .to_socket_addrs()
+        .map_err(|e| qsh_core::Error::Transport {
+            message: format!("failed to resolve server address: {}", e),
+        })?
+        .next()
+        .ok_or_else(|| qsh_core::Error::Transport {
+            message: "no addresses found for server".to_string(),
+        })?;
+
+    let session_key = server_info.decode_session_key()?;
+    let cert_hash = server_info.decode_cert_hash().ok();
+
+    let config = qsh_client::ConnectionConfig {
+        server_addr: addr,
+        session_key,
+        cert_hash,
+        term_size: qsh_core::protocol::TermSize { cols: 80, rows: 24 },
+        term_type: "xterm-256color".to_string(),
+        env: Vec::new(),
+        predictive_echo: false,
+        connect_timeout: std::time::Duration::from_secs(30),
+        zero_rtt_available: false,
+        keep_alive_interval: Some(std::time::Duration::from_millis(500)),
+        max_idle_timeout: std::time::Duration::from_secs(15),
+    };
+
+    // Connect using the channel model (no implicit terminal opened)
+    let conn = ChannelConnection::connect(config).await?;
+    info!(rtt = ?conn.rtt(), session_id = ?conn.session_id(), "Channel model connection established");
+
+    // Drop bootstrap handle after connection
+    drop(handle);
+
+    // Use the underlying QUIC connection for file transfer
+    // The channel model handshake is complete, but file transfers still use
+    // direct streams on the QuicConnection for now
+    let quic = Arc::clone(conn.quic());
+
+    // Create file transfer client
+    let transfer = FileTransfer::new(quic);
+    let options = cli.transfer_options();
+
+    // Perform transfer
+    if cli.is_upload() {
+        let local_path = match source {
+            FilePath::Local(p) => p,
+            _ => unreachable!(),
+        };
+        let raw_remote_path: &str = match dest {
+            FilePath::Remote { path, .. } => path.as_str(),
+            _ => unreachable!(),
+        };
+
+        // For scp-style semantics we first determine whether the raw remote
+        // path refers to an existing directory (when specified), then resolve
+        // the final upload path accordingly.
+        let remote_is_dir = if !raw_remote_path.is_empty() {
+            match transfer.remote_is_directory(raw_remote_path).await {
+                Ok(is_dir) => is_dir,
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+
+        let remote_path = resolve_remote_upload_path(local_path, raw_remote_path, remote_is_dir);
+
+        info!(local = %local_path.display(), remote = %remote_path, "Starting upload (channel model)");
+        let result = transfer.upload(local_path, &remote_path, options).await?;
+
+        if result.skipped {
+            eprintln!("File already up to date, skipped transfer");
+        } else {
+            eprintln!(
+                "Uploaded {} in {:.1}s ({}/s){}",
+                format_bytes(result.bytes),
+                result.duration_secs,
+                format_bytes((result.bytes as f64 / result.duration_secs) as u64),
+                if result.delta_used { " [delta]" } else { "" }
+            );
+        }
+    } else {
+        let remote_path = match source {
+            FilePath::Remote { path, .. } => path.as_str(),
+            _ => unreachable!(),
+        };
+        let local_path = match dest {
+            FilePath::Local(p) => p,
+            _ => unreachable!(),
+        };
+
+        info!(remote = %remote_path, local = %local_path.display(), "Starting download (channel model)");
+        let result = transfer.download(remote_path, local_path, options).await?;
+
+        if result.skipped {
+            eprintln!("File already up to date, skipped transfer");
+        } else {
+            eprintln!(
+                "Downloaded {} in {:.1}s ({}/s){}",
+                format_bytes(result.bytes),
+                result.duration_secs,
+                format_bytes((result.bytes as f64 / result.duration_secs) as u64),
+                if result.delta_used { " [delta]" } else { "" }
+            );
+        }
+    }
+
+    // Close the channel connection gracefully
+    conn.close().await?;
+
+    Ok(())
 }
 
 fn format_bytes(bytes: u64) -> String {

@@ -28,29 +28,61 @@ use crate::protocol::Message;
 // Stream Types
 // =============================================================================
 
+use crate::protocol::ChannelId;
+
 /// Identifies the type/purpose of a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StreamType {
-    /// Control stream (client-initiated bidirectional, ID 0).
+    /// Control stream (bidirectional, ID 0).
+    /// Carries: Hello, HelloAck, GlobalRequest, GlobalReply,
+    ///          ChannelOpen, ChannelAccept, ChannelReject, ChannelClose,
+    ///          Resize, StateAck, Shutdown
     Control,
-    /// Terminal output from server (server-initiated unidirectional, ID 3).
+
+    /// Channel input stream (unidirectional client->server).
+    /// Carries ChannelData with terminal input or file data.
+    ChannelIn(ChannelId),
+
+    /// Channel output stream (unidirectional server->client).
+    /// Carries ChannelData with terminal output, state updates, or file data.
+    ChannelOut(ChannelId),
+
+    /// Bidirectional channel stream (for forwards, tunnel).
+    /// Carries raw TCP bytes (forwards) or ChannelData with TunnelPacket (tunnel).
+    ChannelBidi(ChannelId),
+
+    // =========================================================================
+    // Legacy stream types (deprecated - kept for backward compatibility)
+    // =========================================================================
+
+    /// Terminal output from server (legacy - use ChannelOut).
+    #[deprecated(note = "Use ChannelOut(channel_id)")]
     TerminalOut,
-    /// Terminal input to server (client-initiated unidirectional, ID 2).
+    /// Terminal input to server (legacy - use ChannelIn).
+    #[deprecated(note = "Use ChannelIn(channel_id)")]
     TerminalIn,
-    /// IP tunnel data (client-initiated bidirectional, ID 4 reserved).
+    /// IP tunnel data (legacy - use ChannelBidi).
+    #[deprecated(note = "Use ChannelBidi(channel_id)")]
     Tunnel,
-    /// Port forward data (dynamic bidirectional streams).
+    /// Port forward data (legacy - use ChannelBidi).
+    #[deprecated(note = "Use ChannelBidi(channel_id)")]
     Forward(u32),
-    /// File transfer data (dynamic bidirectional streams).
+    /// File transfer data (legacy - use ChannelIn/ChannelOut pair).
+    #[deprecated(note = "Use ChannelIn/ChannelOut pair")]
     FileTransfer(u64),
 }
 
 impl StreamType {
     /// Get the QUIC stream ID for this type (if fixed).
-    /// Forward and FileTransfer streams are dynamically allocated, so return None.
+    /// Channel streams are dynamically allocated, so return None.
+    #[allow(deprecated)]
     pub fn fixed_id(&self) -> Option<u64> {
         match self {
             StreamType::Control => Some(0),
+            StreamType::ChannelIn(_) | StreamType::ChannelOut(_) | StreamType::ChannelBidi(_) => {
+                None
+            }
+            // Legacy types
             StreamType::TerminalIn => Some(2),
             StreamType::TerminalOut => Some(3),
             StreamType::Tunnel => Some(4),
@@ -60,10 +92,13 @@ impl StreamType {
     }
 
     /// Check if this is a bidirectional stream type.
+    #[allow(deprecated)]
     pub fn is_bidirectional(&self) -> bool {
         matches!(
             self,
             StreamType::Control
+                | StreamType::ChannelBidi(_)
+                // Legacy
                 | StreamType::Tunnel
                 | StreamType::Forward(_)
                 | StreamType::FileTransfer(_)
@@ -71,8 +106,26 @@ impl StreamType {
     }
 
     /// Check if this is a unidirectional stream type.
+    #[allow(deprecated)]
     pub fn is_unidirectional(&self) -> bool {
-        matches!(self, StreamType::TerminalIn | StreamType::TerminalOut)
+        matches!(
+            self,
+            StreamType::ChannelIn(_)
+                | StreamType::ChannelOut(_)
+                // Legacy
+                | StreamType::TerminalIn
+                | StreamType::TerminalOut
+        )
+    }
+
+    /// Get the channel ID for channel stream types.
+    pub fn channel_id(&self) -> Option<ChannelId> {
+        match self {
+            StreamType::ChannelIn(id)
+            | StreamType::ChannelOut(id)
+            | StreamType::ChannelBidi(id) => Some(*id),
+            _ => None,
+        }
     }
 }
 
@@ -134,10 +187,90 @@ pub trait Connection: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{ChannelId, ChannelSide};
     use std::collections::HashSet;
 
     #[test]
-    fn stream_type_equality_and_hashing() {
+    fn channel_stream_type_equality_and_hashing() {
+        let mut set = HashSet::new();
+
+        set.insert(StreamType::Control);
+        set.insert(StreamType::ChannelIn(ChannelId::client(0)));
+        set.insert(StreamType::ChannelIn(ChannelId::client(1)));
+        set.insert(StreamType::ChannelIn(ChannelId::server(0))); // Different side
+        set.insert(StreamType::ChannelOut(ChannelId::client(0)));
+        set.insert(StreamType::ChannelBidi(ChannelId::client(0)));
+        set.insert(StreamType::ChannelIn(ChannelId::client(0))); // Duplicate
+
+        assert_eq!(set.len(), 6);
+    }
+
+    #[test]
+    fn channel_id_equality() {
+        // Client(5) != Server(5)
+        assert_ne!(ChannelId::client(5), ChannelId::server(5));
+
+        // Same side, same id are equal
+        assert_eq!(ChannelId::client(5), ChannelId::client(5));
+        assert_eq!(ChannelId::server(5), ChannelId::server(5));
+
+        // Different ids are not equal
+        assert_ne!(ChannelId::client(0), ChannelId::client(1));
+    }
+
+    #[test]
+    fn channel_id_encode_decode() {
+        let test_cases = [
+            ChannelId::client(0),
+            ChannelId::client(1),
+            ChannelId::client(u64::MAX >> 1),
+            ChannelId::server(0),
+            ChannelId::server(1),
+            ChannelId::server(u64::MAX >> 1),
+        ];
+
+        for id in test_cases {
+            let encoded = id.encode();
+            let decoded = ChannelId::decode(encoded);
+            assert_eq!(id, decoded, "encode/decode roundtrip failed for {:?}", id);
+        }
+    }
+
+    #[test]
+    fn channel_id_display() {
+        assert_eq!(format!("{}", ChannelId::client(0)), "c0");
+        assert_eq!(format!("{}", ChannelId::client(42)), "c42");
+        assert_eq!(format!("{}", ChannelId::server(0)), "s0");
+        assert_eq!(format!("{}", ChannelId::server(123)), "s123");
+    }
+
+    #[test]
+    fn stream_type_channel_directionality() {
+        let ch = ChannelId::client(0);
+
+        assert!(StreamType::Control.is_bidirectional());
+        assert!(StreamType::ChannelBidi(ch).is_bidirectional());
+
+        assert!(StreamType::ChannelIn(ch).is_unidirectional());
+        assert!(StreamType::ChannelOut(ch).is_unidirectional());
+
+        assert!(!StreamType::Control.is_unidirectional());
+        assert!(!StreamType::ChannelIn(ch).is_bidirectional());
+    }
+
+    #[test]
+    fn stream_type_channel_id_extraction() {
+        let ch = ChannelId::client(42);
+
+        assert_eq!(StreamType::ChannelIn(ch).channel_id(), Some(ch));
+        assert_eq!(StreamType::ChannelOut(ch).channel_id(), Some(ch));
+        assert_eq!(StreamType::ChannelBidi(ch).channel_id(), Some(ch));
+        assert_eq!(StreamType::Control.channel_id(), None);
+    }
+
+    #[allow(deprecated)]
+    #[test]
+    fn legacy_stream_type_equality_and_hashing() {
         let mut set = HashSet::new();
 
         set.insert(StreamType::Control);
@@ -148,29 +281,12 @@ mod tests {
         set.insert(StreamType::Forward(2));
         set.insert(StreamType::Forward(1)); // Duplicate
 
-        assert_eq!(set.len(), 6); // 5 unique types + 2 forwards = 6
+        assert_eq!(set.len(), 6);
     }
 
+    #[allow(deprecated)]
     #[test]
-    fn stream_type_forward_id_encoding() {
-        let f1 = StreamType::Forward(1);
-        let f2 = StreamType::Forward(2);
-        let f1_again = StreamType::Forward(1);
-
-        assert_ne!(f1, f2);
-        assert_eq!(f1, f1_again);
-
-        // Extract IDs
-        if let StreamType::Forward(id) = f1 {
-            assert_eq!(id, 1);
-        }
-        if let StreamType::Forward(id) = f2 {
-            assert_eq!(id, 2);
-        }
-    }
-
-    #[test]
-    fn stream_type_fixed_ids() {
+    fn legacy_stream_type_fixed_ids() {
         assert_eq!(StreamType::Control.fixed_id(), Some(0));
         assert_eq!(StreamType::TerminalIn.fixed_id(), Some(2));
         assert_eq!(StreamType::TerminalOut.fixed_id(), Some(3));
@@ -178,8 +294,9 @@ mod tests {
         assert_eq!(StreamType::Forward(42).fixed_id(), None);
     }
 
+    #[allow(deprecated)]
     #[test]
-    fn stream_type_directionality() {
+    fn legacy_stream_type_directionality() {
         assert!(StreamType::Control.is_bidirectional());
         assert!(StreamType::Tunnel.is_bidirectional());
         assert!(StreamType::Forward(1).is_bidirectional());
@@ -191,13 +308,12 @@ mod tests {
         assert!(!StreamType::TerminalIn.is_bidirectional());
     }
 
-    // Trait bounds test - verifies the trait is object-safe where applicable
-    // and has correct Send + Sync bounds
     #[test]
     fn trait_bounds_are_correct() {
         fn assert_send_sync<T: Send + Sync>() {}
 
-        // StreamType should be Send + Sync
         assert_send_sync::<StreamType>();
+        assert_send_sync::<ChannelId>();
+        assert_send_sync::<ChannelSide>();
     }
 }

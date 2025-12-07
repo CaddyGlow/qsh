@@ -272,6 +272,10 @@ pub struct Cli {
     #[cfg(feature = "standalone")]
     #[arg(long = "no-agent")]
     pub no_agent: bool,
+
+    /// Use SSH-style channel model (experimental)
+    #[arg(long = "channel-model", hide = true)]
+    pub channel_model: bool,
 }
 
 impl Cli {
@@ -445,6 +449,10 @@ pub struct CpCli {
     #[cfg(feature = "standalone")]
     #[arg(long = "no-agent")]
     pub no_agent: bool,
+
+    /// Use SSH-style channel model (experimental)
+    #[arg(long = "channel-model", hide = true)]
+    pub channel_model: bool,
 }
 
 /// Parsed file path (local or remote).
@@ -833,6 +841,7 @@ mod tests {
             assert!(!cli.accept_unknown_host);
             assert!(!cli.no_agent);
         }
+        assert!(!cli.channel_model);
     }
 
     // =========================================================================
@@ -1073,6 +1082,7 @@ mod tests {
             assert!(!cli.accept_unknown_host);
             assert!(!cli.no_agent);
         }
+        assert!(!cli.channel_model);
     }
 
     #[test]

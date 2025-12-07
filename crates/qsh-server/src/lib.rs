@@ -8,10 +8,13 @@
 //! - Port forwarding (local/remote)
 //! - File transfer handling
 //! - Terminal state tracking
+//! - Channel-based multiplexing (SSH-style)
 //! - Standalone mode with SSH key authentication (feature-gated)
 
 pub mod bootstrap;
+pub mod channel;
 pub mod cli;
+pub mod connection;
 pub mod file;
 pub mod forward;
 pub mod pty;
@@ -22,11 +25,13 @@ pub mod session;
 pub mod standalone;
 
 pub use bootstrap::BootstrapServer;
+pub use channel::{ChannelHandle, FileTransferChannel, ForwardChannel, TerminalChannel};
 pub use cli::Cli;
+pub use connection::{ConnectionConfig, ConnectionHandler, ConnectionSession};
 pub use file::FileHandler;
 pub use forward::ForwardHandler;
 pub use pty::{Pty, PtyRelay};
-pub use registry::{RealSessionSpawner, SessionRegistry};
+pub use registry::{ConnectionRegistry, ConnectionSessionGuard, RealSessionSpawner, SessionRegistry};
 pub use session::{PendingSession, ServerSession, SessionAuthorizer, SessionConfig};
 
 #[cfg(feature = "standalone")]
