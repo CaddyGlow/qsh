@@ -14,7 +14,8 @@ use tracing::{debug, info, warn};
 
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
-    ChannelId, DataFlags, FileDataPayload, Message, TerminalInputPayload, TerminalOutputPayload,
+    ChannelData, ChannelId, ChannelPayload, DataFlags, FileDataData, FileTransferMetadata,
+    Message, TerminalInputData, TerminalOutputData,
 };
 use qsh_core::terminal::TerminalState;
 use qsh_core::transport::{QuicSender, QuicStream, StreamPair};
@@ -123,10 +124,13 @@ impl TerminalChannel {
 
         let seq = self.inner.next_seq.fetch_add(1, Ordering::SeqCst);
 
-        let msg = Message::TerminalInput(TerminalInputPayload {
-            sequence: seq,
-            data: data.to_vec(),
-            predictable,
+        let msg = Message::ChannelDataMsg(ChannelData {
+            channel_id: self.inner.channel_id,
+            payload: ChannelPayload::TerminalInput(TerminalInputData {
+                sequence: seq,
+                data: data.to_vec(),
+                predictable,
+            }),
         });
 
         self.inner.input_tx.send(msg).map_err(|_| Error::Transport {
@@ -144,10 +148,13 @@ impl TerminalChannel {
 
         let seq = self.inner.next_seq.fetch_add(1, Ordering::SeqCst);
 
-        let msg = Message::TerminalInput(TerminalInputPayload {
-            sequence: seq,
-            data: data.to_vec(),
-            predictable,
+        let msg = Message::ChannelDataMsg(ChannelData {
+            channel_id: self.inner.channel_id,
+            payload: ChannelPayload::TerminalInput(TerminalInputData {
+                sequence: seq,
+                data: data.to_vec(),
+                predictable,
+            }),
         });
 
         self.inner.input_sender.send(&msg).await?;
@@ -155,7 +162,7 @@ impl TerminalChannel {
     }
 
     /// Receive output from the terminal.
-    pub async fn recv_output(&self) -> Result<TerminalOutputPayload> {
+    pub async fn recv_output(&self) -> Result<TerminalOutputData> {
         if self.inner.closed.load(Ordering::SeqCst) {
             return Err(Error::ConnectionClosed);
         }
@@ -163,20 +170,25 @@ impl TerminalChannel {
         let mut stream = self.inner.output_stream.lock().await;
         loop {
             match stream.recv().await? {
-                Message::TerminalOutput(output) => {
-                    // Update confirmed sequence
-                    self.inner
-                        .confirmed_seq
-                        .fetch_max(output.confirmed_input_seq, Ordering::SeqCst);
-                    return Ok(output);
-                }
-                Message::StateUpdate(update) => {
-                    // State updates also confirm input
-                    self.inner
-                        .confirmed_seq
-                        .fetch_max(update.confirmed_input_seq, Ordering::SeqCst);
-                    // TODO: Process state diff for prediction
-                }
+                Message::ChannelDataMsg(data) => match data.payload {
+                    ChannelPayload::TerminalOutput(output) => {
+                        // Update confirmed sequence
+                        self.inner
+                            .confirmed_seq
+                            .fetch_max(output.confirmed_input_seq, Ordering::SeqCst);
+                        return Ok(output);
+                    }
+                    ChannelPayload::StateUpdate(update) => {
+                        // State updates also confirm input
+                        self.inner
+                            .confirmed_seq
+                            .fetch_max(update.confirmed_input_seq, Ordering::SeqCst);
+                        // TODO: Process state diff for prediction
+                    }
+                    other => {
+                        warn!(?other, "Unexpected channel payload on terminal output stream");
+                    }
+                },
                 other => {
                     warn!(?other, "Unexpected message on terminal output stream");
                 }
@@ -226,7 +238,7 @@ struct FileChannelInner {
     /// Bidirectional stream for file data.
     stream: Mutex<QuicStream>,
     /// File metadata (size, etc).
-    metadata: Option<qsh_core::protocol::FileMetadataPayload>,
+    metadata: Option<FileTransferMetadata>,
     /// Whether the channel is closed.
     closed: AtomicBool,
     /// Bytes transferred.
@@ -238,7 +250,7 @@ impl FileChannel {
     pub(crate) fn new(
         channel_id: ChannelId,
         stream: QuicStream,
-        metadata: Option<qsh_core::protocol::FileMetadataPayload>,
+        metadata: Option<FileTransferMetadata>,
     ) -> Self {
         let inner = Arc::new(FileChannelInner {
             channel_id,
@@ -257,7 +269,7 @@ impl FileChannel {
     }
 
     /// Get file metadata (for downloads).
-    pub fn metadata(&self) -> Option<&qsh_core::protocol::FileMetadataPayload> {
+    pub fn metadata(&self) -> Option<&FileTransferMetadata> {
         self.inner.metadata.as_ref()
     }
 
@@ -268,11 +280,13 @@ impl FileChannel {
         }
 
         let len = data.len() as u64;
-        let msg = Message::FileData(FileDataPayload {
-            transfer_id: self.inner.channel_id.id,
-            offset,
-            data,
-            flags: DataFlags::default(),
+        let msg = Message::ChannelDataMsg(ChannelData {
+            channel_id: self.inner.channel_id,
+            payload: ChannelPayload::FileData(FileDataData {
+                offset,
+                data,
+                flags: DataFlags::default(),
+            }),
         });
 
         self.inner.stream.lock().await.send(&msg).await?;

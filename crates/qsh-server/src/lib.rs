@@ -28,11 +28,9 @@ pub use bootstrap::BootstrapServer;
 pub use channel::{ChannelHandle, FileTransferChannel, ForwardChannel, TerminalChannel};
 pub use cli::Cli;
 pub use connection::{ConnectionConfig, ConnectionHandler, ConnectionSession};
-pub use file::FileHandler;
-pub use forward::ForwardHandler;
 pub use pty::{Pty, PtyRelay};
-pub use registry::{ConnectionRegistry, ConnectionSessionGuard, RealSessionSpawner, SessionRegistry};
-pub use session::{PendingSession, ServerSession, SessionAuthorizer, SessionConfig};
+pub use registry::{ConnectionRegistry, ConnectionSessionGuard, PtyControl};
+pub use session::{PendingSession, SessionAuthorizer, SessionConfig};
 
 #[cfg(feature = "standalone")]
 pub use standalone::{StandaloneAuthenticator, StandaloneConfig};

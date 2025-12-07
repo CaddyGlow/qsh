@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use quinn::{RecvStream, SendStream};
+use tokio::io::AsyncWriteExt;
 use tokio::select;
 use tokio::sync::Mutex;
 
@@ -74,20 +75,18 @@ pub struct QuicStream {
 }
 
 /// Map a bidirectional stream ID to StreamType.
-/// Note: This is legacy behavior for backward compatibility. New code should use
-/// the channel model where stream type is determined by the channel open handshake.
-#[allow(deprecated)]
-async fn map_bidi_stream_type(stream_id: u64, next_forward_id: &Arc<Mutex<u32>>) -> StreamType {
-    match stream_id {
-        0 => StreamType::Control,
-        4 => StreamType::Tunnel,
-        _ => {
-            // Use a monotonic forward id for simplicity
-            let mut guard = next_forward_id.lock().await;
-            let id = *guard;
-            *guard = guard.saturating_add(1);
-            StreamType::Forward(id)
-        }
+/// In the channel model, only the control stream (ID 0) uses a fixed ID.
+/// Other bidirectional streams are ChannelBidi streams identified by the
+/// channel header sent after opening.
+fn map_bidi_stream_type(stream_id: u64) -> StreamType {
+    if stream_id == 0 {
+        StreamType::Control
+    } else {
+        // For bidirectional streams that aren't control, we need to read
+        // the channel header to determine the channel ID. For now, return
+        // a placeholder that will be resolved after reading the header.
+        // This is handled by the caller reading a ChannelOpen message.
+        StreamType::Control // Will be overridden by caller
     }
 }
 
@@ -320,17 +319,12 @@ impl QuicStream {
 /// A QUIC connection wrapper.
 pub struct QuicConnection {
     inner: quinn::Connection,
-    /// Next forward ID for client-initiated forwards
-    next_forward_id: Arc<Mutex<u32>>,
 }
 
 impl QuicConnection {
     /// Create a new connection wrapper.
     pub fn new(conn: quinn::Connection) -> Self {
-        Self {
-            inner: conn,
-            next_forward_id: Arc::new(Mutex::new(0)),
-        }
+        Self { inner: conn }
     }
 
     /// Get the underlying Quinn connection.
@@ -356,10 +350,8 @@ impl QuicConnection {
 impl Connection for QuicConnection {
     type Stream = QuicStream;
 
-    #[allow(deprecated)]
     async fn open_stream(&self, stream_type: StreamType) -> Result<Self::Stream> {
         match stream_type {
-            // New channel model stream types
             StreamType::Control | StreamType::ChannelBidi(_) => {
                 let (send, recv) = self.inner.open_bi().await.map_err(|e| Error::Transport {
                     message: format!("failed to open bidirectional stream: {}", e),
@@ -367,7 +359,6 @@ impl Connection for QuicConnection {
                 Ok(QuicStream::new(send, recv))
             }
             StreamType::ChannelIn(channel_id) | StreamType::ChannelOut(channel_id) => {
-                use tokio::io::AsyncWriteExt;
                 let mut send = self.inner.open_uni().await.map_err(|e| Error::Transport {
                     message: format!("failed to open channel stream: {}", e),
                 })?;
@@ -377,31 +368,6 @@ impl Connection for QuicConnection {
                     message: format!("failed to write channel header: {}", e),
                 })?;
                 Ok(QuicStream::from_send(send))
-            }
-            // Legacy stream types
-            StreamType::Tunnel => {
-                let (send, recv) = self.inner.open_bi().await.map_err(|e| Error::Transport {
-                    message: format!("failed to open bidirectional stream: {}", e),
-                })?;
-                Ok(QuicStream::new(send, recv))
-            }
-            StreamType::TerminalIn => {
-                let send = self.inner.open_uni().await.map_err(|e| Error::Transport {
-                    message: format!("failed to open terminal input stream: {}", e),
-                })?;
-                Ok(QuicStream::from_send(send))
-            }
-            StreamType::TerminalOut => {
-                let send = self.inner.open_uni().await.map_err(|e| Error::Transport {
-                    message: format!("failed to open terminal output stream: {}", e),
-                })?;
-                Ok(QuicStream::from_send(send))
-            }
-            StreamType::Forward(_) | StreamType::FileTransfer(_) => {
-                let (send, recv) = self.inner.open_bi().await.map_err(|e| Error::Transport {
-                    message: format!("failed to open bidirectional stream: {}", e),
-                })?;
-                Ok(QuicStream::new(send, recv))
             }
         }
     }
@@ -414,7 +380,7 @@ impl Connection for QuicConnection {
                 })?;
                 // Use the full QUIC stream ID (includes initiator + direction bits)
                 let stream_id: u64 = send.id().into();
-                let stream_type = map_bidi_stream_type(stream_id, &self.next_forward_id).await;
+                let stream_type = map_bidi_stream_type(stream_id);
                 Ok((stream_type, QuicStream::new(send, recv)))
             }
             uni = self.inner.accept_uni() => {
@@ -595,7 +561,8 @@ mod tests {
     #[test]
     fn stream_type_identification() {
         // Just verify stream types work correctly
+        use crate::protocol::ChannelId;
         assert!(StreamType::Control.is_bidirectional());
-        assert!(StreamType::Forward(0).is_bidirectional());
+        assert!(StreamType::ChannelBidi(ChannelId::client(0)).is_bidirectional());
     }
 }

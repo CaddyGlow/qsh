@@ -1,11 +1,4 @@
 //! File transfer handling for qsh server.
 //!
-//! Provides server-side file transfer functionality:
-//! - Handling file requests (upload/download)
-//! - Computing and sending file metadata
-//! - Delta transfer support
-//! - Parallel chunk assembly
-
-pub mod handler;
-
-pub use handler::FileHandler;
+//! File transfers are now handled via the channel model using ChannelOpen with
+//! FileTransferParams. See the `channel::file_transfer` module for the implementation.

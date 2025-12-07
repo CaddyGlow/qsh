@@ -102,10 +102,10 @@ impl Codec {
 mod tests {
     use super::*;
     use crate::protocol::{
-        Capabilities, HelloAckPayload, HelloPayload, ResizePayload, SessionId, ShutdownPayload,
-        ShutdownReason, StateAckPayload, TermSize, TerminalInputPayload,
+        Capabilities, ChannelData, ChannelId, ChannelPayload, HelloAckPayload, HelloPayload,
+        ResizePayload, SessionId, ShutdownPayload, ShutdownReason, StateAckPayload,
+        TerminalInputData,
     };
-    use crate::terminal::TerminalState;
 
     #[test]
     fn encode_decode_roundtrip_resize() {
@@ -127,11 +127,6 @@ mod tests {
             client_nonce: 12345,
             capabilities: Capabilities::default(),
             resume_session: None,
-            term_size: TermSize::default(),
-            term_type: "xterm-256color".into(),
-            env: vec![("COLORTERM".into(), "truecolor".into())],
-            last_generation: 0,
-            last_input_seq: 0,
         });
 
         let encoded = Codec::encode(&msg).unwrap();
@@ -140,9 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_decode_roundtrip_hello_ack_with_initial_state() {
-        let state = TerminalState::new(80, 24);
-
+    fn encode_decode_roundtrip_hello_ack() {
         let msg = Message::HelloAck(HelloAckPayload {
             protocol_version: 1,
             accepted: true,
@@ -150,7 +143,6 @@ mod tests {
             capabilities: Capabilities::default(),
             session_id: SessionId::from_bytes([0; 16]),
             server_nonce: 0,
-            initial_state: Some(state),
             zero_rtt_available: false,
         });
 
@@ -159,13 +151,15 @@ mod tests {
         assert_eq!(msg, decoded);
     }
 
-    #[allow(deprecated)]
     #[test]
     fn encode_decode_roundtrip_terminal_input() {
-        let msg = Message::TerminalInput(TerminalInputPayload {
-            sequence: 999,
-            data: vec![0x61, 0x62, 0x63], // "abc"
-            predictable: true,
+        let msg = Message::ChannelDataMsg(ChannelData {
+            channel_id: ChannelId::client(0),
+            payload: ChannelPayload::TerminalInput(TerminalInputData {
+                sequence: 999,
+                data: vec![0x61, 0x62, 0x63], // "abc"
+                predictable: true,
+            }),
         });
 
         let encoded = Codec::encode(&msg).unwrap();

@@ -262,6 +262,26 @@ pub struct FileTransferParams {
     pub resume_from: Option<u64>,
 }
 
+/// File metadata sent in ChannelAccept for file transfers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileTransferMetadata {
+    /// File size in bytes.
+    pub size: u64,
+    /// Modification time (Unix timestamp).
+    pub mtime: u64,
+    /// File mode/permissions.
+    pub mode: u32,
+    /// Block checksums for delta sync (empty if delta disabled).
+    #[serde(default)]
+    pub blocks: Vec<BlockChecksum>,
+    /// Whether this is a directory.
+    pub is_dir: bool,
+    /// Optional strong hash (xxHash64) of the entire file contents.
+    /// Present when skip_if_unchanged is enabled and file exists.
+    #[serde(default)]
+    pub file_hash: Option<u64>,
+}
+
 /// Parameters for local port forward (-L).
 ///
 /// Client opened this channel to request server connect to target.
@@ -346,7 +366,7 @@ pub enum ChannelAcceptData {
     },
     FileTransfer {
         /// File metadata for downloads, confirmation for uploads.
-        metadata: Option<FileMetadataPayload>,
+        metadata: Option<FileTransferMetadata>,
     },
     DirectTcpIp,
     ForwardedTcpIp,
@@ -704,70 +724,6 @@ pub enum Message {
     #[cfg(feature = "standalone")]
     AuthFailure(AuthFailurePayload),
 
-    // =========================================================================
-    // Legacy messages (deprecated - kept for backward compatibility during migration)
-    // =========================================================================
-
-    /// User input sent to server (legacy - use ChannelDataMsg with TerminalInput).
-    #[deprecated(note = "Use ChannelDataMsg with TerminalInput payload")]
-    TerminalInput(TerminalInputPayload),
-    /// Raw terminal output from server (legacy).
-    #[deprecated(note = "Use ChannelDataMsg with TerminalOutput payload")]
-    TerminalOutput(TerminalOutputPayload),
-    /// Terminal state update from server (legacy).
-    #[deprecated(note = "Use ChannelDataMsg with StateUpdate payload")]
-    StateUpdate(StateUpdatePayload),
-
-    /// Request to establish a forwarded connection (legacy).
-    #[deprecated(note = "Use ChannelOpen with DirectTcpIp/ForwardedTcpIp params")]
-    ForwardRequest(ForwardRequestPayload),
-    /// Accept a forward request (legacy).
-    #[deprecated(note = "Use ChannelAccept")]
-    ForwardAccept(ForwardAcceptPayload),
-    /// Reject a forward request (legacy).
-    #[deprecated(note = "Use ChannelReject")]
-    ForwardReject(ForwardRejectPayload),
-    /// Data on a forwarded connection (legacy).
-    #[deprecated(note = "Forward channels use raw bytes on ChannelBidi streams")]
-    ForwardData(ForwardDataPayload),
-    /// End of data in one direction (legacy).
-    #[deprecated(note = "Use QUIC stream FIN for EOF")]
-    ForwardEof(ForwardEofPayload),
-    /// Close a forwarded connection (legacy).
-    #[deprecated(note = "Use ChannelClose")]
-    ForwardClose(ForwardClosePayload),
-
-    /// Tunnel configuration request (legacy).
-    #[cfg(feature = "tunnel")]
-    #[deprecated(note = "Use ChannelOpen with Tunnel params")]
-    TunnelConfig(TunnelConfigPayload),
-    /// Tunnel configuration acknowledgment (legacy).
-    #[cfg(feature = "tunnel")]
-    #[deprecated(note = "Use ChannelAccept with Tunnel data")]
-    TunnelConfigAck(TunnelConfigAckPayload),
-    /// Raw IP packet through tunnel (legacy).
-    #[cfg(feature = "tunnel")]
-    #[deprecated(note = "Use ChannelDataMsg with TunnelPacket payload")]
-    TunnelPacket(TunnelPacketPayload),
-
-    /// Request to start a file transfer (legacy).
-    #[deprecated(note = "Use ChannelOpen with FileTransfer params")]
-    FileRequest(FileRequestPayload),
-    /// File metadata response (legacy).
-    #[deprecated(note = "Use ChannelAccept with FileTransfer data")]
-    FileMetadata(FileMetadataPayload),
-    /// File data block (legacy).
-    #[deprecated(note = "Use ChannelDataMsg with FileData payload")]
-    FileData(FileDataPayload),
-    /// Acknowledge received data (legacy).
-    #[deprecated(note = "Use ChannelDataMsg with FileAck payload")]
-    FileAck(FileAckPayload),
-    /// Transfer complete notification (legacy).
-    #[deprecated(note = "Use ChannelDataMsg with FileComplete payload")]
-    FileComplete(FileCompletePayload),
-    /// File transfer error (legacy).
-    #[deprecated(note = "Use ChannelDataMsg with FileError payload")]
-    FileError(FileErrorPayload),
 }
 
 // =============================================================================
@@ -777,7 +733,7 @@ pub enum Message {
 /// Client hello payload.
 ///
 /// Establishes connection-level parameters. Terminal-specific parameters
-/// have been moved to `TerminalParams` in `ChannelOpen`.
+/// are sent via `TerminalParams` in `ChannelOpen`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HelloPayload {
     /// Protocol version (must be 1).
@@ -792,31 +748,12 @@ pub struct HelloPayload {
     /// None for a brand-new session.
     #[serde(default)]
     pub resume_session: Option<SessionId>,
-
-    // Legacy fields - kept for backward compatibility during migration
-    // These will be removed in protocol v2
-
-    /// Requested terminal size (legacy - use TerminalParams in ChannelOpen).
-    #[serde(default)]
-    pub term_size: TermSize,
-    /// TERM environment variable (legacy - use TerminalParams in ChannelOpen).
-    #[serde(default)]
-    pub term_type: String,
-    /// Additional environment variables (legacy - use TerminalParams in ChannelOpen).
-    #[serde(default)]
-    pub env: Vec<(String, String)>,
-    /// Last confirmed state generation (legacy - use TerminalParams in ChannelOpen).
-    #[serde(default)]
-    pub last_generation: u64,
-    /// Last confirmed input sequence (legacy - use TerminalParams in ChannelOpen).
-    #[serde(default)]
-    pub last_input_seq: u64,
 }
 
 /// Server hello acknowledgment payload.
 ///
-/// Establishes connection-level parameters. Terminal state has been moved
-/// to `ChannelAcceptData::Terminal` in `ChannelAccept`.
+/// Establishes connection-level parameters. Terminal state is sent via
+/// `ChannelAcceptData::Terminal` in `ChannelAccept`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HelloAckPayload {
     /// Server protocol version.
@@ -835,12 +772,6 @@ pub struct HelloAckPayload {
     pub server_nonce: u64,
     /// 0-RTT is available for future reconnects.
     pub zero_rtt_available: bool,
-
-    // Legacy field - kept for backward compatibility during migration
-
-    /// Initial terminal state (legacy - use ChannelAccept with Terminal data).
-    #[serde(default)]
-    pub initial_state: Option<TerminalState>,
 }
 
 /// Client/server capabilities.
@@ -854,11 +785,6 @@ pub struct Capabilities {
     pub max_forwards: u16,
     /// Supports IP tunnel.
     pub tunnel: bool,
-    /// Supports SSH-style channel model (no implicit terminal).
-    /// When true, the server should not spawn a PTY during Hello handshake.
-    /// Instead, the client will open terminal channels explicitly via ChannelOpen.
-    #[serde(default)]
-    pub channel_model: bool,
 }
 
 /// Terminal size.
@@ -912,37 +838,6 @@ pub enum ShutdownReason {
 // Terminal Messages
 // =============================================================================
 
-/// Terminal input payload.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TerminalInputPayload {
-    /// Monotonic sequence number.
-    pub sequence: u64,
-    /// Raw input bytes.
-    pub data: Vec<u8>,
-    /// Hint: these bytes may be predicted locally.
-    pub predictable: bool,
-}
-
-/// Raw terminal output payload (bypasses state tracking).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TerminalOutputPayload {
-    /// Raw output bytes from PTY.
-    pub data: Vec<u8>,
-    /// Highest input sequence processed before this output.
-    pub confirmed_input_seq: u64,
-}
-
-/// State update payload.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct StateUpdatePayload {
-    /// State diff or full state.
-    pub diff: StateDiff,
-    /// Highest input sequence processed.
-    pub confirmed_input_seq: u64,
-    /// Server timestamp for latency calc (microseconds).
-    pub timestamp: u64,
-}
-
 /// State acknowledgment payload (sent on control stream).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StateAckPayload {
@@ -961,17 +856,8 @@ pub struct StateAckPayload {
 pub use crate::terminal::{Cell, Cursor, StateDiff, TerminalState};
 
 // =============================================================================
-// Forward Messages
+// Forward Types
 // =============================================================================
-
-/// Forward request payload.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ForwardRequestPayload {
-    /// Unique forward ID for this connection.
-    pub forward_id: u64,
-    /// Forward specification (includes bind address and target info).
-    pub spec: ForwardSpec,
-}
 
 /// Forward specification enumeration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1233,100 +1119,6 @@ fn parse_port(s: &str) -> crate::Result<u16> {
         })
 }
 
-/// Forward accept payload.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ForwardAcceptPayload {
-    pub forward_id: u64,
-}
-
-/// Forward reject payload.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ForwardRejectPayload {
-    pub forward_id: u64,
-    pub reason: String,
-}
-
-/// Forward data payload.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ForwardDataPayload {
-    pub forward_id: u64,
-    pub data: Vec<u8>,
-}
-
-/// Forward EOF payload (half-close).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ForwardEofPayload {
-    pub forward_id: u64,
-}
-
-/// Forward close payload.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ForwardClosePayload {
-    pub forward_id: u64,
-    pub reason: Option<String>,
-}
-
-// =============================================================================
-// Tunnel Messages (Feature-gated)
-// =============================================================================
-
-/// Tunnel configuration payload.
-#[cfg(feature = "tunnel")]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TunnelConfigPayload {
-    /// Requested client tunnel IP with prefix.
-    pub client_ip: IpNet,
-    /// Requested MTU for tunnel interface.
-    pub mtu: u16,
-    /// Routes to push to client (optional).
-    pub requested_routes: Vec<IpNet>,
-    /// Enable IPv6 in tunnel.
-    pub ipv6: bool,
-}
-
-/// Tunnel configuration acknowledgment payload.
-#[cfg(feature = "tunnel")]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TunnelConfigAckPayload {
-    /// Whether tunnel was accepted.
-    pub accepted: bool,
-    /// Rejection reason (if not accepted).
-    pub reject_reason: Option<String>,
-    /// Server's tunnel IP.
-    pub server_ip: IpNet,
-    /// Negotiated MTU.
-    pub mtu: u16,
-    /// Routes client should add (server-pushed).
-    pub routes: Vec<IpNet>,
-    /// DNS servers to use (optional).
-    pub dns_servers: Vec<IpAddr>,
-}
-
-/// Tunnel packet payload.
-#[cfg(feature = "tunnel")]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TunnelPacketPayload {
-    /// Raw IP packet (IPv4 or IPv6, including header).
-    pub packet: Vec<u8>,
-}
-
-#[cfg(feature = "tunnel")]
-impl TunnelPacketPayload {
-    /// Get IP version from packet (4 or 6).
-    pub fn ip_version(&self) -> Option<u8> {
-        self.packet.first().map(|b| b >> 4)
-    }
-
-    /// Validate basic IP packet structure.
-    pub fn is_valid(&self) -> bool {
-        match self.ip_version() {
-            Some(4) => self.packet.len() >= 20, // Min IPv4 header
-            Some(6) => self.packet.len() >= 40, // Min IPv6 header
-            _ => false,
-        }
-    }
-}
-
 // Re-export ipnet types for tunnel feature
 #[cfg(feature = "tunnel")]
 pub use ipnet::IpNet;
@@ -1460,53 +1252,6 @@ impl Default for TransferOptions {
     }
 }
 
-/// Chunk specification for parallel transfers.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ChunkSpec {
-    /// Chunk identifier within the transfer.
-    pub chunk_id: u32,
-    /// Starting byte offset.
-    pub offset: u64,
-    /// Length of this chunk in bytes.
-    pub length: u64,
-}
-
-/// File transfer request payload.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FileRequestPayload {
-    /// Unique identifier for this transfer.
-    pub transfer_id: u64,
-    /// Remote file path.
-    pub path: String,
-    /// Transfer direction.
-    pub direction: TransferDirection,
-    /// Resume from byte offset (if resuming).
-    pub resume_from: Option<u64>,
-    /// Transfer options.
-    pub options: TransferOptions,
-    /// Chunk specification for parallel transfer (None = whole file).
-    pub chunk: Option<ChunkSpec>,
-    /// Client-side block checksums for delta downloads (empty if unused).
-    #[serde(default)]
-    pub client_blocks: Vec<BlockChecksum>,
-    /// Source file modification time (seconds since Unix epoch) for uploads.
-    #[serde(default)]
-    pub source_mtime: Option<u64>,
-    /// Source file modification time nanoseconds (0-999999999) for uploads.
-    #[serde(default)]
-    pub source_mtime_nsec: Option<u32>,
-    /// Source file access time (seconds since Unix epoch) for uploads.
-    #[serde(default)]
-    pub source_atime: Option<u64>,
-    /// Source file access time nanoseconds (0-999999999) for uploads.
-    #[serde(default)]
-    pub source_atime_nsec: Option<u32>,
-    /// Source file size for uploads.
-    /// Used by server to optimize skip_if_unchanged (skip delta computation if sizes match).
-    #[serde(default)]
-    pub source_size: Option<u64>,
-}
-
 /// Block checksum for delta sync.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BlockChecksum {
@@ -1516,27 +1261,6 @@ pub struct BlockChecksum {
     pub weak: u32,
     /// Strong checksum (xxHash64).
     pub strong: u64,
-}
-
-/// File metadata payload.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FileMetadataPayload {
-    /// Transfer ID this metadata belongs to.
-    pub transfer_id: u64,
-    /// File size in bytes.
-    pub size: u64,
-    /// Modification time (Unix timestamp).
-    pub mtime: u64,
-    /// File mode/permissions.
-    pub mode: u32,
-    /// Block checksums for delta sync (empty if delta disabled).
-    pub blocks: Vec<BlockChecksum>,
-    /// Whether this is a directory.
-    pub is_dir: bool,
-    /// Optional strong hash (xxHash64) of the entire file contents.
-    /// Present when skip_if_unchanged is enabled and file exists.
-    #[serde(default)]
-    pub file_hash: Option<u64>,
 }
 
 /// Data flags for file data blocks.
@@ -1550,28 +1274,6 @@ pub struct DataFlags {
     pub block_ref: bool,
 }
 
-/// File data payload.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FileDataPayload {
-    /// Transfer ID this data belongs to.
-    pub transfer_id: u64,
-    /// Byte offset in the file.
-    pub offset: u64,
-    /// Data bytes (or block index if block_ref flag set).
-    pub data: Vec<u8>,
-    /// Data flags.
-    pub flags: DataFlags,
-}
-
-/// File acknowledgment payload.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FileAckPayload {
-    /// Transfer ID.
-    pub transfer_id: u64,
-    /// Bytes received so far.
-    pub bytes_received: u64,
-}
-
 /// Completion status for a file transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum FileTransferStatus {
@@ -1581,31 +1283,6 @@ pub enum FileTransferStatus {
     /// No data was transferred because the file was already up to date
     /// (size + mtime + hash match).
     AlreadyUpToDate,
-}
-
-/// File transfer complete payload.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FileCompletePayload {
-    /// Transfer ID.
-    pub transfer_id: u64,
-    /// Final file checksum (xxHash64).
-    pub checksum: u64,
-    /// Total bytes transferred.
-    pub total_bytes: u64,
-    /// Completion status for this transfer.
-    #[serde(default)]
-    pub status: FileTransferStatus,
-}
-
-/// File transfer error payload.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FileErrorPayload {
-    /// Transfer ID.
-    pub transfer_id: u64,
-    /// Error code.
-    pub code: FileErrorCode,
-    /// Human-readable error message.
-    pub message: String,
 }
 
 /// File transfer error codes.
@@ -1655,7 +1332,6 @@ impl std::fmt::Display for FileErrorCode {
 mod tests {
     use super::*;
 
-    #[allow(deprecated)]
     #[test]
     fn test_message_variants_exist() {
         // Test that all message variants can be constructed
@@ -1665,11 +1341,6 @@ mod tests {
             client_nonce: 0,
             capabilities: Capabilities::default(),
             resume_session: None,
-            term_size: TermSize::default(),
-            term_type: "xterm-256color".into(),
-            env: Vec::new(),
-            last_generation: 0,
-            last_input_seq: 0,
         });
 
         let _hello_ack = Message::HelloAck(HelloAckPayload {
@@ -1679,7 +1350,6 @@ mod tests {
             capabilities: Capabilities::default(),
             session_id: SessionId::from_bytes([0; 16]),
             server_nonce: 0,
-            initial_state: None,
             zero_rtt_available: false,
         });
 
@@ -1694,52 +1364,9 @@ mod tests {
             message: None,
         });
 
-        let _input = Message::TerminalInput(TerminalInputPayload {
-            sequence: 1,
-            data: vec![0x61], // 'a'
-            predictable: true,
-        });
-
-        let _update = Message::StateUpdate(StateUpdatePayload {
-            diff: StateDiff::Full(TerminalState::default()),
-            confirmed_input_seq: 0,
-            timestamp: 0,
-        });
-
         let _ack = Message::StateAck(StateAckPayload {
             channel_id: None,
             generation: 1,
-        });
-
-        let _fwd_req = Message::ForwardRequest(ForwardRequestPayload {
-            forward_id: 0,
-            spec: ForwardSpec::Local {
-                bind_addr: std::net::SocketAddr::new(
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                    5432,
-                ),
-                target_host: "localhost".into(),
-                target_port: 5432,
-            },
-        });
-
-        let _fwd_accept = Message::ForwardAccept(ForwardAcceptPayload { forward_id: 0 });
-
-        let _fwd_reject = Message::ForwardReject(ForwardRejectPayload {
-            forward_id: 0,
-            reason: "connection refused".into(),
-        });
-
-        let _fwd_data = Message::ForwardData(ForwardDataPayload {
-            forward_id: 0,
-            data: vec![1, 2, 3],
-        });
-
-        let _fwd_eof = Message::ForwardEof(ForwardEofPayload { forward_id: 0 });
-
-        let _fwd_close = Message::ForwardClose(ForwardClosePayload {
-            forward_id: 0,
-            reason: None,
         });
     }
 
@@ -1916,9 +1543,8 @@ mod tests {
         assert_send_sync::<HelloPayload>();
         assert_send_sync::<HelloAckPayload>();
         assert_send_sync::<Capabilities>();
-        assert_send_sync::<TerminalInputPayload>();
-        assert_send_sync::<StateUpdatePayload>();
-        assert_send_sync::<ForwardRequestPayload>();
+        assert_send_sync::<ChannelData>();
+        assert_send_sync::<ChannelPayload>();
     }
 
     #[test]
@@ -1979,51 +1605,4 @@ mod tests {
         };
     }
 
-    #[cfg(feature = "tunnel")]
-    #[test]
-    fn test_tunnel_packet_ip_version() {
-        // IPv4 packet (version nibble = 4)
-        let ipv4 = TunnelPacketPayload {
-            packet: vec![0x45, 0x00, 0x00, 0x14],
-        };
-        assert_eq!(ipv4.ip_version(), Some(4));
-
-        // IPv6 packet (version nibble = 6)
-        let ipv6 = TunnelPacketPayload {
-            packet: vec![0x60, 0x00, 0x00, 0x00],
-        };
-        assert_eq!(ipv6.ip_version(), Some(6));
-
-        // Empty packet
-        let empty = TunnelPacketPayload { packet: vec![] };
-        assert_eq!(empty.ip_version(), None);
-    }
-
-    #[cfg(feature = "tunnel")]
-    #[test]
-    fn test_tunnel_packet_validation() {
-        // Valid IPv4 (20+ bytes)
-        let valid_v4 = TunnelPacketPayload {
-            packet: vec![0x45; 20],
-        };
-        assert!(valid_v4.is_valid());
-
-        // Too short for IPv4
-        let short_v4 = TunnelPacketPayload {
-            packet: vec![0x45; 10],
-        };
-        assert!(!short_v4.is_valid());
-
-        // Valid IPv6 (40+ bytes)
-        let valid_v6 = TunnelPacketPayload {
-            packet: vec![0x60; 40],
-        };
-        assert!(valid_v6.is_valid());
-
-        // Invalid version
-        let bad_version = TunnelPacketPayload {
-            packet: vec![0x50; 40],
-        };
-        assert!(!bad_version.is_valid());
-    }
 }

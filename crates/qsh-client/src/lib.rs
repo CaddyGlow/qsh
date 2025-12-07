@@ -31,12 +31,10 @@ pub mod standalone;
 pub use channel::{FileChannel, ForwardChannel, TerminalChannel};
 pub use cli::{Cli, CpCli, FilePath};
 pub use connection::{
-    ChannelConnection, ChannelHandle, ClientConnection, ConnectionConfig, LatencyStats,
-    LatencyTracker,
+    ChannelConnection, ChannelHandle, ConnectionConfig, LatencyStats, LatencyTracker, connect_quic,
 };
 pub use escape::{EscapeCommand, EscapeHandler, EscapeResult, parse_escape_key};
-pub use file::{FileTransfer, TransferResult};
-pub use forward::{LocalForwarder, Socks5Proxy};
+pub use file::TransferResult;
 pub use ssh::{BootstrapHandle, BootstrapMode, SshConfig, bootstrap};
 pub use terminal::{RawModeGuard, StdinReader, StdoutWriter, get_terminal_size, restore_terminal};
 

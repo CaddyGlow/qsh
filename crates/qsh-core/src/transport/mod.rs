@@ -4,12 +4,11 @@
 //! - Real QUIC (Quinn)
 //! - Mock transport for testing
 //!
-//! Stream mapping per PROTOCOL:
-//! - Control: client-bidi 0
-//! - Terminal out: server-uni 3
-//! - Terminal in: client-uni 2
-//! - Tunnel: client-bidi 4 (reserved)
-//! - Forwards: server-bidi 1/5/9..., client-bidi 8/12/...
+//! Stream types (SSH-style channel model):
+//! - Control: bidirectional stream ID 0 (Hello, ChannelOpen/Accept/Reject/Close, etc.)
+//! - ChannelIn(id): unidirectional client->server (terminal input, file data)
+//! - ChannelOut(id): unidirectional server->client (terminal output, file data)
+//! - ChannelBidi(id): bidirectional (port forwards, tunnel)
 
 mod quic;
 
@@ -50,72 +49,28 @@ pub enum StreamType {
     /// Bidirectional channel stream (for forwards, tunnel).
     /// Carries raw TCP bytes (forwards) or ChannelData with TunnelPacket (tunnel).
     ChannelBidi(ChannelId),
-
-    // =========================================================================
-    // Legacy stream types (deprecated - kept for backward compatibility)
-    // =========================================================================
-
-    /// Terminal output from server (legacy - use ChannelOut).
-    #[deprecated(note = "Use ChannelOut(channel_id)")]
-    TerminalOut,
-    /// Terminal input to server (legacy - use ChannelIn).
-    #[deprecated(note = "Use ChannelIn(channel_id)")]
-    TerminalIn,
-    /// IP tunnel data (legacy - use ChannelBidi).
-    #[deprecated(note = "Use ChannelBidi(channel_id)")]
-    Tunnel,
-    /// Port forward data (legacy - use ChannelBidi).
-    #[deprecated(note = "Use ChannelBidi(channel_id)")]
-    Forward(u32),
-    /// File transfer data (legacy - use ChannelIn/ChannelOut pair).
-    #[deprecated(note = "Use ChannelIn/ChannelOut pair")]
-    FileTransfer(u64),
 }
 
 impl StreamType {
     /// Get the QUIC stream ID for this type (if fixed).
     /// Channel streams are dynamically allocated, so return None.
-    #[allow(deprecated)]
     pub fn fixed_id(&self) -> Option<u64> {
         match self {
             StreamType::Control => Some(0),
             StreamType::ChannelIn(_) | StreamType::ChannelOut(_) | StreamType::ChannelBidi(_) => {
                 None
             }
-            // Legacy types
-            StreamType::TerminalIn => Some(2),
-            StreamType::TerminalOut => Some(3),
-            StreamType::Tunnel => Some(4),
-            StreamType::Forward(_) => None,
-            StreamType::FileTransfer(_) => None,
         }
     }
 
     /// Check if this is a bidirectional stream type.
-    #[allow(deprecated)]
     pub fn is_bidirectional(&self) -> bool {
-        matches!(
-            self,
-            StreamType::Control
-                | StreamType::ChannelBidi(_)
-                // Legacy
-                | StreamType::Tunnel
-                | StreamType::Forward(_)
-                | StreamType::FileTransfer(_)
-        )
+        matches!(self, StreamType::Control | StreamType::ChannelBidi(_))
     }
 
     /// Check if this is a unidirectional stream type.
-    #[allow(deprecated)]
     pub fn is_unidirectional(&self) -> bool {
-        matches!(
-            self,
-            StreamType::ChannelIn(_)
-                | StreamType::ChannelOut(_)
-                // Legacy
-                | StreamType::TerminalIn
-                | StreamType::TerminalOut
-        )
+        matches!(self, StreamType::ChannelIn(_) | StreamType::ChannelOut(_))
     }
 
     /// Get the channel ID for channel stream types.
@@ -124,7 +79,7 @@ impl StreamType {
             StreamType::ChannelIn(id)
             | StreamType::ChannelOut(id)
             | StreamType::ChannelBidi(id) => Some(*id),
-            _ => None,
+            StreamType::Control => None,
         }
     }
 }
@@ -266,46 +221,6 @@ mod tests {
         assert_eq!(StreamType::ChannelOut(ch).channel_id(), Some(ch));
         assert_eq!(StreamType::ChannelBidi(ch).channel_id(), Some(ch));
         assert_eq!(StreamType::Control.channel_id(), None);
-    }
-
-    #[allow(deprecated)]
-    #[test]
-    fn legacy_stream_type_equality_and_hashing() {
-        let mut set = HashSet::new();
-
-        set.insert(StreamType::Control);
-        set.insert(StreamType::TerminalIn);
-        set.insert(StreamType::TerminalOut);
-        set.insert(StreamType::Tunnel);
-        set.insert(StreamType::Forward(1));
-        set.insert(StreamType::Forward(2));
-        set.insert(StreamType::Forward(1)); // Duplicate
-
-        assert_eq!(set.len(), 6);
-    }
-
-    #[allow(deprecated)]
-    #[test]
-    fn legacy_stream_type_fixed_ids() {
-        assert_eq!(StreamType::Control.fixed_id(), Some(0));
-        assert_eq!(StreamType::TerminalIn.fixed_id(), Some(2));
-        assert_eq!(StreamType::TerminalOut.fixed_id(), Some(3));
-        assert_eq!(StreamType::Tunnel.fixed_id(), Some(4));
-        assert_eq!(StreamType::Forward(42).fixed_id(), None);
-    }
-
-    #[allow(deprecated)]
-    #[test]
-    fn legacy_stream_type_directionality() {
-        assert!(StreamType::Control.is_bidirectional());
-        assert!(StreamType::Tunnel.is_bidirectional());
-        assert!(StreamType::Forward(1).is_bidirectional());
-
-        assert!(StreamType::TerminalIn.is_unidirectional());
-        assert!(StreamType::TerminalOut.is_unidirectional());
-
-        assert!(!StreamType::Control.is_unidirectional());
-        assert!(!StreamType::TerminalIn.is_bidirectional());
     }
 
     #[test]

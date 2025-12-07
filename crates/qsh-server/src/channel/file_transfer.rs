@@ -1,18 +1,18 @@
 //! File transfer channel implementation.
 //!
 //! Manages file upload/download operations within a channel.
+//!
+//! TODO: Reimplement using the channel model. Currently a stub.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use qsh_core::error::{Error, Result};
-use qsh_core::protocol::{ChannelId, FileMetadataPayload, FileTransferParams};
+use qsh_core::protocol::{ChannelId, FileTransferMetadata, FileTransferParams, TransferDirection};
 use qsh_core::transport::{QuicConnection, QuicStream};
-
-use crate::file::FileHandler;
 
 /// File transfer channel managing upload/download operations.
 #[derive(Clone)]
@@ -24,11 +24,9 @@ struct FileTransferChannelInner {
     /// Channel ID.
     channel_id: ChannelId,
     /// QUIC connection.
-    quic: Arc<QuicConnection>,
-    /// File handler for actual I/O.
-    file_handler: Arc<FileHandler<QuicConnection>>,
-    /// Transfer parameters.
     #[allow(dead_code)]
+    quic: Arc<QuicConnection>,
+    /// Transfer parameters.
     params: FileTransferParams,
     /// Whether the channel is closed.
     closed: AtomicBool,
@@ -44,7 +42,7 @@ impl FileTransferChannel {
         channel_id: ChannelId,
         params: FileTransferParams,
         quic: Arc<QuicConnection>,
-    ) -> Result<(Self, Option<FileMetadataPayload>)> {
+    ) -> Result<(Self, Option<FileTransferMetadata>)> {
         debug!(
             channel_id = %channel_id,
             path = %params.path,
@@ -52,23 +50,34 @@ impl FileTransferChannel {
             "Creating file transfer channel"
         );
 
-        // Get base directory (user's home or current directory)
-        let base_dir = std::env::var("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
-            });
-
-        let file_handler = Arc::new(FileHandler::new(quic.clone(), base_dir));
-
-        // For downloads, we could pre-fetch metadata here
-        // For now, metadata is fetched when the transfer actually starts
-        let metadata = None;
+        // For downloads, pre-fetch file metadata
+        let metadata = if params.direction == TransferDirection::Download {
+            // Get metadata for the file
+            match std::fs::metadata(&params.path) {
+                Ok(meta) => {
+                    Some(FileTransferMetadata {
+                        size: meta.len(),
+                        mtime: meta.modified()
+                            .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs())
+                            .unwrap_or(0),
+                        mode: 0o644, // Default mode
+                        blocks: Vec::new(), // Delta sync not implemented yet
+                        is_dir: meta.is_dir(),
+                        file_hash: None, // Hash computation not implemented yet
+                    })
+                }
+                Err(e) => {
+                    warn!(path = %params.path, error = %e, "Failed to get file metadata");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let inner = Arc::new(FileTransferChannelInner {
             channel_id,
             quic,
-            file_handler,
             params,
             closed: AtomicBool::new(false),
             stream: Mutex::new(None),
@@ -91,8 +100,8 @@ impl FileTransferChannel {
         // Store the stream for potential use
         *self.inner.stream.lock().await = Some(stream);
 
-        // The actual file transfer is handled by the FileHandler
-        // which processes FileRequest/FileData/FileComplete messages
+        // TODO: Implement actual file transfer using ChannelData messages
+        warn!(channel_id = %self.inner.channel_id, "File transfer not fully implemented yet");
 
         Ok(())
     }
@@ -114,11 +123,6 @@ impl FileTransferChannel {
     /// Check if the channel is closed.
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::SeqCst)
-    }
-
-    /// Get access to the underlying file handler.
-    pub fn file_handler(&self) -> &Arc<FileHandler<QuicConnection>> {
-        &self.inner.file_handler
     }
 }
 

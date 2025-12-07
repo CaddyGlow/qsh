@@ -11,10 +11,9 @@ use bytes::BytesMut;
 use proptest::prelude::*;
 
 use crate::protocol::{
-    Capabilities, Codec, ForwardAcceptPayload, ForwardClosePayload, ForwardDataPayload,
-    ForwardEofPayload, ForwardRejectPayload, ForwardRequestPayload, ForwardSpec, HelloPayload,
-    Message, ResizePayload, ShutdownPayload, ShutdownReason, StateAckPayload, TermSize,
-    TerminalInputPayload,
+    Capabilities, ChannelData, ChannelId, ChannelOpenPayload, ChannelParams, ChannelPayload, Codec,
+    HelloPayload, Message, ResizePayload, ShutdownPayload, ShutdownReason, StateAckPayload,
+    TermSize, TerminalInputData, TerminalParams,
 };
 
 #[cfg(feature = "standalone")]
@@ -32,14 +31,12 @@ prop_compose! {
         compression in any::<bool>(),
         max_forwards in any::<u16>(),
         tunnel in any::<bool>(),
-        channel_model in any::<bool>(),
     ) -> Capabilities {
         Capabilities {
             predictive_echo,
             compression,
             max_forwards,
             tunnel,
-            channel_model,
         }
     }
 }
@@ -59,11 +56,6 @@ prop_compose! {
         session_key in any::<[u8; 32]>(),
         client_nonce in any::<u64>(),
         capabilities in arb_capabilities(),
-        term_size in arb_term_size(),
-        term_type in "[a-z0-9-]{1,32}",
-        env in prop::collection::vec(("[A-Z_]{1,16}", "[a-zA-Z0-9_-]{0,32}"), 0..3),
-        last_generation in any::<u64>(),
-        last_input_seq in any::<u64>(),
     ) -> HelloPayload {
         HelloPayload {
             protocol_version,
@@ -71,11 +63,6 @@ prop_compose! {
             client_nonce,
             capabilities,
             resume_session: None,
-            term_size,
-            term_type,
-            env: env.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
-            last_generation,
-            last_input_seq,
         }
     }
 }
@@ -85,8 +72,8 @@ prop_compose! {
         sequence in any::<u64>(),
         data in prop::collection::vec(any::<u8>(), 0..1024),
         predictable in any::<bool>(),
-    ) -> TerminalInputPayload {
-        TerminalInputPayload {
+    ) -> TerminalInputData {
+        TerminalInputData {
             sequence,
             data,
             predictable,
@@ -105,19 +92,33 @@ fn arb_shutdown_reason() -> impl Strategy<Value = ShutdownReason> {
 }
 
 prop_compose! {
-    fn arb_forward_spec()(
-        variant in 0u8..3,
-        bind_ip in any::<[u8; 4]>(),
-        bind_port in any::<u16>(),
-        target_host in "[a-z.]{1,32}",
-        target_port in any::<u16>(),
-    ) -> ForwardSpec {
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(bind_ip)), bind_port);
-        match variant {
-            0 => ForwardSpec::Local { bind_addr, target_host, target_port },
-            1 => ForwardSpec::Remote { bind_addr, target_host, target_port },
-            _ => ForwardSpec::Dynamic { bind_addr },
+    fn arb_channel_id()(
+        id in any::<u64>(),
+        is_client in any::<bool>(),
+    ) -> ChannelId {
+        if is_client {
+            ChannelId::client(id)
+        } else {
+            ChannelId::server(id)
+        }
+    }
+}
+
+prop_compose! {
+    fn arb_terminal_params()(
+        term_size in arb_term_size(),
+        term_type in "[a-z0-9-]{1,32}",
+        env in prop::collection::vec(("[A-Z_]{1,16}", "[a-zA-Z0-9_-]{0,32}"), 0..3),
+        last_generation in any::<u64>(),
+        last_input_seq in any::<u64>(),
+    ) -> TerminalParams {
+        TerminalParams {
+            term_size,
+            term_type,
+            env: env.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            shell: None,
+            last_generation,
+            last_input_seq,
         }
     }
 }
@@ -182,52 +183,37 @@ prop_compose! {
 }
 
 /// Generate an arbitrary Message (base messages without feature-gated variants)
-#[allow(deprecated)]
 fn arb_message_base() -> impl Strategy<Value = Message> {
     prop_oneof![
         // Control messages
         arb_hello().prop_map(Message::Hello),
-        (any::<u16>(), any::<u16>())
-            .prop_map(|(cols, rows)| Message::Resize(ResizePayload {
-                channel_id: None,
+        (arb_channel_id(), any::<u16>(), any::<u16>())
+            .prop_map(|(ch, cols, rows)| Message::Resize(ResizePayload {
+                channel_id: Some(ch),
                 cols,
                 rows,
             })),
         (arb_shutdown_reason(), any::<Option<String>>())
             .prop_map(|(reason, message)| Message::Shutdown(ShutdownPayload { reason, message })),
-        // Terminal messages (legacy)
-        arb_terminal_input().prop_map(Message::TerminalInput),
-        any::<u64>().prop_map(|g| Message::StateAck(StateAckPayload {
-            channel_id: None,
+        // Channel open
+        (arb_channel_id(), arb_terminal_params()).prop_map(|(ch, params)| {
+            Message::ChannelOpen(ChannelOpenPayload {
+                channel_id: ch,
+                params: ChannelParams::Terminal(params),
+            })
+        }),
+        // Channel data with terminal input
+        (arb_channel_id(), arb_terminal_input()).prop_map(|(ch, input)| {
+            Message::ChannelDataMsg(ChannelData {
+                channel_id: ch,
+                payload: ChannelPayload::TerminalInput(input),
+            })
+        }),
+        // State ack
+        (arb_channel_id(), any::<u64>()).prop_map(|(ch, g)| Message::StateAck(StateAckPayload {
+            channel_id: Some(ch),
             generation: g,
         })),
-        // Forward messages (legacy)
-        (any::<u64>(), arb_forward_spec()).prop_map(|(id, spec)| {
-            Message::ForwardRequest(ForwardRequestPayload {
-                forward_id: id,
-                spec,
-            })
-        }),
-        any::<u64>().prop_map(|id| Message::ForwardAccept(ForwardAcceptPayload { forward_id: id })),
-        (any::<u64>(), "[a-z ]{0,64}").prop_map(|(id, reason)| Message::ForwardReject(
-            ForwardRejectPayload {
-                forward_id: id,
-                reason,
-            }
-        )),
-        (any::<u64>(), prop::collection::vec(any::<u8>(), 0..1024)).prop_map(|(id, data)| {
-            Message::ForwardData(ForwardDataPayload {
-                forward_id: id,
-                data,
-            })
-        }),
-        any::<u64>().prop_map(|id| Message::ForwardEof(ForwardEofPayload { forward_id: id })),
-        (any::<u64>(), any::<Option<String>>()).prop_map(|(id, reason)| Message::ForwardClose(
-            ForwardClosePayload {
-                forward_id: id,
-                reason,
-            }
-        )),
     ]
 }
 
@@ -264,17 +250,20 @@ proptest! {
         prop_assert_eq!(msg, decoded);
     }
 
-    #[allow(deprecated)]
     #[test]
     fn roundtrip_terminal_input(
+        channel_id in arb_channel_id(),
         seq in any::<u64>(),
         data in prop::collection::vec(any::<u8>(), 0..4096),
         predictable in any::<bool>(),
     ) {
-        let msg = Message::TerminalInput(TerminalInputPayload {
-            sequence: seq,
-            data,
-            predictable,
+        let msg = Message::ChannelDataMsg(ChannelData {
+            channel_id,
+            payload: ChannelPayload::TerminalInput(TerminalInputData {
+                sequence: seq,
+                data,
+                predictable,
+            }),
         });
 
         let encoded = Codec::encode(&msg).unwrap();

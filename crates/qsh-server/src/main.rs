@@ -1,6 +1,6 @@
 //! qsh server binary entry point.
 //!
-//! QUIC endpoint for qsh connections.
+//! QUIC endpoint for qsh connections using the SSH-style channel model.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -9,12 +9,10 @@ use clap::Parser;
 use quinn::{Endpoint, IdleTimeout, ServerConfig, TransportConfig};
 use tracing::{debug, error, info, warn};
 
-use qsh_core::protocol::{Capabilities, Message, ResizePayload, ShutdownReason};
-use qsh_core::transport::{Connection, StreamPair, StreamType, server_crypto_config};
+use qsh_core::protocol::{Capabilities, Message};
+use qsh_core::transport::{Connection, server_crypto_config};
 use qsh_server::{
-    BootstrapServer, Cli, ConnectionConfig, ConnectionHandler, FileHandler, ForwardHandler,
-    PendingSession, RealSessionSpawner, ServerSession, SessionAuthorizer, SessionConfig,
-    SessionRegistry,
+    BootstrapServer, Cli, ConnectionConfig, PendingSession, SessionAuthorizer, SessionConfig,
 };
 
 #[cfg(feature = "standalone")]
@@ -164,7 +162,6 @@ async fn run_bootstrap(cli: &Cli) -> qsh_core::Result<()> {
     bootstrap.print_response(None)?;
 
     let endpoint = bootstrap.endpoint();
-    let registry = build_registry(cli);
 
     // Build session config
     let session_config = SessionConfig {
@@ -173,14 +170,20 @@ async fn run_bootstrap(cli: &Cli) -> qsh_core::Result<()> {
             compression: cli.compress,
             max_forwards: cli.max_forwards,
             tunnel: false,
-            channel_model: true, // Server supports channel model
         },
         idle_timeout: std::time::Duration::from_secs(300),
         max_forwards: cli.max_forwards,
         allow_remote_forwards: cli.allow_remote_forwards,
     };
 
-    serve_endpoint(endpoint, session_config, registry, Some(authorizer), None).await
+    // Build connection config
+    let conn_config = ConnectionConfig {
+        max_forwards: cli.max_forwards,
+        allow_remote_forwards: cli.allow_remote_forwards,
+        ..Default::default()
+    };
+
+    serve_endpoint(endpoint, session_config, conn_config, Some(authorizer), None).await
 }
 
 async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
@@ -248,14 +251,18 @@ async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
             compression: cli.compress,
             max_forwards: cli.max_forwards,
             tunnel: false,
-            channel_model: true, // Server supports channel model
         },
         idle_timeout: std::time::Duration::from_secs(300),
         max_forwards: cli.max_forwards,
         allow_remote_forwards: cli.allow_remote_forwards,
     };
 
-    let registry = build_registry(cli);
+    // Build connection config
+    let conn_config = ConnectionConfig {
+        max_forwards: cli.max_forwards,
+        allow_remote_forwards: cli.allow_remote_forwards,
+        ..Default::default()
+    };
 
     // Optional standalone authenticator (feature-gated)
     #[cfg(feature = "standalone")]
@@ -278,23 +285,13 @@ async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
     #[cfg(not(feature = "standalone"))]
     let standalone_auth: Option<StandaloneAuth> = None;
 
-    serve_endpoint(endpoint, session_config, registry, None, standalone_auth).await
-}
-
-fn build_registry(cli: &Cli) -> Arc<SessionRegistry> {
-    let env_vars = cli.parse_env_vars();
-    let shell = cli.shell.as_ref().map(|p| p.to_string_lossy().into_owned());
-    let spawner = Arc::new(RealSessionSpawner {
-        shell,
-        env: env_vars,
-    });
-    Arc::new(SessionRegistry::new(cli.session_linger_duration(), spawner))
+    serve_endpoint(endpoint, session_config, conn_config, None, standalone_auth).await
 }
 
 async fn serve_endpoint(
     endpoint: Endpoint,
     session_config: SessionConfig,
-    registry: Arc<SessionRegistry>,
+    conn_config: ConnectionConfig,
     authorizer: Option<Arc<SessionAuthorizer>>,
     standalone_auth: Option<StandaloneAuth>,
 ) -> qsh_core::Result<()> {
@@ -312,12 +309,12 @@ async fn serve_endpoint(
         };
 
         let config = session_config.clone();
-        let registry = registry.clone();
+        let conn_config = conn_config.clone();
         let authorizer = authorizer.clone();
         let standalone_auth = standalone_auth.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                handle_connection(incoming, config, registry, authorizer, standalone_auth).await
+                handle_connection(incoming, config, conn_config, authorizer, standalone_auth).await
             {
                 error!(error = %e, "Connection handler error");
             }
@@ -330,7 +327,7 @@ async fn serve_endpoint(
 async fn handle_connection(
     incoming: quinn::Incoming,
     config: SessionConfig,
-    registry: Arc<SessionRegistry>,
+    conn_config: ConnectionConfig,
     authorizer: Option<Arc<SessionAuthorizer>>,
     standalone_auth: Option<StandaloneAuth>,
 ) -> qsh_core::Result<()> {
@@ -380,387 +377,12 @@ async fn handle_connection(
     }
 
     let quic = qsh_core::transport::QuicConnection::new(conn);
+    let pending = PendingSession::new(quic, authorizer, config).await?;
 
-    let pending = PendingSession::new(quic, authorizer, config.clone()).await?;
-
-    // Check if client wants to use channel model
-    if pending.hello().capabilities.channel_model {
-        // Channel model: no implicit terminal, client opens channels explicitly
-        let conn_config = ConnectionConfig {
-            max_forwards: config.max_forwards,
-            allow_remote_forwards: config.allow_remote_forwards,
-            ..Default::default()
-        };
-        return handle_connection_channel_model_pending(pending, conn_config).await;
-    }
-
-    // Legacy mode: spawn PTY during handshake
-    let attach = registry.prepare(pending.hello()).await?;
-    let parser = attach.parser.clone();
-    let initial_state = attach.initial_state.clone();
-    let session = pending.accept(parser, initial_state).await?;
-
-    // Handle the session
-    handle_session(session, attach, registry).await
-}
-
-/// Handle an established session (shared between bootstrap and normal modes).
-async fn handle_session(
-    mut session: ServerSession,
-    mut attach: qsh_server::registry::SessionAttach,
-    registry: Arc<SessionRegistry>,
-) -> qsh_core::Result<()> {
-    info!(
-        addr = %session.remote_addr(),
-        rtt = ?session.rtt(),
-        "Session attached"
-    );
-
-    // Channel for terminal input messages (from client -> server)
-    let (input_tx, mut input_rx) =
-        tokio::sync::mpsc::unbounded_channel::<qsh_core::protocol::TerminalInputPayload>();
-
-    // Create forward handler with shared connection
-    let quic_conn = session.quic_connection();
-    let forward_handler = Arc::new(ForwardHandler::new(
-        quic_conn.clone(),
-        session.max_forwards(),
-    ));
-
-    // Create file-transfer handler rooted at the user's home directory
-    // (or current directory as a fallback).
-    let base_dir = std::env::var("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
-        });
-    let file_handler = Arc::new(FileHandler::new(quic_conn.clone(), base_dir));
-
-    // Spawn a task to accept forward streams and terminal input stream
-    let accept_quic = quic_conn.clone();
-    let accept_forward = Arc::clone(&forward_handler);
-    let accept_file = Arc::clone(&file_handler);
-    let terminal_input_tx = input_tx.clone();
-    let accept_task = tokio::spawn(async move {
-        loop {
-            match accept_quic.accept_stream().await {
-                Ok((stream_type, stream)) => match stream_type {
-                    StreamType::Forward(_) | StreamType::FileTransfer(_) | StreamType::Tunnel => {
-                        let fwd = Arc::clone(&accept_forward);
-                        let file = Arc::clone(&accept_file);
-                        tokio::spawn(async move {
-                            dispatch_dynamic_stream(stream_type, stream, fwd, file).await;
-                        });
-                    }
-                    StreamType::TerminalIn => {
-                        let mut stream = stream;
-                        let tx = terminal_input_tx.clone();
-                        tokio::spawn(async move {
-                            loop {
-                                match stream.recv().await {
-                                    Ok(Message::TerminalInput(input)) => {
-                                        if tx.send(input).is_err() {
-                                            break;
-                                        }
-                                    }
-                                    Ok(other) => {
-                                        tracing::warn!(
-                                            ?other,
-                                            "Unexpected message on terminal input stream"
-                                        );
-                                    }
-                                    Err(qsh_core::Error::ConnectionClosed) => break,
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "Terminal input stream error");
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-                    }
-                    other => {
-                        warn!(stream_type = ?other, "Unexpected stream type from accept");
-                    }
-                },
-                Err(e) => {
-                    // Stream accept error - might be connection closing
-                    if !matches!(e, qsh_core::Error::ConnectionClosed) {
-                        warn!(error = %e, "Failed to accept stream");
-                    }
-                    break;
-                }
-            }
-        }
-    });
-
-    let mut last_input_seq = attach.last_input_seq;
-    let mut output_rx = attach.output_rx;
-    let entry = attach.entry.clone();
-    let stop_fut = attach.guard.stopped();
-    tokio::pin!(stop_fut);
-
-    // Main session loop
-    loop {
-        tokio::select! {
-            // Use biased selection to prioritize client input for low latency
-            biased;
-
-            // Handle terminal input stream (client -> server)
-            input = input_rx.recv() => {
-                match input {
-                    Some(input) => {
-                        debug!(
-                            seq = input.sequence,
-                            len = input.data.len(),
-                            data = ?&input.data[..input.data.len().min(32)],
-                            "Received terminal input from client"
-                        );
-                        last_input_seq = input.sequence;
-                        entry.record_input_seq(last_input_seq).await;
-                        if let Err(e) = entry.send_input(input.data).await {
-                            error!(error = %e, "Failed to send input to PTY");
-                            break;
-                        }
-                    }
-                    None => {
-                        info!("Terminal input stream closed");
-                        break;
-                    }
-                }
-            }
-
-            // Handle control messages (resize, shutdown)
-            msg = session.process_control() => {
-                match msg {
-                    Ok(Some(Message::Resize(ResizePayload { cols, rows, .. }))) => {
-                        debug!(cols, rows, "Terminal resize requested");
-                        if let Err(e) = entry.resize(cols, rows) {
-                            warn!(error = %e, "Failed to resize PTY");
-                        } else {
-                            entry.touch().await;
-                        }
-                    }
-                    Ok(Some(Message::Shutdown(payload))) => {
-                        info!(reason = ?payload.reason, "Client requested shutdown");
-                        if matches!(payload.reason, ShutdownReason::UserRequested) {
-                            entry.touch().await;
-                        } else {
-                            let key = entry.key();
-                            registry.close_entry(&key).await;
-                        }
-                        break;
-                    }
-                    Ok(Some(Message::TerminalInput(input))) => {
-                        debug!(
-                            seq = input.sequence,
-                            len = input.data.len(),
-                            data = ?&input.data[..input.data.len().min(32)],
-                            "Terminal input received on control stream (legacy)"
-                        );
-                        last_input_seq = input.sequence;
-                        entry.record_input_seq(last_input_seq).await;
-                        if let Err(e) = entry.send_input(input.data).await {
-                            error!(error = %e, "Failed to send input to PTY");
-                            break;
-                        }
-                    }
-                    Ok(Some(other)) => {
-                        warn!(msg = ?other, "Unexpected control message");
-                    }
-                    Ok(None) => {
-                        // Connection closed
-                        info!("Connection closed");
-                        break;
-                    }
-                    Err(e) => {
-                        error!(error = %e, "Control stream error");
-                        break;
-                    }
-                }
-            }
-
-            // Handle PTY output -> send to client (state-based for prediction support)
-            output = output_rx.recv() => {
-                match output {
-                    Ok(data) if !data.is_empty() => {
-                        debug!(
-                            len = data.len(),
-                            data = ?&data[..data.len().min(32)],
-                            confirmed_seq = last_input_seq,
-                            "Sending state update to client"
-                        );
-                        if let Err(e) = session.send_state_update(data, last_input_seq).await {
-                            error!(error = %e, "Failed to send state update");
-                            break;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        info!("Output stream closed (shell exited)");
-                        // Send shutdown before breaking so client knows shell exited
-                        if let Err(e) = session.send_shutdown(
-                            ShutdownReason::ShellExited,
-                            Some("shell exited".to_string()),
-                        ).await {
-                            warn!(error = %e, "Failed to send shutdown message");
-                        }
-                        break;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!(skipped, "Terminal output lagged");
-                    }
-                }
-            }
-
-            stop_reason = &mut stop_fut => {
-                if let Some(reason) = stop_reason {
-                    match reason {
-                        qsh_server::registry::AttachmentStopReason::PtyExited => {
-                            if let Err(e) = session.send_shutdown(ShutdownReason::ShellExited, Some("shell exited".to_string())).await {
-                                warn!(error = %e, "Failed to send shutdown message");
-                            }
-                        }
-                        qsh_server::registry::AttachmentStopReason::Replaced => {
-                            let _ = session.send_shutdown(
-                                ShutdownReason::ServerShutdown,
-                                Some("Session replaced by another client".to_string()),
-                            ).await;
-                        }
-                        qsh_server::registry::AttachmentStopReason::RegistryShutdown |
-                        qsh_server::registry::AttachmentStopReason::ExplicitClose => {
-                            let _ = session.send_shutdown(
-                                ShutdownReason::ServerShutdown,
-                                Some("Session closed".to_string()),
-                            ).await;
-                        }
-                    }
-                }
-                break;
-            }
-        }
-    }
-
-    // Stop the accept task
-    accept_task.abort();
-
-    entry.touch().await;
-    session.close().await;
-
-    Ok(())
-}
-
-/// Handle a connection using the channel model, starting from a pending session.
-///
-/// This is called when the client's Hello indicates `channel_model: true`.
-async fn handle_connection_channel_model_pending(
-    pending: PendingSession,
-    conn_config: ConnectionConfig,
-) -> qsh_core::Result<()> {
-    // Accept the session and create the connection handler
+    // Accept the session and create the connection handler (channel model only)
     let (handler, shutdown_rx) = pending.accept_channel_model(conn_config).await?;
 
     // Run the channel model session loop
-    handle_channel_model_session(handler, shutdown_rx).await
-}
-
-/// Dispatch a dynamically-typed bidirectional stream by peeking at the first message.
-async fn dispatch_dynamic_stream<C: Connection + 'static>(
-    stream_type: StreamType,
-    mut stream: impl StreamPair + 'static,
-    forward_handler: Arc<ForwardHandler<C>>,
-    file_handler: Arc<FileHandler<C>>,
-) {
-    let first = match stream.recv().await {
-        Ok(msg) => msg,
-        Err(e) => {
-            warn!(stream = ?stream_type, error = %e, "Failed to read first message on stream");
-            return;
-        }
-    };
-
-    match first {
-        Message::ForwardRequest(req) => {
-            let forward_id = req.forward_id;
-            if let Err(e) = forward_handler.handle_request(req, stream).await {
-                error!(forward_id, error = %e, "Forward request handling failed");
-            }
-        }
-        Message::FileRequest(req) => {
-            let transfer_id = req.transfer_id;
-            if let Err(e) = file_handler.handle_request(req, stream).await {
-                error!(transfer_id, error = %e, "File request handling failed");
-            }
-        }
-        other => {
-            warn!(?stream_type, msg = ?other, "Unexpected first message on dynamic stream");
-        }
-    }
-}
-
-// =============================================================================
-// Channel Model Handler (SSH-style multiplexing)
-// =============================================================================
-
-/// Handle a connection using the SSH-style channel model.
-///
-/// This is an alternative to `handle_connection` that uses `ConnectionHandler`
-/// for multiplexed channels instead of a single terminal session per connection.
-#[allow(dead_code)]
-async fn handle_connection_channel_model(
-    incoming: quinn::Incoming,
-    session_config: SessionConfig,
-    conn_config: qsh_server::ConnectionConfig,
-    _registry: Arc<qsh_server::ConnectionRegistry>,
-    authorizer: Option<Arc<SessionAuthorizer>>,
-    #[allow(unused_variables)] standalone_auth: Option<StandaloneAuth>,
-) -> qsh_core::Result<()> {
-    let addr = incoming.remote_address();
-    info!(addr = %addr, "Incoming connection (channel model)");
-
-    let conn = incoming.await.map_err(|e| qsh_core::Error::Transport {
-        message: format!("connection failed: {}", e),
-    })?;
-
-    // If standalone mode is enabled, perform mutual SSH key authentication
-    #[cfg(feature = "standalone")]
-    if let Some(auth) = standalone_auth {
-        use qsh_server::standalone::{AuthResult, authenticate_connection, send_auth_failure};
-
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| qsh_core::Error::Transport {
-                message: format!("failed to open auth stream: {}", e),
-            })?;
-
-        match authenticate_connection(auth.as_ref(), &mut send, &mut recv).await {
-            AuthResult::Success { client_fingerprint } => {
-                info!(%client_fingerprint, "Standalone client authenticated (channel model)");
-            }
-            AuthResult::Failure {
-                code,
-                internal_message,
-            } => {
-                error!(
-                    code = ?code,
-                    message = %internal_message,
-                    "Standalone authentication failed"
-                );
-                if let Err(e) = send_auth_failure(&mut send, code, &internal_message).await {
-                    warn!(error = %e, "Failed to send AuthFailure to client");
-                }
-                return Err(qsh_core::Error::AuthenticationFailed);
-            }
-        }
-    }
-
-    let quic = qsh_core::transport::QuicConnection::new(conn);
-
-    // Perform Hello/HelloAck handshake and create connection handler
-    let pending = PendingSession::new(quic, authorizer, session_config).await?;
-    let (handler, mut shutdown_rx) = pending.accept_channel_model(conn_config).await?;
-
-    // Handle the connection using the channel model
     handle_channel_model_session(handler, shutdown_rx).await
 }
 

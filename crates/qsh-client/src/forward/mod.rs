@@ -1,14 +1,10 @@
 //! Port forwarding handlers for qsh client.
 //!
-//! This module provides:
-//! - Local forward handler (-L): binds locally, connects via server
-//! - SOCKS5 proxy (-D): dynamic forwarding via SOCKS5 protocol
-
-mod local;
-mod socks;
-
-pub use local::LocalForwarder;
-pub use socks::Socks5Proxy;
-
-#[cfg(test)]
-mod tests;
+//! Port forwarding is now handled via the channel model:
+//! - Local forward (-L): Use `ChannelConnection::open_direct_tcpip()`
+//! - Dynamic forward (-D): Use `ChannelConnection::open_dynamic()`
+//!
+//! The `ForwardChannel` type in the `channel` module provides the bidirectional
+//! stream for forwarding data.
+//!
+//! TODO: Migrate LocalForwarder and Socks5Proxy to use the channel model.

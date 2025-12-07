@@ -12,8 +12,8 @@ use tracing::{debug, error, info, warn};
 
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
-    ChannelId, Message, StateDiff, StateUpdatePayload, TerminalInputPayload, TerminalOutputPayload,
-    TerminalParams,
+    ChannelData, ChannelId, ChannelPayload, Message, StateDiff, StateUpdateData, TerminalInputData,
+    TerminalOutputData, TerminalParams,
 };
 use qsh_core::terminal::{TerminalParser, TerminalState};
 use qsh_core::transport::{Connection, QuicConnection, QuicStream, StreamPair, StreamType};
@@ -226,18 +226,9 @@ impl TerminalChannel {
         // Process input messages from the stream
         loop {
             match stream.recv().await {
-                Ok(Message::TerminalInput(input)) => {
-                    self.handle_input(input).await?;
-                }
-                #[allow(deprecated)]
                 Ok(Message::ChannelDataMsg(data)) => {
-                    if let qsh_core::protocol::ChannelPayload::TerminalInput(input) = data.payload {
-                        self.handle_input(TerminalInputPayload {
-                            sequence: input.sequence,
-                            data: input.data,
-                            predictable: input.predictable,
-                        })
-                        .await?;
+                    if let ChannelPayload::TerminalInput(input) = data.payload {
+                        self.handle_input(input).await?;
                     }
                 }
                 Ok(other) => {
@@ -260,13 +251,8 @@ impl TerminalChannel {
         Ok(())
     }
 
-    /// Handle legacy input stream (for backward compatibility).
-    pub async fn handle_legacy_input_stream(&self, stream: QuicStream) -> Result<()> {
-        self.handle_incoming_stream(stream).await
-    }
-
     /// Handle a terminal input message.
-    async fn handle_input(&self, input: TerminalInputPayload) -> Result<()> {
+    async fn handle_input(&self, input: TerminalInputData) -> Result<()> {
         if self.inner.closed.load(Ordering::SeqCst) {
             return Err(Error::ConnectionClosed);
         }
@@ -370,11 +356,15 @@ impl TerminalChannelInner {
         let mut stream_guard = self.output_stream.lock().await;
         if let Some(ref mut stream) = *stream_guard {
             let confirmed_seq = self.confirmed_input_seq.load(Ordering::SeqCst);
+            let channel_id = self.channel_id;
 
             // Send raw output first
-            let output = Message::TerminalOutput(TerminalOutputPayload {
-                data: data.clone(),
-                confirmed_input_seq: confirmed_seq,
+            let output = Message::ChannelDataMsg(ChannelData {
+                channel_id,
+                payload: ChannelPayload::TerminalOutput(TerminalOutputData {
+                    data: data.clone(),
+                    confirmed_input_seq: confirmed_seq,
+                }),
             });
             stream.send(&output).await?;
 
@@ -395,13 +385,16 @@ impl TerminalChannelInner {
                 diff
             };
 
-            let update = Message::StateUpdate(StateUpdatePayload {
-                diff,
-                confirmed_input_seq: confirmed_seq,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_micros() as u64,
+            let update = Message::ChannelDataMsg(ChannelData {
+                channel_id,
+                payload: ChannelPayload::StateUpdate(StateUpdateData {
+                    diff,
+                    confirmed_input_seq: confirmed_seq,
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros() as u64,
+                }),
             });
             stream.send(&update).await?;
         }

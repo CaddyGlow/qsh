@@ -1,27 +1,22 @@
 //! Server session handling.
 //!
-//! Manages client sessions including:
+//! Manages client sessions using the SSH-style channel model:
 //! - Session key validation
-//! - PTY spawning and I/O relay
-//! - State tracking and updates
-//! - Reconnection handling
+//! - Channel-based multiplexing (multiple terminals, file transfers, forwards per connection)
+//! - Reconnection support
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use qsh_core::constants::SESSION_KEY_LEN;
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
-    Capabilities, HelloAckPayload, HelloPayload, Message, SessionId, ShutdownPayload,
-    ShutdownReason, StateDiff, StateUpdatePayload, TerminalOutputPayload,
+    Capabilities, HelloAckPayload, HelloPayload, Message, SessionId,
 };
-use qsh_core::session::SessionState;
-use qsh_core::terminal::{TerminalParser, TerminalState};
 use qsh_core::transport::{Connection, QuicConnection, QuicStream, StreamPair, StreamType};
 use rand::Rng;
 
@@ -48,7 +43,6 @@ impl Default for SessionConfig {
                 compression: false,
                 max_forwards: 10,
                 tunnel: false,
-                channel_model: true, // Server supports channel model
             },
             idle_timeout: Duration::from_secs(300),
             max_forwards: 10,
@@ -57,28 +51,6 @@ impl Default for SessionConfig {
     }
 }
 
-/// An active server session.
-pub struct ServerSession {
-    /// QUIC connection (shared for forward handling).
-    quic: Arc<QuicConnection>,
-    /// Control stream.
-    control: QuicStream,
-    /// Terminal output stream (server -> client).
-    terminal_out: QuicStream,
-    /// Session state.
-    #[allow(dead_code)] // Will be used for reconnection
-    session_state: SessionState,
-    /// Terminal parser (owns terminal state).
-    parser: Arc<Mutex<TerminalParser>>,
-    /// Last confirmed input sequence.
-    confirmed_input_seq: u64,
-    /// Server configuration.
-    config: SessionConfig,
-    /// Terminal size (cols, rows).
-    term_size: (u16, u16),
-    /// Last state sent to client (for computing diffs).
-    last_sent_state: Option<TerminalState>,
-}
 
 /// Controls which session keys may attach.
 #[derive(Debug, Default)]
@@ -151,7 +123,6 @@ impl PendingSession {
         debug!(
             protocol_version = hello.protocol_version,
             client_nonce = hello.client_nonce,
-            term_type = hello.term_type,
             "Received Hello"
         );
 
@@ -167,7 +138,6 @@ impl PendingSession {
                 capabilities: config.capabilities.clone(),
                 session_id: SessionId::new(),
                 server_nonce: 0,
-                initial_state: None,
                 zero_rtt_available: false,
             };
             control.send(&Message::HelloAck(ack)).await?;
@@ -187,7 +157,6 @@ impl PendingSession {
                 capabilities: config.capabilities.clone(),
                 session_id: SessionId::new(),
                 server_nonce: 0,
-                initial_state: None,
                 zero_rtt_available: false,
             };
             control.send(&Message::HelloAck(ack)).await?;
@@ -216,73 +185,10 @@ impl PendingSession {
             capabilities: self.config.capabilities.clone(),
             session_id: SessionId::new(),
             server_nonce: 0,
-            initial_state: None,
             zero_rtt_available: false,
         };
         self.control.send(&Message::HelloAck(ack)).await?;
         Ok(())
-    }
-
-    /// Finalize the handshake and build a [`ServerSession`].
-    pub async fn accept(
-        mut self,
-        parser: Arc<Mutex<TerminalParser>>,
-        mut initial_state: TerminalState,
-    ) -> Result<ServerSession> {
-        initial_state.generation = initial_state.generation.max(1);
-
-        // Send HelloAck
-        let ack = HelloAckPayload {
-            protocol_version: 1,
-            accepted: true,
-            reject_reason: None,
-            capabilities: self.config.capabilities.clone(),
-            session_id: SessionId::new(),
-            server_nonce: rand::random(),
-            initial_state: Some(initial_state.clone()),
-            zero_rtt_available: true,
-        };
-        self.control.send(&Message::HelloAck(ack)).await?;
-
-        let session_state = SessionState::new(self.hello.session_key);
-
-        // Open terminal output stream (server uni to client)
-        let mut terminal_out = self
-            .quic
-            .open_stream(StreamType::TerminalOut)
-            .await
-            .map_err(|e| Error::Transport {
-                message: format!("failed to open terminal output stream: {}", e),
-            })?;
-
-        // Send an initial empty output to materialize the stream on the client side.
-        // QUIC unidirectional streams aren't visible to the peer until data is written.
-        terminal_out
-            .send(&Message::TerminalOutput(TerminalOutputPayload {
-                data: Vec::new(),
-                confirmed_input_seq: 0,
-            }))
-            .await?;
-
-        let actual_size = initial_state.size();
-
-        info!(
-            term_size = %format!("{}x{}", actual_size.0, actual_size.1),
-            term_type = self.hello.term_type,
-            "Session established"
-        );
-
-        Ok(ServerSession {
-            quic: Arc::new(self.quic),
-            control: self.control,
-            terminal_out,
-            session_state,
-            parser,
-            confirmed_input_seq: 0,
-            config: self.config,
-            term_size: actual_size,
-            last_sent_state: Some(initial_state),
-        })
     }
 
     /// Finalize the handshake and build a [`ConnectionHandler`] for the channel model.
@@ -296,7 +202,7 @@ impl PendingSession {
     ) -> Result<(Arc<ConnectionHandler>, tokio::sync::mpsc::Receiver<()>)> {
         let session_id = SessionId::new();
 
-        // Send HelloAck (no initial terminal state - channels created separately)
+        // Send HelloAck (channels created separately via ChannelOpen)
         let ack = HelloAckPayload {
             protocol_version: 1,
             accepted: true,
@@ -304,7 +210,6 @@ impl PendingSession {
             capabilities: self.config.capabilities.clone(),
             session_id,
             server_nonce: rand::random(),
-            initial_state: None, // No implicit terminal in channel model
             zero_rtt_available: true,
         };
         self.control.send(&Message::HelloAck(ack)).await?;
@@ -323,149 +228,6 @@ impl PendingSession {
     }
 }
 
-impl ServerSession {
-    /// Get the session state.
-    pub fn state(&self) -> &SessionState {
-        &self.session_state
-    }
-
-    /// Get the remote address.
-    pub fn remote_addr(&self) -> std::net::SocketAddr {
-        self.quic.remote_addr()
-    }
-
-    /// Get the terminal size (cols, rows).
-    pub fn term_size(&self) -> (u16, u16) {
-        self.term_size
-    }
-
-    /// Maximum number of forwards allowed for this session.
-    pub fn max_forwards(&self) -> u16 {
-        self.config.max_forwards
-    }
-
-    /// Get the current RTT.
-    pub fn rtt(&self) -> Duration {
-        self.quic.rtt()
-    }
-
-    /// Get a shared reference to the underlying QUIC connection.
-    ///
-    /// Used by forward handlers to accept streams.
-    pub fn quic_connection(&self) -> Arc<QuicConnection> {
-        Arc::clone(&self.quic)
-    }
-
-    /// Accept an incoming stream from the client.
-    ///
-    /// Returns the stream type and the stream itself.
-    pub async fn accept_stream(&self) -> Result<(StreamType, QuicStream)> {
-        self.quic.accept_stream().await
-    }
-
-    /// Send raw terminal output to the client.
-    ///
-    /// This sends the raw PTY output directly without state tracking.
-    /// For simple terminal use, this is sufficient.
-    pub async fn send_output(&mut self, data: Vec<u8>, input_seq: u64) -> Result<()> {
-        self.confirmed_input_seq = input_seq;
-
-        let output = TerminalOutputPayload {
-            data,
-            confirmed_input_seq: self.confirmed_input_seq,
-        };
-
-        self.terminal_out
-            .send(&Message::TerminalOutput(output))
-            .await
-    }
-
-    /// Send raw output and state update to the client.
-    ///
-    /// Sends raw PTY output first (for immediate display and protocol passthrough),
-    /// then sends state update (for reconnection and prediction support).
-    ///
-    /// NOTE: The parser is shared with SessionEntry which processes PTY output
-    /// via process_output(). We must NOT call parser.process() here or the
-    /// output would be processed twice, corrupting the terminal state.
-    pub async fn send_state_update(&mut self, data: Vec<u8>, input_seq: u64) -> Result<()> {
-        self.confirmed_input_seq = input_seq;
-
-        // Send raw output first - this handles all terminal protocols directly
-        let output = TerminalOutputPayload {
-            data,
-            confirmed_input_seq: self.confirmed_input_seq,
-        };
-        self.terminal_out
-            .send(&Message::TerminalOutput(output))
-            .await?;
-
-        // Then send state update for reconnection/prediction support
-        let new_state = {
-            let parser = self.parser.lock().await;
-            parser.state().clone()
-        };
-
-        // Compute diff from last sent state (incremental when possible)
-        let diff = if let Some(ref last_state) = self.last_sent_state {
-            last_state.diff_to(&new_state)
-        } else {
-            StateDiff::Full(new_state.clone())
-        };
-
-        let update = StateUpdatePayload {
-            diff,
-            confirmed_input_seq: self.confirmed_input_seq,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_micros() as u64,
-        };
-
-        // Update last sent state
-        self.last_sent_state = Some(new_state);
-
-        self.terminal_out.send(&Message::StateUpdate(update)).await
-    }
-
-    /// Handle a terminal input message.
-    pub async fn handle_input(&mut self, data: &[u8]) -> Result<()> {
-        // In a full implementation, this would write to the PTY
-        debug!(len = data.len(), "Received terminal input");
-        Ok(())
-    }
-
-    /// Send a shutdown message to the client.
-    pub async fn send_shutdown(
-        &mut self,
-        reason: ShutdownReason,
-        message: Option<String>,
-    ) -> Result<()> {
-        let payload = ShutdownPayload { reason, message };
-        self.control.send(&Message::Shutdown(payload)).await
-    }
-
-    /// Process incoming control messages.
-    pub async fn process_control(&mut self) -> Result<Option<Message>> {
-        match self.control.recv().await {
-            Ok(msg) => Ok(Some(msg)),
-            Err(Error::ConnectionClosed) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Close the session gracefully.
-    ///
-    /// This finishes the control stream to ensure any pending messages
-    /// (like Shutdown) are delivered before the connection closes.
-    pub async fn close(mut self) {
-        // Finish the control stream to ensure shutdown message is delivered
-        if let Err(e) = self.control.finish().await {
-            warn!(error = %e, "Failed to finish control stream");
-        }
-        info!(addr = %self.quic.remote_addr(), "Session closed");
-    }
-}
 
 #[cfg(test)]
 mod tests {

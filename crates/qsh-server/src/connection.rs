@@ -709,30 +709,14 @@ impl ConnectionHandler {
                     })
                 }
             }
-            // Legacy stream types - dispatch to appropriate handler
-            StreamType::TerminalIn => {
-                // Find the first terminal channel
-                let channels = self.channels.read().await;
-                for handle in channels.values() {
-                    if let ChannelHandle::Terminal(terminal) = handle {
-                        return terminal.handle_legacy_input_stream(stream).await;
-                    }
-                }
-                warn!("Terminal input stream but no terminal channel");
+            StreamType::ChannelOut(channel_id) => {
+                // Server doesn't expect to receive output streams from client
+                warn!(channel_id = %channel_id, "Unexpected ChannelOut stream from client");
                 Ok(())
             }
-            StreamType::Forward(id) => {
-                // Legacy forward stream
-                debug!(forward_id = id, "Legacy forward stream");
-                Ok(())
-            }
-            StreamType::FileTransfer(id) => {
-                // Legacy file transfer stream
-                debug!(transfer_id = id, "Legacy file transfer stream");
-                Ok(())
-            }
-            other => {
-                warn!(stream_type = ?other, "Unexpected stream type");
+            StreamType::Control => {
+                // Control stream is handled separately
+                warn!("Unexpected additional control stream");
                 Ok(())
             }
         }
