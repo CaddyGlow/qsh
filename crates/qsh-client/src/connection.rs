@@ -458,6 +458,7 @@ impl ChannelConnection {
     /// Open a file transfer channel.
     pub async fn open_file_transfer(&self, params: FileTransferParams) -> Result<FileChannel> {
         let channel_id = self.allocate_channel_id();
+        let resume_offset = params.resume_from;
 
         // Send ChannelOpen
         let open = ChannelOpenPayload {
@@ -484,7 +485,7 @@ impl ChannelConnection {
             _ => None,
         };
 
-        let channel = FileChannel::new(channel_id, stream, metadata);
+        let channel = FileChannel::new(channel_id, stream, metadata, resume_offset);
 
         // Register channel
         self.channels
@@ -588,12 +589,6 @@ impl ChannelConnection {
             .next_global_request_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending_global_requests
-            .lock()
-            .await
-            .insert(request_id, tx);
-
         let request = GlobalRequestPayload {
             request_id,
             request: GlobalRequest::TcpIpForward {
@@ -602,15 +597,29 @@ impl ChannelConnection {
             },
         };
 
-        {
+        // Send request and wait for reply within the same lock scope
+        let result = {
             let mut control = self.control.lock().await;
             control.send(&Message::GlobalRequest(request)).await?;
-        }
 
-        // Wait for reply
-        let result = rx.await.map_err(|_| Error::Transport {
-            message: "global request cancelled".to_string(),
-        })?;
+            // Read until we get our GlobalReply
+            loop {
+                match control.recv().await? {
+                    Message::GlobalReply(reply) if reply.request_id == request_id => {
+                        break reply.result;
+                    }
+                    Message::GlobalReply(reply) => {
+                        debug!(
+                            request_id = reply.request_id,
+                            "Received GlobalReply for different request"
+                        );
+                    }
+                    other => {
+                        debug!(?other, "Ignoring message while waiting for GlobalReply");
+                    }
+                }
+            }
+        };
 
         match result {
             GlobalReplyResult::Success(GlobalReplyData::TcpIpForward { bound_port: bp }) => {
@@ -654,12 +663,6 @@ impl ChannelConnection {
             .next_global_request_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending_global_requests
-            .lock()
-            .await
-            .insert(request_id, tx);
-
         let request = GlobalRequestPayload {
             request_id,
             request: GlobalRequest::CancelTcpIpForward {
@@ -668,14 +671,29 @@ impl ChannelConnection {
             },
         };
 
-        {
+        // Send request and wait for reply within the same lock scope
+        let result = {
             let mut control = self.control.lock().await;
             control.send(&Message::GlobalRequest(request)).await?;
-        }
 
-        let result = rx.await.map_err(|_| Error::Transport {
-            message: "global request cancelled".to_string(),
-        })?;
+            // Read until we get our GlobalReply
+            loop {
+                match control.recv().await? {
+                    Message::GlobalReply(reply) if reply.request_id == request_id => {
+                        break reply.result;
+                    }
+                    Message::GlobalReply(reply) => {
+                        debug!(
+                            request_id = reply.request_id,
+                            "Received GlobalReply for different request"
+                        );
+                    }
+                    other => {
+                        debug!(?other, "Ignoring message while waiting for GlobalReply");
+                    }
+                }
+            }
+        };
 
         match result {
             GlobalReplyResult::Success(_) => {

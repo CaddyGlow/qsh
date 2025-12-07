@@ -556,31 +556,21 @@ impl ConnectionHandler {
             channel_id = %channel_id,
             bound = %format!("{}:{}", params.bound_host, params.bound_port),
             originator = %format!("{}:{}", params.originator_host, params.originator_port),
-            "Opening forwarded-tcpip channel"
+            "Setting up forwarded-tcpip relay"
         );
 
-        // This is server-initiated when a connection arrives on a remote forward
-        match ForwardChannel::new_forwarded(channel_id, params, Arc::clone(&self.quic), tcp_stream)
-            .await
-        {
-            Ok(channel) => {
-                {
-                    let mut channels = self.channels.write().await;
-                    channels.insert(channel_id, ChannelHandle::Forward(channel));
-                }
+        // Client already accepted - just set up the relay
+        // Note: We don't send ChannelAccept here - for server-initiated channels,
+        // the CLIENT sends ChannelAccept and we've already received it.
+        let channel =
+            ForwardChannel::new_forwarded(channel_id, params, Arc::clone(&self.quic), tcp_stream)
+                .await?;
 
-                self.send_channel_accept(channel_id, ChannelAcceptData::ForwardedTcpIp)
-                    .await
-            }
-            Err(e) => {
-                self.send_channel_reject(
-                    channel_id,
-                    ChannelRejectCode::ConnectFailed,
-                    &e.to_string(),
-                )
-                .await
-            }
-        }
+        let mut channels = self.channels.write().await;
+        channels.insert(channel_id, ChannelHandle::Forward(channel));
+
+        info!(channel_id = %channel_id, "Forwarded channel relay started");
+        Ok(())
     }
 
     async fn open_dynamic_forward_channel(
@@ -824,14 +814,38 @@ impl ConnectionHandler {
             params: ChannelParams::ForwardedTcpIp(params.clone()),
         };
 
+        // Send ChannelOpen and wait for ChannelAccept within the same lock scope
         {
             let mut control = self.control.lock().await;
             control.send(&Message::ChannelOpen(open_payload)).await?;
+            debug!(channel_id = %channel_id, "Sent ChannelOpen for forwarded-tcpip, waiting for accept");
+
+            // Wait for ChannelAccept from client
+            loop {
+                match control.recv().await? {
+                    Message::ChannelAccept(accept) if accept.channel_id == channel_id => {
+                        debug!(channel_id = %channel_id, "Received ChannelAccept for forwarded-tcpip");
+                        break;
+                    }
+                    Message::ChannelReject(reject) if reject.channel_id == channel_id => {
+                        warn!(
+                            channel_id = %channel_id,
+                            code = ?reject.code,
+                            message = %reject.message,
+                            "Client rejected forwarded channel"
+                        );
+                        return Err(Error::Forward {
+                            message: format!("client rejected: {}", reject.message),
+                        });
+                    }
+                    other => {
+                        debug!(?other, "Ignoring message while waiting for ChannelAccept");
+                    }
+                }
+            }
         }
 
-        debug!(channel_id = %channel_id, "Sent ChannelOpen for forwarded-tcpip");
-
-        // Now set up the channel (the client will accept/reject)
+        // Now set up the channel and start relay
         self.open_forwarded_tcpip_channel(channel_id, params, tcp_stream)
             .await
     }

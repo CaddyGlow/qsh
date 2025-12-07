@@ -242,6 +242,8 @@ struct FileChannelInner {
     closed: AtomicBool,
     /// Bytes transferred.
     bytes_transferred: AtomicU64,
+    /// Resume offset (for resuming partial transfers).
+    resume_offset: u64,
 }
 
 impl FileChannel {
@@ -250,6 +252,7 @@ impl FileChannel {
         channel_id: ChannelId,
         stream: QuicStream,
         metadata: Option<FileTransferMetadata>,
+        resume_offset: Option<u64>,
     ) -> Self {
         let inner = Arc::new(FileChannelInner {
             channel_id,
@@ -257,6 +260,7 @@ impl FileChannel {
             metadata,
             closed: AtomicBool::new(false),
             bytes_transferred: AtomicU64::new(0),
+            resume_offset: resume_offset.unwrap_or(0),
         });
 
         Self { inner }
@@ -270,6 +274,11 @@ impl FileChannel {
     /// Get file metadata (for downloads).
     pub fn metadata(&self) -> Option<&FileTransferMetadata> {
         self.inner.metadata.as_ref()
+    }
+
+    /// Get the resume offset (for resuming partial transfers).
+    pub fn resume_offset(&self) -> u64 {
+        self.inner.resume_offset
     }
 
     /// Send file data chunk.

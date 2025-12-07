@@ -136,6 +136,7 @@ impl FileTransferChannel {
             blocks: Vec::new(), // Delta sync blocks computed separately
             is_dir: meta.is_dir(),
             file_hash,
+            partial_checksum: None, // Computed on demand for resume
         })
     }
 
@@ -156,6 +157,31 @@ impl FileTransferChannel {
                 break;
             }
             hasher.update(&buf[..n]);
+        }
+
+        Ok(hasher.finish())
+    }
+
+    /// Compute xxHash64 for the first `len` bytes of a file.
+    async fn compute_partial_hash(path: &PathBuf, len: u64) -> Result<u64> {
+        let mut file = File::open(path).await.map_err(|e| Error::FileTransfer {
+            message: format!("failed to open file for partial hashing: {}", e),
+        })?;
+
+        let mut hasher = StreamingHasher::new();
+        let mut buf = vec![0u8; FILE_CHUNK_SIZE];
+        let mut remaining = len;
+
+        while remaining > 0 {
+            let to_read = (remaining as usize).min(FILE_CHUNK_SIZE);
+            let n = file.read(&mut buf[..to_read]).await.map_err(|e| Error::FileTransfer {
+                message: format!("failed to read file for partial hashing: {}", e),
+            })?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            remaining -= n as u64;
         }
 
         Ok(hasher.finish())
@@ -207,10 +233,12 @@ impl FileTransferChannel {
     async fn handle_upload(&self) -> Result<()> {
         let path = PathBuf::from(&self.inner.params.path);
         let temp_path = path.with_extension("qscp.tmp");
+        let resume_offset = self.inner.params.resume_from.unwrap_or(0);
 
         info!(
             channel_id = %self.inner.channel_id,
             path = %path.display(),
+            resume_from = resume_offset,
             "Starting upload receive"
         );
 
@@ -221,20 +249,99 @@ impl FileTransferChannel {
             })?;
         }
 
-        // Open temp file for writing
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temp_path)
-            .await
-            .map_err(|e| Error::FileTransfer {
-                message: format!("failed to create temp file: {}", e),
-            })?;
+        // Handle resume: check if temp file exists and matches resume offset
+        let (mut file, mut hasher, mut total_bytes) = if resume_offset > 0 {
+            // Try to open existing temp file for resume
+            if let Ok(meta) = fs::metadata(&temp_path).await {
+                if meta.len() >= resume_offset {
+                    // Hash the existing partial data
+                    let partial_hash = Self::compute_partial_hash(&temp_path, resume_offset).await?;
+                    debug!(
+                        channel_id = %self.inner.channel_id,
+                        partial_hash = %format!("{:016x}", partial_hash),
+                        resume_offset = resume_offset,
+                        "Resuming upload from existing partial file"
+                    );
 
-        let mut hasher = StreamingHasher::new();
-        let mut total_bytes: u64 = 0;
-        let mut last_ack_bytes: u64 = 0;
+                    // Open for append and seek
+                    let mut file = OpenOptions::new()
+                        .write(true)
+                        .open(&temp_path)
+                        .await
+                        .map_err(|e| Error::FileTransfer {
+                            message: format!("failed to open temp file for resume: {}", e),
+                        })?;
+                    file.seek(std::io::SeekFrom::Start(resume_offset))
+                        .await
+                        .map_err(|e| Error::FileTransfer {
+                            message: format!("failed to seek in temp file: {}", e),
+                        })?;
+
+                    // Initialize hasher with partial data
+                    let mut partial_file = File::open(&temp_path).await.map_err(|e| Error::FileTransfer {
+                        message: format!("failed to open temp file for hashing: {}", e),
+                    })?;
+                    let mut hasher = StreamingHasher::new();
+                    let mut buf = vec![0u8; FILE_CHUNK_SIZE];
+                    let mut remaining = resume_offset;
+                    while remaining > 0 {
+                        let to_read = (remaining as usize).min(FILE_CHUNK_SIZE);
+                        let n = partial_file.read(&mut buf[..to_read]).await.map_err(|e| Error::FileTransfer {
+                            message: format!("failed to read partial file: {}", e),
+                        })?;
+                        if n == 0 {
+                            break;
+                        }
+                        hasher.update(&buf[..n]);
+                        remaining -= n as u64;
+                    }
+
+                    (file, hasher, resume_offset)
+                } else {
+                    // Partial file too small, start fresh
+                    warn!(
+                        channel_id = %self.inner.channel_id,
+                        "Partial file smaller than resume offset, starting fresh"
+                    );
+                    let file = OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(&temp_path)
+                        .await
+                        .map_err(|e| Error::FileTransfer {
+                            message: format!("failed to create temp file: {}", e),
+                        })?;
+                    (file, StreamingHasher::new(), 0)
+                }
+            } else {
+                // No partial file exists, start fresh
+                let file = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&temp_path)
+                    .await
+                    .map_err(|e| Error::FileTransfer {
+                        message: format!("failed to create temp file: {}", e),
+                    })?;
+                (file, StreamingHasher::new(), 0)
+            }
+        } else {
+            // No resume, create fresh temp file
+            let file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temp_path)
+                .await
+                .map_err(|e| Error::FileTransfer {
+                    message: format!("failed to create temp file: {}", e),
+                })?;
+            (file, StreamingHasher::new(), 0)
+        };
+
+        let mut last_ack_bytes: u64 = total_bytes;
 
         // Create decompressor for compressed data
         let decompressor = Decompressor::new();

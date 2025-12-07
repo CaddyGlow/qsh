@@ -3,14 +3,17 @@
 //! Transfers files to/from remote hosts using the qsh protocol.
 
 use std::net::ToSocketAddrs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use clap::Parser;
-use indicatif::{ProgressBar, ProgressStyle};
+use futures::stream::{self, StreamExt};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tracing::{debug, error, info};
+use tokio::sync::Semaphore;
+use tracing::{debug, error, info, warn};
 
 use qsh_client::{BootstrapMode, ChannelConnection, CpCli, FileChannel, FilePath, SshConfig, bootstrap};
 use qsh_core::file::checksum::StreamingHasher;
@@ -89,7 +92,7 @@ async fn run_transfer(
     dest: &FilePath,
 ) -> qsh_core::Result<()> {
     // Connect using the channel model
-    let conn = connect(cli, host, user).await?;
+    let conn = Arc::new(connect(cli, host, user).await?);
 
     // Determine transfer direction
     let is_upload = cli.is_upload();
@@ -120,7 +123,56 @@ async fn run_transfer(
     // Build transfer options
     let options = cli.transfer_options();
 
-    // Open a file transfer channel
+    // Check if this is a directory transfer
+    let local_meta = fs::metadata(&local_path).await;
+    let is_directory = local_meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+
+    if is_directory && !options.recursive {
+        return Err(qsh_core::Error::FileTransfer {
+            message: format!("{} is a directory (use -r for recursive)", local_path.display()),
+        });
+    }
+
+    let start_time = Instant::now();
+
+    if is_directory && is_upload {
+        // Recursive directory upload
+        let result = do_recursive_upload(&conn, &local_path, &remote_path, &options).await;
+        if let Ok(conn) = Arc::try_unwrap(conn) {
+            conn.close().await?;
+        }
+        return result;
+    }
+
+    // Check for resume support
+    let resume_from = if cli.resume {
+        if is_upload {
+            // For uploads, we'll check server metadata after opening channel
+            None
+        } else {
+            // For downloads, check for partial file
+            let partial_path = local_path.with_extension("qscp.partial");
+            if let Ok(partial_meta) = fs::metadata(&partial_path).await {
+                let partial_size = partial_meta.len();
+                if partial_size > 0 {
+                    info!(
+                        partial_size = partial_size,
+                        path = %partial_path.display(),
+                        "Found partial file, attempting resume"
+                    );
+                    Some(partial_size)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Single file transfer
     let transfer_params = qsh_core::protocol::FileTransferParams {
         path: remote_path.clone(),
         direction: if is_upload {
@@ -129,7 +181,7 @@ async fn run_transfer(
             qsh_core::protocol::TransferDirection::Download
         },
         options: options.clone(),
-        resume_from: None,
+        resume_from,
     };
 
     info!(
@@ -143,7 +195,6 @@ async fn run_transfer(
     debug!(channel_id = ?file_channel.channel_id(), "File transfer channel opened");
 
     // Run the transfer
-    let start_time = Instant::now();
     let result = if is_upload {
         do_upload(&file_channel, &local_path, &remote_path, &options).await
     } else {
@@ -152,7 +203,9 @@ async fn run_transfer(
 
     // Close the channel and connection
     file_channel.mark_closed();
-    conn.close().await?;
+    if let Ok(conn) = Arc::try_unwrap(conn) {
+        conn.close().await?;
+    }
 
     match result {
         Ok(stats) => {
@@ -184,6 +237,206 @@ async fn run_transfer(
 struct TransferStats {
     bytes: u64,
     skipped: bool,
+}
+
+/// File entry for recursive transfer.
+#[derive(Debug, Clone)]
+struct FileEntry {
+    /// Local path to the file.
+    local_path: PathBuf,
+    /// Relative path from the source directory.
+    relative_path: PathBuf,
+    /// File size in bytes.
+    size: u64,
+}
+
+/// Recursively collect all files in a directory.
+async fn collect_files(base_path: &Path) -> qsh_core::Result<Vec<FileEntry>> {
+    let mut files = Vec::new();
+    let mut stack = vec![base_path.to_path_buf()];
+
+    while let Some(dir_path) = stack.pop() {
+        let mut entries = fs::read_dir(&dir_path).await.map_err(|e| qsh_core::Error::FileTransfer {
+            message: format!("failed to read directory {}: {}", dir_path.display(), e),
+        })?;
+
+        while let Some(entry) = entries.next_entry().await.map_err(|e| qsh_core::Error::FileTransfer {
+            message: format!("failed to read entry: {}", e),
+        })? {
+            let path = entry.path();
+            let metadata = entry.metadata().await.map_err(|e| qsh_core::Error::FileTransfer {
+                message: format!("failed to get metadata for {}: {}", path.display(), e),
+            })?;
+
+            if metadata.is_dir() {
+                stack.push(path);
+            } else if metadata.is_file() {
+                let relative_path = path.strip_prefix(base_path)
+                    .map_err(|_| qsh_core::Error::FileTransfer {
+                        message: "failed to compute relative path".to_string(),
+                    })?
+                    .to_path_buf();
+
+                files.push(FileEntry {
+                    local_path: path,
+                    relative_path,
+                    size: metadata.len(),
+                });
+            }
+        }
+    }
+
+    // Sort for consistent ordering
+    files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    Ok(files)
+}
+
+/// Perform recursive directory upload with parallel transfers.
+async fn do_recursive_upload(
+    conn: &Arc<ChannelConnection>,
+    local_base: &Path,
+    remote_base: &str,
+    options: &TransferOptions,
+) -> qsh_core::Result<()> {
+    let start_time = Instant::now();
+
+    // Collect all files
+    eprintln!("Scanning {}...", local_base.display());
+    let files = collect_files(local_base).await?;
+
+    if files.is_empty() {
+        eprintln!("No files to transfer");
+        return Ok(());
+    }
+
+    let total_files = files.len();
+    let total_bytes: u64 = files.iter().map(|f| f.size).sum();
+    eprintln!("Found {} files ({} bytes total)", total_files, total_bytes);
+
+    // Setup progress tracking
+    let mp = MultiProgress::new();
+    let overall_pb = mp.add(ProgressBar::new(total_bytes));
+    overall_pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({percent}%) {msg}")
+            .unwrap()
+            .progress_chars("=>-"),
+    );
+    overall_pb.set_message(format!("0/{} files", total_files));
+
+    // Setup parallel transfer semaphore
+    let semaphore = Arc::new(Semaphore::new(options.parallel.max(1)));
+    let transferred_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let transferred_files = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let skipped_files = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let failed_files = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // Process files in parallel
+    let results: Vec<_> = stream::iter(files)
+        .map(|file| {
+            let conn = Arc::clone(conn);
+            let semaphore = Arc::clone(&semaphore);
+            let options = options.clone();
+            let remote_base = remote_base.to_string();
+            let transferred_bytes = Arc::clone(&transferred_bytes);
+            let transferred_files = Arc::clone(&transferred_files);
+            let skipped_files = Arc::clone(&skipped_files);
+            let failed_files = Arc::clone(&failed_files);
+            let overall_pb = overall_pb.clone();
+            let total_files = total_files;
+
+            async move {
+                // Acquire semaphore permit
+                let _permit = semaphore.acquire().await.unwrap();
+
+                // Build remote path
+                let remote_path = format!(
+                    "{}/{}",
+                    remote_base.trim_end_matches('/'),
+                    file.relative_path.to_string_lossy().replace('\\', "/")
+                );
+
+                // Create transfer params
+                let transfer_params = qsh_core::protocol::FileTransferParams {
+                    path: remote_path.clone(),
+                    direction: qsh_core::protocol::TransferDirection::Upload,
+                    options: options.clone(),
+                    resume_from: None,
+                };
+
+                // Open channel and transfer
+                match conn.open_file_transfer(transfer_params).await {
+                    Ok(channel) => {
+                        let result = do_upload(&channel, &file.local_path, &remote_path, &options).await;
+                        channel.mark_closed();
+
+                        match result {
+                            Ok(stats) => {
+                                if stats.skipped {
+                                    skipped_files.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                } else {
+                                    transferred_bytes.fetch_add(stats.bytes, std::sync::atomic::Ordering::SeqCst);
+                                }
+                                transferred_files.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            Err(e) => {
+                                warn!(path = %file.local_path.display(), error = %e, "Transfer failed");
+                                failed_files.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(path = %file.local_path.display(), error = %e, "Failed to open channel");
+                        failed_files.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+
+                // Update overall progress
+                let done = transferred_files.load(std::sync::atomic::Ordering::SeqCst)
+                    + skipped_files.load(std::sync::atomic::Ordering::SeqCst)
+                    + failed_files.load(std::sync::atomic::Ordering::SeqCst);
+                let bytes = transferred_bytes.load(std::sync::atomic::Ordering::SeqCst);
+                overall_pb.set_position(bytes);
+                overall_pb.set_message(format!("{}/{} files", done, total_files));
+            }
+        })
+        .buffer_unordered(options.parallel.max(1))
+        .collect()
+        .await;
+
+    overall_pb.finish_with_message("complete");
+
+    // Print summary
+    let elapsed = start_time.elapsed();
+    let bytes = transferred_bytes.load(std::sync::atomic::Ordering::SeqCst);
+    let transferred = transferred_files.load(std::sync::atomic::Ordering::SeqCst);
+    let skipped = skipped_files.load(std::sync::atomic::Ordering::SeqCst);
+    let failed = failed_files.load(std::sync::atomic::Ordering::SeqCst);
+
+    let speed = if elapsed.as_secs_f64() > 0.0 {
+        bytes as f64 / elapsed.as_secs_f64() / 1024.0 / 1024.0
+    } else {
+        0.0
+    };
+
+    eprintln!(
+        "\nTransferred {} files ({} bytes) in {:.2}s ({:.2} MB/s)",
+        transferred, bytes, elapsed.as_secs_f64(), speed
+    );
+    if skipped > 0 {
+        eprintln!("Skipped {} files (already up to date)", skipped);
+    }
+    if failed > 0 {
+        eprintln!("Failed {} files", failed);
+        return Err(qsh_core::Error::FileTransfer {
+            message: format!("{} files failed to transfer", failed),
+        });
+    }
+
+    // Consume results to ensure all futures completed
+    drop(results);
+
+    Ok(())
 }
 
 /// Upload a file to the remote server.
@@ -344,17 +597,94 @@ async fn do_download(
         })?;
     }
 
-    // Open temp file for writing
-    let temp_path = local_path.with_extension("qscp.tmp");
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&temp_path)
-        .await
-        .map_err(|e| qsh_core::Error::FileTransfer {
-            message: format!("failed to create temp file: {}", e),
-        })?;
+    // Use .qscp.partial for partial downloads
+    let partial_path = local_path.with_extension("qscp.partial");
+
+    // Check if we're resuming from a partial file
+    let resume_offset = channel.resume_offset();
+    let (mut file, mut hasher, mut total_bytes) = if resume_offset > 0 {
+        // Open existing partial file for append
+        if let Ok(partial_meta) = fs::metadata(&partial_path).await {
+            if partial_meta.len() >= resume_offset {
+                debug!(
+                    resume_offset = resume_offset,
+                    "Resuming download from partial file"
+                );
+
+                // Read existing partial file to initialize hasher
+                let mut partial_file = File::open(&partial_path).await.map_err(|e| qsh_core::Error::FileTransfer {
+                    message: format!("failed to open partial file for hashing: {}", e),
+                })?;
+                let mut hasher = StreamingHasher::new();
+                let mut buf = vec![0u8; FILE_CHUNK_SIZE];
+                let mut remaining = resume_offset;
+                while remaining > 0 {
+                    let to_read = (remaining as usize).min(FILE_CHUNK_SIZE);
+                    let n = partial_file.read(&mut buf[..to_read]).await.map_err(|e| qsh_core::Error::FileTransfer {
+                        message: format!("failed to read partial file: {}", e),
+                    })?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                    remaining -= n as u64;
+                }
+
+                // Open for append
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .open(&partial_path)
+                    .await
+                    .map_err(|e| qsh_core::Error::FileTransfer {
+                        message: format!("failed to open partial file for resume: {}", e),
+                    })?;
+                file.seek(std::io::SeekFrom::Start(resume_offset))
+                    .await
+                    .map_err(|e| qsh_core::Error::FileTransfer {
+                        message: format!("failed to seek in partial file: {}", e),
+                    })?;
+
+                (file, hasher, resume_offset)
+            } else {
+                // Partial file too small, start fresh
+                warn!("Partial file smaller than resume offset, starting fresh");
+                let file = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&partial_path)
+                    .await
+                    .map_err(|e| qsh_core::Error::FileTransfer {
+                        message: format!("failed to create partial file: {}", e),
+                    })?;
+                (file, StreamingHasher::new(), 0)
+            }
+        } else {
+            // No partial file, start fresh
+            let file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&partial_path)
+                .await
+                .map_err(|e| qsh_core::Error::FileTransfer {
+                    message: format!("failed to create partial file: {}", e),
+                })?;
+            (file, StreamingHasher::new(), 0)
+        }
+    } else {
+        // No resume, create fresh partial file
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&partial_path)
+            .await
+            .map_err(|e| qsh_core::Error::FileTransfer {
+                message: format!("failed to create partial file: {}", e),
+            })?;
+        (file, StreamingHasher::new(), 0)
+    };
 
     // Setup decompressor for compressed data
     let decompressor = Decompressor::new();
@@ -362,9 +692,9 @@ async fn do_download(
     // Setup progress bar
     let filename = local_path.file_name().unwrap_or_default().to_string_lossy();
     let pb = create_progress_bar(file_size, &filename);
-
-    let mut hasher = StreamingHasher::new();
-    let mut total_bytes: u64 = 0;
+    if total_bytes > 0 {
+        pb.set_position(total_bytes);
+    }
 
     // Receive file data
     loop {
@@ -421,7 +751,7 @@ async fn do_download(
                 // Verify checksum
                 let local_checksum = hasher.finish();
                 if complete.checksum != local_checksum {
-                    let _ = fs::remove_file(&temp_path).await;
+                    let _ = fs::remove_file(&partial_path).await;
                     return Err(qsh_core::Error::FileTransfer {
                         message: format!(
                             "checksum mismatch: local={:016x} remote={:016x}",
@@ -430,9 +760,9 @@ async fn do_download(
                     });
                 }
 
-                // Rename temp to final
-                fs::rename(&temp_path, local_path).await.map_err(|e| qsh_core::Error::FileTransfer {
-                    message: format!("failed to rename temp file: {}", e),
+                // Rename partial to final
+                fs::rename(&partial_path, local_path).await.map_err(|e| qsh_core::Error::FileTransfer {
+                    message: format!("failed to rename partial file: {}", e),
                 })?;
 
                 return Ok(TransferStats { bytes: total_bytes, skipped: false });
@@ -442,7 +772,12 @@ async fn do_download(
                 ..
             }) => {
                 pb.finish_with_message("error");
-                let _ = fs::remove_file(&temp_path).await;
+                // Keep partial file for resume support
+                info!(
+                    partial_path = %partial_path.display(),
+                    bytes_received = total_bytes,
+                    "Transfer failed, partial file preserved for resume"
+                );
                 return Err(qsh_core::Error::FileTransfer {
                     message: format!("server error: {:?} - {}", err.code, err.message),
                 });

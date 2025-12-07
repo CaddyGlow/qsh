@@ -92,6 +92,36 @@ fn extract_cursor(diff: &StateDiff) -> Option<(u16, u16)> {
     }
 }
 
+/// Handle control messages in forwarding-only mode.
+///
+/// Processes server-initiated channels (ForwardedTcpIp) and shutdown requests.
+async fn handle_control_message(
+    conn: &std::sync::Arc<ChannelConnection>,
+    msg: qsh_core::protocol::Message,
+) -> qsh_core::Result<()> {
+    use qsh_core::protocol::{ChannelParams, Message};
+
+    match msg {
+        Message::ChannelOpen(open) => match open.params {
+            ChannelParams::ForwardedTcpIp(params) => {
+                conn.handle_forwarded_channel_open(open.channel_id, params)
+                    .await?;
+            }
+            other => {
+                debug!(?other, "Ignoring unexpected ChannelOpen type");
+            }
+        },
+        Message::Shutdown(payload) => {
+            info!(reason = ?payload.reason, "Server requested shutdown");
+            return Err(qsh_core::Error::ConnectionClosed);
+        }
+        other => {
+            debug!(?other, "Ignoring control message in forward-only mode");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "standalone")]
 async fn run_client_direct(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Result<()> {
     use rand::RngCore;
@@ -175,6 +205,25 @@ async fn run_client_direct(cli: &Cli, host: &str, user: Option<&str>) -> qsh_cor
         // Start forwards
         let _forward_handles = start_forwards(cli, &conn).await?;
 
+        // Spawn control message handler for server-initiated channels (remote forwards)
+        let conn_clone = std::sync::Arc::clone(&conn);
+        let control_task = tokio::spawn(async move {
+            loop {
+                match conn_clone.recv_control().await {
+                    Ok(msg) => {
+                        if let Err(e) = handle_control_message(&conn_clone, msg).await {
+                            warn!(error = %e, "Error handling control message");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "Control stream ended");
+                        break;
+                    }
+                }
+            }
+        });
+
         // Wait for Ctrl+C
         info!("Press Ctrl+C to exit");
         tokio::signal::ctrl_c()
@@ -182,6 +231,7 @@ async fn run_client_direct(cli: &Cli, host: &str, user: Option<&str>) -> qsh_cor
             .map_err(qsh_core::Error::Io)?;
 
         info!("Shutting down...");
+        control_task.abort();
         conn.shutdown().await?;
         return Ok(());
     }
@@ -291,6 +341,25 @@ async fn run_client_channel_model(
         // Start forwards
         let _forward_handles = start_forwards(cli, &conn).await?;
 
+        // Spawn control message handler for server-initiated channels (remote forwards)
+        let conn_clone = std::sync::Arc::clone(&conn);
+        let control_task = tokio::spawn(async move {
+            loop {
+                match conn_clone.recv_control().await {
+                    Ok(msg) => {
+                        if let Err(e) = handle_control_message(&conn_clone, msg).await {
+                            warn!(error = %e, "Error handling control message");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "Control stream ended");
+                        break;
+                    }
+                }
+            }
+        });
+
         // Wait for Ctrl+C
         info!("Press Ctrl+C to exit");
         tokio::signal::ctrl_c()
@@ -298,6 +367,7 @@ async fn run_client_channel_model(
             .map_err(qsh_core::Error::Io)?;
 
         info!("Shutting down...");
+        control_task.abort();
         conn.shutdown().await?;
         return Ok(());
     }

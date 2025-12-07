@@ -295,6 +295,11 @@ pub struct FileTransferMetadata {
     /// Present when skip_if_unchanged is enabled and file exists.
     #[serde(default)]
     pub file_hash: Option<u64>,
+    /// Partial file checksum for resume support.
+    /// When resuming, this is the xxHash64 of the first `size` bytes.
+    /// Used to verify partial file integrity before continuing transfer.
+    #[serde(default)]
+    pub partial_checksum: Option<u64>,
 }
 
 /// Parameters for local port forward (-L).

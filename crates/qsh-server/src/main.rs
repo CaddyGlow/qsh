@@ -5,6 +5,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+/// Enable the single-instance-per-user singleton via named pipe.
+/// When enabled, bootstrap mode will reuse an existing server instance if one is running.
+/// Set to false to allow multiple independent bootstrap instances (useful for debugging).
+const ENABLE_BOOTSTRAP_SINGLETON: bool = false;
+
 use clap::Parser;
 use quinn::{Endpoint, IdleTimeout, ServerConfig, TransportConfig};
 use tracing::{debug, error, info, warn};
@@ -129,12 +134,13 @@ fn main() {
 /// 4. Accepts a single connection
 /// 5. Handles that session then exits
 async fn run_bootstrap(cli: &Cli) -> qsh_core::Result<()> {
-    // First, see if an instance is already running for this user and ask it
-    // for a new session key via the pipe.
-    let pipe_path = qsh_server::bootstrap::bootstrap_pipe_path();
-    if let Some(json) = qsh_server::bootstrap::try_existing_bootstrap(&pipe_path).await? {
-        println!("{}", json);
-        return Ok(());
+    // Singleton mode: try to reuse an existing server instance via named pipe.
+    if ENABLE_BOOTSTRAP_SINGLETON {
+        let pipe_path = qsh_server::bootstrap::bootstrap_pipe_path();
+        if let Some(json) = qsh_server::bootstrap::try_existing_bootstrap(&pipe_path).await? {
+            println!("{}", json);
+            return Ok(());
+        }
     }
 
     // Use port 0 to auto-select from range, or specified port
@@ -147,16 +153,26 @@ async fn run_bootstrap(cli: &Cli) -> qsh_core::Result<()> {
     let authorizer = Arc::new(SessionAuthorizer::new());
     authorizer.allow(bootstrap.session_key()).await;
 
-    // Create pipe for subsequent bootstrap requests and start listener.
-    let _pipe_guard =
-        qsh_server::bootstrap::create_pipe(&pipe_path).map_err(|e| qsh_core::Error::Transport {
-            message: format!("failed to create bootstrap pipe: {}", e),
-        })?;
-    let _pipe_task = qsh_server::bootstrap::spawn_pipe_listener(
-        pipe_path,
-        bootstrap.clone(),
-        authorizer.clone(),
-    );
+    // Singleton mode: create pipe for subsequent bootstrap requests.
+    let _pipe_guard;
+    let _pipe_task;
+    if ENABLE_BOOTSTRAP_SINGLETON {
+        let pipe_path = qsh_server::bootstrap::bootstrap_pipe_path();
+        _pipe_guard = Some(
+            qsh_server::bootstrap::create_pipe(&pipe_path)
+                .map_err(|e| qsh_core::Error::Transport {
+                    message: format!("failed to create bootstrap pipe: {}", e),
+                })?,
+        );
+        _pipe_task = Some(qsh_server::bootstrap::spawn_pipe_listener(
+            pipe_path,
+            bootstrap.clone(),
+            authorizer.clone(),
+        ));
+    } else {
+        _pipe_guard = None;
+        _pipe_task = None;
+    }
 
     // Output connection info to stdout
     bootstrap.print_response(None)?;
@@ -183,7 +199,16 @@ async fn run_bootstrap(cli: &Cli) -> qsh_core::Result<()> {
         ..Default::default()
     };
 
-    serve_endpoint(endpoint, session_config, conn_config, Some(authorizer), None).await
+    // Bootstrap mode: accept single connection, then exit
+    serve_endpoint(
+        endpoint,
+        session_config,
+        conn_config,
+        Some(authorizer),
+        None,
+        true, // single_connection
+    )
+    .await
 }
 
 async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
@@ -285,7 +310,16 @@ async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
     #[cfg(not(feature = "standalone"))]
     let standalone_auth: Option<StandaloneAuth> = None;
 
-    serve_endpoint(endpoint, session_config, conn_config, None, standalone_auth).await
+    // Normal server mode: accept multiple connections
+    serve_endpoint(
+        endpoint,
+        session_config,
+        conn_config,
+        None,
+        standalone_auth,
+        false, // single_connection
+    )
+    .await
 }
 
 async fn serve_endpoint(
@@ -294,9 +328,10 @@ async fn serve_endpoint(
     conn_config: ConnectionConfig,
     authorizer: Option<Arc<SessionAuthorizer>>,
     standalone_auth: Option<StandaloneAuth>,
+    single_connection: bool,
 ) -> qsh_core::Result<()> {
     let addr = endpoint.local_addr().ok();
-    info!(?addr, "Server listening");
+    info!(?addr, single_connection, "Server listening");
 
     // Accept connections
     loop {
@@ -312,6 +347,19 @@ async fn serve_endpoint(
         let conn_config = conn_config.clone();
         let authorizer = authorizer.clone();
         let standalone_auth = standalone_auth.clone();
+
+        if single_connection {
+            // Bootstrap mode: handle single connection synchronously, then exit
+            let result =
+                handle_connection(incoming, config, conn_config, authorizer, standalone_auth).await;
+            if let Err(e) = &result {
+                error!(error = %e, "Connection handler error");
+            }
+            info!("Single connection completed, exiting");
+            return result;
+        }
+
+        // Normal mode: spawn connection handler and continue accepting
         tokio::spawn(async move {
             if let Err(e) =
                 handle_connection(incoming, config, conn_config, authorizer, standalone_auth).await
