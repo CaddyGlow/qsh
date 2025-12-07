@@ -602,6 +602,7 @@ AAAECBrLZZNM25f1vduElMLpZWAH9g5heM7sv1r62hvVfglNRHlNW52FYlU/5DcNv/dWdr\n\
                     compression: false,
                     max_forwards: 10,
                     tunnel: false,
+                    channel_model: true,
                 },
                 initial_state: Some(initial_state),
                 zero_rtt_available: false,

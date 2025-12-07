@@ -317,6 +317,7 @@ impl ClientConnection {
                 compression: false,
                 max_forwards: 10,
                 tunnel: false,
+                channel_model: false, // Legacy mode
             },
             resume_session: None,
             term_size: config.term_size,
@@ -661,6 +662,7 @@ impl ClientConnection {
                 compression: false,
                 max_forwards: self.server_caps.max_forwards,
                 tunnel: self.server_caps.tunnel,
+                channel_model: false, // Legacy mode
             },
             resume_session: None, // TODO: use actual session ID
             term_size: self.config.term_size,
@@ -907,7 +909,7 @@ impl ChannelConnection {
             .open_stream(qsh_core::transport::StreamType::Control)
             .await?;
 
-        // Send Hello (no terminal params)
+        // Send Hello (channel model - no implicit terminal)
         let hello = HelloPayload {
             protocol_version: 1,
             session_key: config.session_key,
@@ -920,6 +922,7 @@ impl ChannelConnection {
                 compression: false,
                 max_forwards: 10,
                 tunnel: false,
+                channel_model: true, // Use SSH-style channel model
             },
             resume_session: None,
             term_size: config.term_size, // Still needed for Hello compat

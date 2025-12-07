@@ -854,6 +854,11 @@ pub struct Capabilities {
     pub max_forwards: u16,
     /// Supports IP tunnel.
     pub tunnel: bool,
+    /// Supports SSH-style channel model (no implicit terminal).
+    /// When true, the server should not spawn a PTY during Hello handshake.
+    /// Instead, the client will open terminal channels explicitly via ChannelOpen.
+    #[serde(default)]
+    pub channel_model: bool,
 }
 
 /// Terminal size.

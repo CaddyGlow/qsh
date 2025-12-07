@@ -32,12 +32,14 @@ prop_compose! {
         compression in any::<bool>(),
         max_forwards in any::<u16>(),
         tunnel in any::<bool>(),
+        channel_model in any::<bool>(),
     ) -> Capabilities {
         Capabilities {
             predictive_echo,
             compression,
             max_forwards,
             tunnel,
+            channel_model,
         }
     }
 }

@@ -13,9 +13,54 @@ use tokio::select;
 use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
-use crate::protocol::{Codec, Message};
+use crate::protocol::{ChannelId, Codec, Message};
 
 use super::{Connection, StreamPair, StreamType};
+
+// =============================================================================
+// Channel Stream Header
+// =============================================================================
+
+/// Magic byte identifying a channel model unidirectional stream.
+const CHANNEL_STREAM_MAGIC: u8 = 0xC1;
+
+/// Create the 9-byte header for channel unidirectional streams.
+///
+/// Format: [magic (1 byte)] [encoded channel_id (8 bytes LE)]
+fn channel_stream_header(channel_id: ChannelId) -> [u8; 9] {
+    let mut header = [0u8; 9];
+    header[0] = CHANNEL_STREAM_MAGIC;
+    header[1..9].copy_from_slice(&channel_id.encode().to_le_bytes());
+    header
+}
+
+/// Read and parse a channel stream header from a unidirectional stream.
+///
+/// Returns the StreamType (ChannelIn or ChannelOut based on initiator).
+async fn read_channel_stream_header(recv: &mut RecvStream) -> Result<StreamType> {
+    let mut header = [0u8; 9];
+    recv.read_exact(&mut header).await.map_err(|e| Error::Transport {
+        message: format!("failed to read channel header: {}", e),
+    })?;
+
+    if header[0] != CHANNEL_STREAM_MAGIC {
+        return Err(Error::Protocol {
+            message: format!("invalid channel stream magic: {:#x}", header[0]),
+        });
+    }
+
+    let encoded = u64::from_le_bytes(header[1..9].try_into().unwrap());
+    let channel_id = ChannelId::decode(encoded);
+
+    // Determine In vs Out based on QUIC stream initiator bit
+    // bit 0 = initiator (0 = client, 1 = server)
+    let stream_id: u64 = recv.id().into();
+    if stream_id & 0x1 == 1 {
+        Ok(StreamType::ChannelOut(channel_id)) // Server-initiated
+    } else {
+        Ok(StreamType::ChannelIn(channel_id)) // Client-initiated
+    }
+}
 
 // =============================================================================
 // Quinn Stream Pair
@@ -46,18 +91,6 @@ async fn map_bidi_stream_type(stream_id: u64, next_forward_id: &Arc<Mutex<u32>>)
     }
 }
 
-/// Map a unidirectional stream ID to StreamType based on initiator.
-/// Note: This is legacy behavior for backward compatibility. New code should use
-/// the channel model where stream type is determined by the channel open handshake.
-#[allow(deprecated)]
-fn map_uni_stream_type(stream_id: u64) -> StreamType {
-    // QUIC stream ID bit0 = initiator (0 client, 1 server), bit1 = direction (0 bidirectional, 1 unidirectional)
-    let initiator_server = stream_id & 0x1 == 1;
-    match initiator_server {
-        true => StreamType::TerminalOut, // server → client output
-        false => StreamType::TerminalIn, // client → server input
-    }
-}
 
 impl QuicStream {
     /// Create a new stream pair from Quinn streams.
@@ -333,15 +366,15 @@ impl Connection for QuicConnection {
                 })?;
                 Ok(QuicStream::new(send, recv))
             }
-            StreamType::ChannelIn(_) => {
-                let send = self.inner.open_uni().await.map_err(|e| Error::Transport {
-                    message: format!("failed to open channel input stream: {}", e),
+            StreamType::ChannelIn(channel_id) | StreamType::ChannelOut(channel_id) => {
+                use tokio::io::AsyncWriteExt;
+                let mut send = self.inner.open_uni().await.map_err(|e| Error::Transport {
+                    message: format!("failed to open channel stream: {}", e),
                 })?;
-                Ok(QuicStream::from_send(send))
-            }
-            StreamType::ChannelOut(_) => {
-                let send = self.inner.open_uni().await.map_err(|e| Error::Transport {
-                    message: format!("failed to open channel output stream: {}", e),
+                // Write channel header to identify this stream
+                let header = channel_stream_header(channel_id);
+                send.write_all(&header).await.map_err(|e| Error::Transport {
+                    message: format!("failed to write channel header: {}", e),
                 })?;
                 Ok(QuicStream::from_send(send))
             }
@@ -385,12 +418,11 @@ impl Connection for QuicConnection {
                 Ok((stream_type, QuicStream::new(send, recv)))
             }
             uni = self.inner.accept_uni() => {
-                let recv = uni.map_err(|e| Error::Transport {
+                let mut recv = uni.map_err(|e| Error::Transport {
                     message: format!("failed to accept unidirectional stream: {}", e),
                 })?;
-                // Use the full QUIC stream ID (includes initiator + direction bits)
-                let stream_id: u64 = recv.id().into();
-                let stream_type = map_uni_stream_type(stream_id);
+                // Read channel header to determine stream type
+                let stream_type = read_channel_stream_header(&mut recv).await?;
                 Ok((stream_type, QuicStream::from_recv(recv)))
             }
         }

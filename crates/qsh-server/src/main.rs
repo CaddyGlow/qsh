@@ -12,8 +12,9 @@ use tracing::{debug, error, info, warn};
 use qsh_core::protocol::{Capabilities, Message, ResizePayload, ShutdownReason};
 use qsh_core::transport::{Connection, StreamPair, StreamType, server_crypto_config};
 use qsh_server::{
-    BootstrapServer, Cli, FileHandler, ForwardHandler, PendingSession, RealSessionSpawner,
-    ServerSession, SessionAuthorizer, SessionConfig, SessionRegistry,
+    BootstrapServer, Cli, ConnectionConfig, ConnectionHandler, FileHandler, ForwardHandler,
+    PendingSession, RealSessionSpawner, ServerSession, SessionAuthorizer, SessionConfig,
+    SessionRegistry,
 };
 
 #[cfg(feature = "standalone")]
@@ -172,6 +173,7 @@ async fn run_bootstrap(cli: &Cli) -> qsh_core::Result<()> {
             compression: cli.compress,
             max_forwards: cli.max_forwards,
             tunnel: false,
+            channel_model: true, // Server supports channel model
         },
         idle_timeout: std::time::Duration::from_secs(300),
         max_forwards: cli.max_forwards,
@@ -246,6 +248,7 @@ async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
             compression: cli.compress,
             max_forwards: cli.max_forwards,
             tunnel: false,
+            channel_model: true, // Server supports channel model
         },
         idle_timeout: std::time::Duration::from_secs(300),
         max_forwards: cli.max_forwards,
@@ -378,7 +381,20 @@ async fn handle_connection(
 
     let quic = qsh_core::transport::QuicConnection::new(conn);
 
-    let pending = PendingSession::new(quic, authorizer, config).await?;
+    let pending = PendingSession::new(quic, authorizer, config.clone()).await?;
+
+    // Check if client wants to use channel model
+    if pending.hello().capabilities.channel_model {
+        // Channel model: no implicit terminal, client opens channels explicitly
+        let conn_config = ConnectionConfig {
+            max_forwards: config.max_forwards,
+            allow_remote_forwards: config.allow_remote_forwards,
+            ..Default::default()
+        };
+        return handle_connection_channel_model_pending(pending, conn_config).await;
+    }
+
+    // Legacy mode: spawn PTY during handshake
     let attach = registry.prepare(pending.hello()).await?;
     let parser = attach.parser.clone();
     let initial_state = attach.initial_state.clone();
@@ -631,6 +647,20 @@ async fn handle_session(
     session.close().await;
 
     Ok(())
+}
+
+/// Handle a connection using the channel model, starting from a pending session.
+///
+/// This is called when the client's Hello indicates `channel_model: true`.
+async fn handle_connection_channel_model_pending(
+    pending: PendingSession,
+    conn_config: ConnectionConfig,
+) -> qsh_core::Result<()> {
+    // Accept the session and create the connection handler
+    let (handler, shutdown_rx) = pending.accept_channel_model(conn_config).await?;
+
+    // Run the channel model session loop
+    handle_channel_model_session(handler, shutdown_rx).await
 }
 
 /// Dispatch a dynamically-typed bidirectional stream by peeking at the first message.

@@ -48,6 +48,7 @@ impl Default for SessionConfig {
                 compression: false,
                 max_forwards: 10,
                 tunnel: false,
+                channel_model: true, // Server supports channel model
             },
             idle_timeout: Duration::from_secs(300),
             max_forwards: 10,
