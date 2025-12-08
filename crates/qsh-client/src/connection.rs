@@ -11,8 +11,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use quinn::{ClientConfig, Endpoint, IdleTimeout, TransportConfig};
-use tracing::{debug, info};
+use tokio::net::UdpSocket;
+use tracing::{debug, info, warn};
 
 use qsh_core::constants::DEFAULT_MAX_FORWARDS;
 use qsh_core::error::{Error, Result};
@@ -21,7 +21,8 @@ use qsh_core::protocol::{
     TermSize,
 };
 use qsh_core::transport::{
-    Connection, QuicConnection, QuicSender, QuicStream, StreamPair, client_crypto_config,
+    Connection, QuicConnection, QuicSender, QuicStream, StreamPair,
+    client_config, enable_error_queue, classify_io_error, cert_hash,
 };
 
 // ============================================================================
@@ -172,6 +173,12 @@ pub struct ConnectionConfig {
     pub keep_alive_interval: Option<Duration>,
     /// QUIC max idle timeout.
     pub max_idle_timeout: Duration,
+    /// Cached session data for 0-RTT resumption.
+    ///
+    /// When reconnecting, provide the session data from a previous connection
+    /// to enable 0-RTT fast reconnection. This is obtained by calling
+    /// `QuicConnection::session_data()` after a successful connection.
+    pub session_data: Option<Vec<u8>>,
 }
 
 impl Default for ConnectionConfig {
@@ -189,6 +196,7 @@ impl Default for ConnectionConfig {
             // Aggressive keepalive (500ms) for fast disconnection detection (mosh uses RTT/2)
             keep_alive_interval: Some(Duration::from_millis(500)),
             max_idle_timeout: Duration::from_secs(15),
+            session_data: None,
         }
     }
 }
@@ -197,45 +205,171 @@ impl Default for ConnectionConfig {
 ///
 /// This performs the QUIC/TLS handshake but does not send qsh protocol
 /// messages. Used by `ChannelConnection::connect()` and standalone authentication.
-pub async fn connect_quic(config: &ConnectionConfig) -> Result<quinn::Connection> {
-    // Create QUIC endpoint
-    let mut endpoint =
-        Endpoint::client("0.0.0.0:0".parse().unwrap()).map_err(|e| Error::Transport {
-            message: format!("failed to create QUIC endpoint: {}", e),
-        })?;
+///
+/// If `config.session_data` is provided, attempts 0-RTT session resumption
+/// for faster reconnection.
+pub async fn connect_quic(config: &ConnectionConfig) -> Result<QuicConnection> {
+    // Bind UDP socket
+    let bind_addr = if config.server_addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
 
-    // Configure transport (keepalive + idle timeout)
-    let mut transport = TransportConfig::default();
-    transport.keep_alive_interval(config.keep_alive_interval);
-    if let Ok(timeout) = IdleTimeout::try_from(config.max_idle_timeout) {
-        transport.max_idle_timeout(Some(timeout));
+    let socket = UdpSocket::bind(bind_addr)
+        .await
+        .map_err(|e| classify_io_error(e))?;
+
+    // Connect socket for ICMP error delivery
+    socket
+        .connect(config.server_addr)
+        .await
+        .map_err(|e| classify_io_error(e))?;
+
+    // Enable IP_RECVERR (Linux) for immediate ICMP error delivery
+    enable_error_queue(&socket)?;
+
+    let local_addr = socket.local_addr().map_err(|e| classify_io_error(e))?;
+
+    // Create quiche client config
+    let mut quiche_config = client_config(config.cert_hash.is_none())?;
+
+    // Set idle timeout
+    quiche_config.set_max_idle_timeout(config.max_idle_timeout.as_millis() as u64);
+
+    // Generate connection ID
+    let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut scid);
+    let scid = quiche::ConnectionId::from_ref(&scid);
+
+    // Create quiche connection
+    let mut conn = quiche::connect(
+        Some("qsh-server"),
+        &scid,
+        local_addr,
+        config.server_addr,
+        &mut quiche_config,
+    )
+    .map_err(|e| Error::HandshakeFailed {
+        message: format!("failed to create connection: {}", e),
+    })?;
+
+    // Apply cached session data for 0-RTT resumption (must be done immediately
+    // after creating the connection, before any packets are sent/received)
+    let has_session_data = config.session_data.is_some();
+    if let Some(session_data) = &config.session_data {
+        if let Err(e) = conn.set_session(session_data) {
+            // Non-fatal: fall back to regular 1-RTT handshake
+            debug!(error = %e, "Failed to set session data for 0-RTT, falling back to 1-RTT");
+        } else {
+            debug!("Set session data for 0-RTT resumption");
+        }
     }
 
-    // Configure TLS with optional cert pinning
-    let crypto = client_crypto_config(config.cert_hash.as_deref())?;
-    let mut client_config = ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(crypto).map_err(|e| Error::Transport {
-            message: format!("failed to create QUIC config: {}", e),
-        })?,
-    ));
-    client_config.transport_config(Arc::new(transport));
-    endpoint.set_default_client_config(client_config);
+    let socket = Arc::new(socket);
 
-    // Connect to server
-    let connecting = endpoint
-        .connect(config.server_addr, "qsh-server")
-        .map_err(|e| Error::Transport {
-            message: format!("failed to initiate connection: {}", e),
-        })?;
+    // Perform handshake
+    let mut out = [0u8; 65535];
+    let mut buf = [0u8; 65535];
 
-    let conn = tokio::time::timeout(config.connect_timeout, connecting)
+    // Initial handshake packet
+    let (write, send_info) = conn.send(&mut out).map_err(|e| Error::HandshakeFailed {
+        message: format!("failed to generate initial packet: {}", e),
+    })?;
+
+    socket
+        .send_to(&out[..write], send_info.to)
         .await
-        .map_err(|_| Error::Timeout)?
-        .map_err(|e| Error::Transport {
-            message: format!("connection failed: {}", e),
-        })?;
+        .map_err(|e| classify_io_error(e))?;
 
-    Ok(conn)
+    // Handshake loop
+    let start = Instant::now();
+    while !conn.is_established() {
+        if start.elapsed() > config.connect_timeout {
+            return Err(Error::Timeout);
+        }
+
+        // Receive response
+        let recv_result = tokio::time::timeout(
+            Duration::from_millis(100),
+            socket.recv_from(&mut buf),
+        )
+        .await;
+
+        match recv_result {
+            Ok(Ok((len, from))) => {
+                let recv_info = quiche::RecvInfo {
+                    from,
+                    to: local_addr,
+                };
+                if let Err(e) = conn.recv(&mut buf[..len], recv_info) {
+                    if e != quiche::Error::Done {
+                        return Err(Error::HandshakeFailed {
+                            message: format!("handshake recv failed: {}", e),
+                        });
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                return Err(classify_io_error(e));
+            }
+            Err(_) => {
+                // Timeout, continue
+            }
+        }
+
+        // Send pending packets
+        loop {
+            match conn.send(&mut out) {
+                Ok((write, send_info)) => {
+                    socket
+                        .send_to(&out[..write], send_info.to)
+                        .await
+                        .map_err(|e| classify_io_error(e))?;
+                }
+                Err(quiche::Error::Done) => break,
+                Err(e) => {
+                    return Err(Error::HandshakeFailed {
+                        message: format!("handshake send failed: {}", e),
+                    });
+                }
+            }
+        }
+    }
+
+    // Verify certificate hash if provided
+    if let Some(expected_hash) = &config.cert_hash {
+        if let Some(peer_cert) = conn.peer_cert() {
+            let actual_hash = cert_hash(peer_cert);
+            if actual_hash.as_slice() != expected_hash.as_slice() {
+                return Err(Error::CertificateError {
+                    message: "certificate hash mismatch".to_string(),
+                });
+            }
+        }
+    }
+
+    let rtt = conn.path_stats().next().map(|p| p.rtt);
+    let resumed = conn.is_resumed();
+    debug!(
+        addr = %config.server_addr,
+        rtt = ?rtt,
+        resumed,
+        had_session_data = has_session_data,
+        "QUIC handshake completed"
+    );
+
+    if resumed {
+        info!(addr = %config.server_addr, "0-RTT session resumed");
+    }
+
+    Ok(QuicConnection::new(
+        conn,
+        socket,
+        config.server_addr,
+        local_addr,
+        false, // is_server = false for client
+    ))
 }
 
 // NOTE: ClientConnection has been removed. Use ChannelConnection instead.
@@ -319,7 +453,7 @@ impl ChannelConnection {
     }
 
     /// Complete the qsh protocol handshake on an existing QUIC connection.
-    pub async fn from_quic(conn: quinn::Connection, config: ConnectionConfig) -> Result<Self> {
+    pub async fn from_quic(conn: QuicConnection, config: ConnectionConfig) -> Result<Self> {
         Self::from_quic_with_resume(conn, config, None).await
     }
 
@@ -338,7 +472,7 @@ impl ChannelConnection {
 
     /// Complete the qsh protocol handshake with optional session resumption.
     async fn from_quic_with_resume(
-        conn: quinn::Connection,
+        conn: QuicConnection,
         config: ConnectionConfig,
         resume_session: Option<SessionId>,
     ) -> Result<Self> {
@@ -346,7 +480,7 @@ impl ChannelConnection {
             resume = resume_session.is_some(),
             "QUIC connection established (channel model)"
         );
-        let quic = Arc::new(QuicConnection::new(conn));
+        let quic = Arc::new(conn);
 
         // Open control stream
         let mut control = quic
@@ -390,13 +524,67 @@ impl ChannelConnection {
             return Err(Error::AuthenticationFailed);
         }
 
+        let has_existing = !hello_ack.existing_channels.is_empty();
         info!(
             session_id = ?hello_ack.session_id,
+            existing_channels = hello_ack.existing_channels.len(),
             "Channel model session established"
         );
 
         // Extract sender before wrapping in Mutex (allows concurrent send/recv)
         let control_sender = control.sender();
+
+        // Restore existing channels if this is a session resume
+        let mut channels = StdHashMap::new();
+        for existing in hello_ack.existing_channels {
+            use qsh_core::protocol::ExistingChannelType;
+            match existing.channel_type {
+                ExistingChannelType::Terminal { state } => {
+                    info!(
+                        channel_id = %existing.channel_id,
+                        "Restoring terminal channel from session resume"
+                    );
+
+                    // Open input stream to send keystrokes
+                    let input_stream = quic
+                        .open_stream(StreamType::ChannelIn(existing.channel_id))
+                        .await
+                        .map_err(|e| Error::Transport {
+                            message: format!("failed to open input stream for restored channel: {}", e),
+                        })?;
+
+                    // Accept output stream from server
+                    let (stream_type, output_stream) = quic.accept_stream().await?;
+                    if !matches!(stream_type, StreamType::ChannelOut(id) if id == existing.channel_id) {
+                        warn!(
+                            expected = %existing.channel_id,
+                            got = ?stream_type,
+                            "Unexpected stream type during channel restore"
+                        );
+                    }
+
+                    // Create restored terminal channel
+                    let terminal = TerminalChannel::restore(
+                        existing.channel_id,
+                        input_stream,
+                        output_stream,
+                        state,
+                    );
+                    channels.insert(existing.channel_id, ChannelHandle::Terminal(terminal));
+                }
+                ExistingChannelType::Other => {
+                    // Non-terminal channels are not restored for now
+                    debug!(
+                        channel_id = %existing.channel_id,
+                        "Skipping non-terminal existing channel"
+                    );
+                }
+            }
+        }
+
+        if has_existing {
+            info!(restored_channels = channels.len(), "Session channels restored");
+        }
 
         Ok(Self {
             quic,
@@ -405,7 +593,7 @@ impl ChannelConnection {
             config,
             session_id: hello_ack.session_id,
             server_caps: hello_ack.capabilities,
-            channels: RwLock::new(StdHashMap::new()),
+            channels: RwLock::new(channels),
             next_channel_id: AtomicU64::new(0),
             pending_global_requests: tokio::sync::Mutex::new(StdHashMap::new()),
             next_global_request_id: std::sync::atomic::AtomicU32::new(0),
@@ -431,6 +619,25 @@ impl ChannelConnection {
     /// Get the current RTT.
     pub fn rtt(&self) -> Duration {
         self.quic.rtt()
+    }
+
+    /// Check if there are any restored channels from session resumption.
+    pub async fn has_restored_channels(&self) -> bool {
+        !self.channels.read().await.is_empty()
+    }
+
+    /// Get the first restored terminal channel (for mosh-style reconnection).
+    ///
+    /// Returns the terminal channel if one was restored during session resumption.
+    /// This should be called instead of `open_terminal()` when reconnecting.
+    pub async fn get_restored_terminal(&self) -> Option<TerminalChannel> {
+        let channels = self.channels.read().await;
+        for handle in channels.values() {
+            if let ChannelHandle::Terminal(terminal) = handle {
+                return Some(terminal.clone());
+            }
+        }
+        None
     }
 
     /// Allocate a new client-side channel ID.

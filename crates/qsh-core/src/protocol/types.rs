@@ -806,6 +806,34 @@ pub struct HelloAckPayload {
     pub server_nonce: u64,
     /// 0-RTT is available for future reconnects.
     pub zero_rtt_available: bool,
+    /// Existing channels from session resumption (mosh-style reconnect).
+    ///
+    /// When a client reconnects to an existing session, this contains
+    /// information about channels that are still active on the server.
+    /// The client should restore these channels and start receiving data.
+    #[serde(default)]
+    pub existing_channels: Vec<ExistingChannel>,
+}
+
+/// Information about an existing channel during session resumption.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExistingChannel {
+    /// Channel ID.
+    pub channel_id: ChannelId,
+    /// Channel type (terminal, file-transfer, etc.).
+    pub channel_type: ExistingChannelType,
+}
+
+/// Type of existing channel for session resumption.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ExistingChannelType {
+    /// Terminal channel with current state.
+    Terminal {
+        /// Current terminal state for immediate display.
+        state: crate::terminal::TerminalState,
+    },
+    /// Other channel types (forwards, file transfers) - just notify existence.
+    Other,
 }
 
 /// Client/server capabilities.

@@ -14,7 +14,15 @@
       "WebSearch",
       "WebFetch(domain:docs.rs)",
       "WebFetch(domain:github.com)",
-      "Bash(cargo tree:*)"
+      "Bash(cargo tree:*)",
+      "Bash(grep:*)",
+      "WebFetch(domain:blog.cloudflare.com)",
+      "Bash(xargs:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(curl:*)",
+      "WebFetch(domain:docs.quic.tech)",
+      "Bash(cargo doc:*)",
+      "Bash(nix develop -c cargo check:*)"
     ],
     "deny": [],
     "ask": []

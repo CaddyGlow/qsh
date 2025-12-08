@@ -14,8 +14,8 @@ repository = "https://github.com/anthropics/qsh"
 tokio = { version = "1.40", features = ["full"] }
 
 # QUIC/TLS
-quinn = "0.11"
-rustls = { version = "0.23", default-features = false, features = ["std", "ring", "logging", "tls12"] }
+tokio-quiche = "0.12"
+quiche = "0.24"
 
 # SSH
 russh = "0.45"
@@ -52,6 +52,7 @@ rcgen = "0.13"
 rand = "0.8"
 base64 = "0.22"
 ring = "0.17"
+rustls-pemfile = "2.2"
 
 # SSH keys (for standalone auth feature)
 ssh-key = { version = "0.6", features = ["ed25519", "rsa", "p256", "std", "encryption", "crypto"] }
@@ -84,3 +85,8 @@ test-case = "3.3"
 assert_matches = "1.5"
 futures = "0.3"
 tempfile = "3"
+
+# Patch datagram-socket for musl compatibility (PR #2224)
+# https://github.com/cloudflare/quiche/pull/2224
+[patch.crates-io]
+datagram-socket = { git = "https://github.com/tedscode/quiche", branch = "msghdr-musl" }

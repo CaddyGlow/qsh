@@ -22,8 +22,9 @@ compression = ["qsh-core/compression"]
 [dependencies]
 qsh-core = { workspace = true }
 tokio = { workspace = true }
-quinn = { workspace = true }
-rustls = { workspace = true }
+tokio-quiche = { workspace = true }
+quiche = { workspace = true }
+rustls-pemfile = { workspace = true }
 nix = { workspace = true }
 libc = { workspace = true }
 clap = { workspace = true }

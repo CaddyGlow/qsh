@@ -77,13 +77,17 @@ impl Default for ConnectionConfig {
 /// - Either side sends ChannelOpen to create any resource
 /// - Receiver responds with ChannelAccept or ChannelReject
 /// - Either side can send ChannelClose to tear down a channel
+///
+/// Supports mosh-style reconnection: when a client reconnects, the QUIC
+/// connection and control stream can be swapped while keeping channels
+/// (and their PTYs) alive.
 pub struct ConnectionHandler {
-    /// Underlying QUIC connection.
-    quic: Arc<QuicConnection>,
+    /// Underlying QUIC connection (swappable for reconnection).
+    quic: RwLock<Arc<QuicConnection>>,
     /// Control stream for lifecycle messages (recv side).
     control: Mutex<QuicStream>,
-    /// Control stream sender (can be used concurrently with recv).
-    control_sender: QuicSender,
+    /// Control stream sender (swappable for reconnection).
+    control_sender: RwLock<QuicSender>,
     /// Active channels keyed by ChannelId.
     channels: RwLock<HashMap<ChannelId, ChannelHandle>>,
     /// Next server-assigned channel ID.
@@ -101,7 +105,7 @@ pub struct ConnectionHandler {
     /// Remote forward listeners (bind_host:bind_port -> listener handle).
     remote_forward_listeners: Mutex<HashMap<(String, u16), RemoteForwardListener>>,
     /// Channel for signaling connection shutdown.
-    shutdown_tx: mpsc::Sender<()>,
+    shutdown_tx: Mutex<mpsc::Sender<()>>,
     /// Last activity timestamp.
     last_activity: Mutex<Instant>,
 }
@@ -128,9 +132,9 @@ impl ConnectionHandler {
         let control_sender = control.sender();
 
         let handler = Arc::new(Self {
-            quic: Arc::new(quic),
+            quic: RwLock::new(Arc::new(quic)),
             control: Mutex::new(control),
-            control_sender,
+            control_sender: RwLock::new(control_sender),
             channels: RwLock::new(HashMap::new()),
             next_server_channel_id: std::sync::atomic::AtomicU64::new(0),
             config,
@@ -139,7 +143,7 @@ impl ConnectionHandler {
             next_global_request_id: std::sync::atomic::AtomicU32::new(0),
             pending_channel_opens: Mutex::new(HashMap::new()),
             remote_forward_listeners: Mutex::new(HashMap::new()),
-            shutdown_tx,
+            shutdown_tx: Mutex::new(shutdown_tx),
             last_activity: Mutex::new(Instant::now()),
         });
 
@@ -152,13 +156,13 @@ impl ConnectionHandler {
     }
 
     /// Get the remote peer address.
-    pub fn remote_addr(&self) -> SocketAddr {
-        self.quic.remote_addr()
+    pub async fn remote_addr(&self) -> SocketAddr {
+        self.quic.read().await.remote_addr()
     }
 
-    /// Get a reference to the underlying QUIC connection.
-    pub fn quic(&self) -> &Arc<QuicConnection> {
-        &self.quic
+    /// Get a clone of the underlying QUIC connection.
+    pub async fn quic(&self) -> Arc<QuicConnection> {
+        Arc::clone(&*self.quic.read().await)
     }
 
     /// Get the connection configuration.
@@ -167,8 +171,8 @@ impl ConnectionHandler {
     }
 
     /// Get the current RTT estimate.
-    pub fn rtt(&self) -> Duration {
-        self.quic.rtt()
+    pub async fn rtt(&self) -> Duration {
+        self.quic.read().await.rtt()
     }
 
     /// Update last activity timestamp.
@@ -179,6 +183,60 @@ impl ConnectionHandler {
     /// Get the idle duration.
     pub async fn idle_duration(&self) -> Duration {
         self.last_activity.lock().await.elapsed()
+    }
+
+    /// Reconnect to a new QUIC connection (mosh-style session resume).
+    ///
+    /// This updates the underlying QUIC connection and control stream while
+    /// keeping all channels (and their PTYs) alive. Terminal channels will
+    /// have their output streams reconnected to the new connection.
+    pub async fn reconnect(
+        &self,
+        new_quic: QuicConnection,
+        new_control: QuicStream,
+        new_shutdown_tx: mpsc::Sender<()>,
+    ) {
+        let new_quic = Arc::new(new_quic);
+        let new_control_sender = new_control.sender();
+
+        info!(
+            session_id = ?self.session_id,
+            new_addr = %new_quic.remote_addr(),
+            "Reconnecting handler to new QUIC connection"
+        );
+
+        // Update the QUIC connection
+        *self.quic.write().await = Arc::clone(&new_quic);
+
+        // Update control stream
+        *self.control.lock().await = new_control;
+        *self.control_sender.write().await = new_control_sender;
+
+        // Update shutdown channel
+        *self.shutdown_tx.lock().await = new_shutdown_tx;
+
+        // Update activity timestamp
+        self.touch().await;
+
+        // Reconnect all terminal channels' output streams
+        let channels = self.channels.read().await;
+        for (channel_id, handle) in channels.iter() {
+            if let ChannelHandle::Terminal(terminal) = handle {
+                if let Err(e) = terminal.reconnect_output(&new_quic).await {
+                    warn!(
+                        channel_id = %channel_id,
+                        error = %e,
+                        "Failed to reconnect terminal output stream"
+                    );
+                }
+            }
+        }
+
+        info!(
+            session_id = ?self.session_id,
+            channel_count = channels.len(),
+            "Handler reconnection complete"
+        );
     }
 
     /// Allocate a new server-initiated channel ID.
@@ -210,10 +268,47 @@ impl ConnectionHandler {
         counts
     }
 
+    /// Get information about existing channels for session resumption.
+    ///
+    /// Returns channel info that can be sent to the client in HelloAck
+    /// to restore channel state after reconnection.
+    pub async fn get_existing_channels(
+        &self,
+    ) -> Vec<qsh_core::protocol::ExistingChannel> {
+        use qsh_core::protocol::{ExistingChannel, ExistingChannelType};
+
+        let channels = self.channels.read().await;
+        let mut result = Vec::with_capacity(channels.len());
+
+        for (channel_id, handle) in channels.iter() {
+            let channel_type = match handle {
+                ChannelHandle::Terminal(terminal) => {
+                    // Get current terminal state
+                    let state = {
+                        let parser = terminal.parser();
+                        let guard = parser.lock().await;
+                        guard.state().clone()
+                    };
+                    ExistingChannelType::Terminal { state }
+                }
+                ChannelHandle::FileTransfer(_) | ChannelHandle::Forward(_) => {
+                    ExistingChannelType::Other
+                }
+            };
+
+            result.push(ExistingChannel {
+                channel_id: *channel_id,
+                channel_type,
+            });
+        }
+
+        result
+    }
+
     /// Send a message on the control stream.
     pub async fn send_control(&self, msg: &Message) -> Result<()> {
         self.touch().await;
-        self.control_sender.send(msg).await
+        self.control_sender.read().await.send(msg).await
     }
 
     /// Receive a message from the control stream.
@@ -490,10 +585,11 @@ impl ConnectionHandler {
         debug!(channel_id = %channel_id, "Opening terminal channel");
 
         // Create terminal channel
+        let quic = self.quic().await;
         match TerminalChannel::new(
             channel_id,
             params,
-            Arc::clone(&self.quic),
+            quic,
             Arc::clone(self),
         )
         .await
@@ -531,7 +627,8 @@ impl ConnectionHandler {
     ) -> Result<()> {
         debug!(channel_id = %channel_id, path = %params.path, "Opening file transfer channel");
 
-        match FileTransferChannel::new(channel_id, params, Arc::clone(&self.quic)).await {
+        let quic = self.quic().await;
+        match FileTransferChannel::new(channel_id, params, quic).await {
             Ok((channel, metadata)) => {
                 {
                     let mut channels = self.channels.write().await;
@@ -571,7 +668,8 @@ impl ConnectionHandler {
             "Opening direct-tcpip channel"
         );
 
-        match ForwardChannel::new_direct(channel_id, params, Arc::clone(&self.quic)).await {
+        let quic = self.quic().await;
+        match ForwardChannel::new_direct(channel_id, params, quic).await {
             Ok(channel) => {
                 {
                     let mut channels = self.channels.write().await;
@@ -608,8 +706,9 @@ impl ConnectionHandler {
         // Client already accepted - just set up the relay
         // Note: We don't send ChannelAccept here - for server-initiated channels,
         // the CLIENT sends ChannelAccept and we've already received it.
+        let quic = self.quic().await;
         let channel =
-            ForwardChannel::new_forwarded(channel_id, params, Arc::clone(&self.quic), tcp_stream)
+            ForwardChannel::new_forwarded(channel_id, params, quic, tcp_stream)
                 .await?;
 
         let mut channels = self.channels.write().await;
@@ -630,7 +729,8 @@ impl ConnectionHandler {
             "Opening dynamic forward channel"
         );
 
-        match ForwardChannel::new_dynamic(channel_id, params, Arc::clone(&self.quic)).await {
+        let quic = self.quic().await;
+        match ForwardChannel::new_dynamic(channel_id, params, quic).await {
             Ok(channel) => {
                 {
                     let mut channels = self.channels.write().await;
@@ -867,6 +967,8 @@ impl ConnectionHandler {
             params: ChannelParams::ForwardedTcpIp(params.clone()),
         };
         self.control_sender
+            .read()
+            .await
             .send(&Message::ChannelOpen(open_payload))
             .await?;
         debug!(channel_id = %channel_id, "Sent ChannelOpen for forwarded-tcpip, waiting for accept");
@@ -963,7 +1065,7 @@ impl ConnectionHandler {
 
     /// Signal connection shutdown.
     pub async fn shutdown(&self) {
-        let _ = self.shutdown_tx.send(()).await;
+        let _ = self.shutdown_tx.lock().await.send(()).await;
 
         // Shutdown all remote forward listeners
         let listeners: Vec<_> = {

@@ -11,6 +11,7 @@ use tracing::{debug, error, info, warn};
 
 use qsh_client::cli::{OverlayPosition as CliOverlayPosition, SshBootstrapMode};
 use qsh_client::overlay::{ConnectionStatus, OverlayPosition, StatusOverlay};
+use qsh_client::prediction::{DisplayPreference, PredictedStyle};
 use qsh_client::{
     BootstrapMode, ChannelConnection, Cli, ConnectionConfig, ConnectionState, EscapeCommand,
     EscapeHandler, EscapeResult, ForwarderHandle, LocalForwarder, ProxyHandle, RawModeGuard,
@@ -157,6 +158,7 @@ async fn run_client_direct(cli: &Cli, host: &str, user: Option<&str>) -> qsh_cor
         zero_rtt_available: false,
         keep_alive_interval: cli.keep_alive_interval(),
         max_idle_timeout: cli.max_idle_timeout(),
+        session_data: None,
     };
 
     info!(addr = %conn_config.server_addr, "Connecting directly to server");
@@ -298,6 +300,7 @@ async fn run_client_channel_model(
         zero_rtt_available: false,
         keep_alive_interval: cli.keep_alive_interval(),
         max_idle_timeout: cli.max_idle_timeout(),
+        session_data: None,
     };
 
     // Connect using the channel model (no implicit terminal)
@@ -384,6 +387,30 @@ async fn render_overlay_if_visible(overlay: &StatusOverlay, stdout: &mut StdoutW
     if !overlay_output.is_empty() {
         let _ = stdout.write(overlay_output.as_bytes()).await;
     }
+}
+
+/// Render a predicted character with the appropriate style.
+fn render_predicted_char(ch: char, style: PredictedStyle) -> Vec<u8> {
+    match style {
+        PredictedStyle::Normal => {
+            // Just the character, no special styling
+            ch.to_string().into_bytes()
+        }
+        PredictedStyle::Underline => {
+            // Underline SGR, char, reset
+            format!("\x1b[4m{}\x1b[24m", ch).into_bytes()
+        }
+        PredictedStyle::Dim => {
+            // Dim SGR, char, reset
+            format!("\x1b[2m{}\x1b[22m", ch).into_bytes()
+        }
+    }
+}
+
+/// Check if a byte represents a predictable (printable ASCII) character.
+fn is_predictable_char(b: u8) -> bool {
+    // Printable ASCII: 0x20 (space) through 0x7E (~)
+    (0x20..=0x7E).contains(&b)
 }
 
 fn get_term_size() -> TermSize {
@@ -650,6 +677,9 @@ async fn run_reconnectable_session(
     let mut stdin = StdinReader::new();
     let mut stdout = StdoutWriter::new();
 
+    // Prediction settings
+    let prediction_enabled = !cli.no_prediction && is_interactive;
+
     // Reconnection loop
     loop {
         // Wait for connection to be available
@@ -677,39 +707,76 @@ async fn run_reconnectable_session(
             "Opening terminal channel"
         );
 
-        // Open terminal channel with recovery state
+        // Get terminal channel: either restored from session resume or newly opened
         let term_size = get_term_size();
-        let terminal_params = qsh_core::protocol::TerminalParams {
-            term_size,
-            term_type: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
-            env: collect_terminal_env(),
-            shell: None,
-            command: cli.command_string(),
-            allocate_pty: cli.should_allocate_pty(),
-            last_generation: terminal_state.last_generation,
-            last_input_seq: terminal_state.last_input_seq,
-        };
+        let terminal = if let Some(restored) = conn.get_restored_terminal().await {
+            // Mosh-style reconnection: reuse the existing terminal channel
+            info!(channel_id = ?restored.channel_id(), "Using restored terminal from session resume");
 
-        let terminal = match conn.open_terminal(terminal_params).await {
-            Ok(t) => t,
-            Err(e) => {
-                if e.is_transient() {
-                    warn!(error = %e, "Failed to open terminal, triggering reconnect");
-                    reconnectable.handle_error(&e).await;
-                    continue;
-                } else {
-                    error!(error = %e, "Fatal error opening terminal");
-                    return Err(e);
+            // Render the restored terminal state to the screen
+            if let Some(state) = restored.take_initial_state().await {
+                info!("Rendering restored terminal state");
+                let ansi_data = state.render_to_ansi();
+                if let Err(e) = stdout.write(&ansi_data).await {
+                    warn!(error = %e, "Failed to render restored terminal state");
+                }
+            }
+
+            // Send resize in case terminal size changed while disconnected
+            let current_size = restored.term_size().await;
+            let term_size_tuple = (term_size.cols, term_size.rows);
+            if current_size != term_size_tuple {
+                debug!(
+                    old_size = ?current_size,
+                    new_size = ?term_size_tuple,
+                    "Sending resize after reconnection"
+                );
+                // Resize will be sent via the control stream when we enter the I/O loop
+            }
+
+            restored
+        } else {
+            // New terminal: open a fresh channel
+            let terminal_params = qsh_core::protocol::TerminalParams {
+                term_size,
+                term_type: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
+                env: collect_terminal_env(),
+                shell: None,
+                command: cli.command_string(),
+                allocate_pty: cli.should_allocate_pty(),
+                last_generation: terminal_state.last_generation,
+                last_input_seq: terminal_state.last_input_seq,
+            };
+
+            match conn.open_terminal(terminal_params).await {
+                Ok(t) => t,
+                Err(e) => {
+                    if e.is_transient() {
+                        warn!(error = %e, "Failed to open terminal, triggering reconnect");
+                        reconnectable.handle_error(&e).await;
+                        continue;
+                    } else {
+                        error!(error = %e, "Fatal error opening terminal");
+                        return Err(e);
+                    }
                 }
             }
         };
 
-        info!(channel_id = ?terminal.channel_id(), "Terminal channel opened");
+        info!(channel_id = ?terminal.channel_id(), "Terminal channel ready");
 
         // Update overlay for connected state
         overlay.set_status(ConnectionStatus::Connected);
         overlay.metrics_mut().update_rtt(conn.rtt());
         overlay.metrics_mut().record_heard();
+
+        // Initialize prediction engine with current RTT
+        if prediction_enabled {
+            let mut prediction = terminal.prediction_mut().await;
+            prediction.update_rtt(conn.rtt());
+            // Set display preference to adaptive (mosh-style)
+            prediction.set_display_preference(DisplayPreference::Adaptive);
+        }
 
         // Start forwards (only on first connection)
         // TODO: Handle forward reconnection
@@ -780,23 +847,64 @@ async fn run_reconnectable_session(
                             continue;
                         }
                         EscapeResult::PassThrough(pass_data) => {
-                            // Queue the input
-                            if let Err(e) = terminal.queue_input(&pass_data, false) {
-                                warn!(error = %e, "Failed to queue input");
-                                break Err(e);
+                            // Check if input contains predictable characters
+                            let has_predictable = prediction_enabled
+                                && pass_data.iter().any(|&b| is_predictable_char(b));
+
+                            // Queue the input (mark as predictable if it has printable chars)
+                            let seq = match terminal.queue_input(&pass_data, has_predictable) {
+                                Ok(seq) => seq,
+                                Err(e) => {
+                                    warn!(error = %e, "Failed to queue input");
+                                    break Err(e);
+                                }
+                            };
+
+                            // If prediction enabled and input is predictable, echo immediately
+                            if has_predictable {
+                                let mut prediction = terminal.prediction_mut().await;
+
+                                // Only render if prediction engine says we should display
+                                if prediction.should_display() {
+                                    let mut predicted_count = 0u32;
+                                    for &byte in &pass_data {
+                                        if is_predictable_char(byte) {
+                                            let ch = byte as char;
+                                            // Note: We use (0, 0) for position since we're doing
+                                            // simple inline echo, not position-based overlay
+                                            if let Some(echo) = prediction.predict(ch, 0, 0, seq) {
+                                                let rendered = render_predicted_char(echo.char, echo.style);
+                                                let _ = stdout.write(&rendered).await;
+                                                predicted_count += 1;
+                                            }
+                                        }
+                                    }
+                                    // Move cursor back so server output overwrites predictions
+                                    // Use CUB (Cursor Back) escape sequence
+                                    if predicted_count > 0 {
+                                        let cursor_back = format!("\x1b[{}D", predicted_count);
+                                        let _ = stdout.write(cursor_back.as_bytes()).await;
+                                    }
+                                }
                             }
                         }
                     }
                 }
 
-                // Handle terminal output
-                result = terminal.recv_output() => {
+                // Handle terminal events (output or state sync)
+                result = terminal.recv_event() => {
                     match result {
-                        Ok(output) => {
+                        Ok(qsh_client::TerminalEvent::Output(output)) => {
                             overlay.metrics_mut().record_heard();
 
                             // Track confirmed input seq for recovery
                             terminal_state.last_input_seq = output.confirmed_input_seq;
+
+                            // Confirm predictions up to this sequence
+                            if prediction_enabled {
+                                let mut prediction = terminal.prediction_mut().await;
+                                prediction.confirm(output.confirmed_input_seq);
+                            }
 
                             // Output the data
                             if let Err(e) = stdout.write(&output.data).await {
@@ -807,12 +915,37 @@ async fn run_reconnectable_session(
                             // Render status overlay
                             render_overlay_if_visible(&overlay, &mut stdout).await;
                         }
+                        Ok(qsh_client::TerminalEvent::StateSync(update)) => {
+                            overlay.metrics_mut().record_heard();
+
+                            // Track confirmed input seq
+                            terminal_state.last_input_seq = update.confirmed_input_seq;
+
+                            // Reset prediction engine on full state sync
+                            if prediction_enabled {
+                                let mut prediction = terminal.prediction_mut().await;
+                                prediction.reset();
+                            }
+
+                            // Render the full state to the terminal (mosh-style resync)
+                            if let qsh_core::terminal::StateDiff::Full(state) = update.diff {
+                                info!("Received state sync after reconnection");
+                                let ansi_data = state.render_to_ansi();
+                                if let Err(e) = stdout.write(&ansi_data).await {
+                                    warn!(error = %e, "stdout write error during state sync");
+                                    break Err(e.into());
+                                }
+                            }
+
+                            // Render status overlay
+                            render_overlay_if_visible(&overlay, &mut stdout).await;
+                        }
                         Err(qsh_core::Error::ConnectionClosed) => {
                             info!("Channel closed");
                             break Ok(());
                         }
                         Err(e) => {
-                            warn!(error = %e, "recv_output error");
+                            warn!(error = %e, "recv_event error");
                             break Err(e);
                         }
                     }
@@ -822,6 +955,13 @@ async fn run_reconnectable_session(
                 _ = overlay_refresh.tick() => {
                     if let Some(rtt) = reconnectable.rtt() {
                         overlay.metrics_mut().update_rtt(rtt);
+
+                        // Update prediction engine RTT for adaptive display
+                        if prediction_enabled {
+                            let mut prediction = terminal.prediction_mut().await;
+                            prediction.update_rtt(rtt);
+                            prediction.check_glitches();
+                        }
                     }
                     render_overlay_if_visible(&overlay, &mut stdout).await;
                 }

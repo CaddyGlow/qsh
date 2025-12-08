@@ -9,17 +9,31 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::sync::{Mutex, mpsc};
-use tracing::warn;
+use tracing::{info, warn};
 
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
     ChannelData, ChannelId, ChannelPayload, DataFlags, FileCompleteData, FileDataData,
-    FileTransferMetadata, FileTransferStatus, Message, TerminalInputData, TerminalOutputData,
+    FileTransferMetadata, FileTransferStatus, Message, StateUpdateData, TerminalInputData,
+    TerminalOutputData,
 };
 use qsh_core::terminal::TerminalState;
 use qsh_core::transport::{QuicSender, QuicStream, StreamPair};
 
 use crate::prediction::PredictionEngine;
+
+// =============================================================================
+// Terminal Event
+// =============================================================================
+
+/// Events received from a terminal channel.
+#[derive(Debug)]
+pub enum TerminalEvent {
+    /// Regular terminal output (raw bytes to display).
+    Output(TerminalOutputData),
+    /// Full state update (for reconnection sync).
+    StateSync(StateUpdateData),
+}
 
 // =============================================================================
 // Terminal Channel
@@ -98,6 +112,25 @@ impl TerminalChannel {
         Self { inner }
     }
 
+    /// Restore a terminal channel from existing state (mosh-style reconnection).
+    ///
+    /// This is used when resuming a session where the terminal already exists
+    /// on the server. The server sends the current terminal state and the client
+    /// sets up streams to continue the session.
+    pub(crate) fn restore(
+        channel_id: ChannelId,
+        input_stream: QuicStream,
+        output_stream: QuicStream,
+        restored_state: TerminalState,
+    ) -> Self {
+        info!(
+            channel_id = %channel_id,
+            "Restoring terminal channel from session resume"
+        );
+        // Use the same constructor - the restored_state becomes the initial state
+        Self::new(channel_id, input_stream, output_stream, restored_state)
+    }
+
     /// Get the channel ID.
     pub fn channel_id(&self) -> ChannelId {
         self.inner.channel_id
@@ -160,8 +193,8 @@ impl TerminalChannel {
         Ok(seq)
     }
 
-    /// Receive output from the terminal.
-    pub async fn recv_output(&self) -> Result<TerminalOutputData> {
+    /// Receive an event from the terminal (output or state update).
+    pub async fn recv_event(&self) -> Result<TerminalEvent> {
         if self.inner.closed.load(Ordering::SeqCst) {
             return Err(Error::ConnectionClosed);
         }
@@ -175,14 +208,14 @@ impl TerminalChannel {
                         self.inner
                             .confirmed_seq
                             .fetch_max(output.confirmed_input_seq, Ordering::SeqCst);
-                        return Ok(output);
+                        return Ok(TerminalEvent::Output(output));
                     }
                     ChannelPayload::StateUpdate(update) => {
                         // State updates also confirm input
                         self.inner
                             .confirmed_seq
                             .fetch_max(update.confirmed_input_seq, Ordering::SeqCst);
-                        // TODO: Process state diff for prediction
+                        return Ok(TerminalEvent::StateSync(update));
                     }
                     other => {
                         warn!(?other, "Unexpected channel payload on terminal output stream");
@@ -190,6 +223,19 @@ impl TerminalChannel {
                 },
                 other => {
                     warn!(?other, "Unexpected message on terminal output stream");
+                }
+            }
+        }
+    }
+
+    /// Receive output from the terminal (legacy API, ignores state updates).
+    pub async fn recv_output(&self) -> Result<TerminalOutputData> {
+        loop {
+            match self.recv_event().await? {
+                TerminalEvent::Output(output) => return Ok(output),
+                TerminalEvent::StateSync(_) => {
+                    // Skip state updates in legacy API
+                    continue;
                 }
             }
         }

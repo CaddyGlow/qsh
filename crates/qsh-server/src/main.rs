@@ -11,24 +11,17 @@ use std::sync::Arc;
 const ENABLE_BOOTSTRAP_SINGLETON: bool = false;
 
 use clap::Parser;
-use quinn::{Endpoint, IdleTimeout, ServerConfig, TransportConfig};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
-use qsh_core::protocol::{Capabilities, Message};
-use qsh_core::transport::{Connection, server_crypto_config};
+use qsh_core::protocol::Capabilities;
+use qsh_core::transport::generate_self_signed_cert;
+use qsh_server::listener::{QshListener, ServerConfig};
 use qsh_server::{
-    BootstrapServer, Cli, ConnectionConfig, ConnectionRegistry, PendingSession, SessionAuthorizer,
-    SessionConfig,
+    BootstrapServer, Cli, ConnectionConfig, SessionAuthorizer, SessionConfig,
 };
 
 #[cfg(feature = "standalone")]
 use qsh_server::{StandaloneAuthenticator, StandaloneConfig};
-
-#[cfg(feature = "standalone")]
-type StandaloneAuth = Arc<StandaloneAuthenticator>;
-
-#[cfg(not(feature = "standalone"))]
-type StandaloneAuth = ();
 
 fn main() {
     // Parse CLI arguments
@@ -178,8 +171,6 @@ async fn run_bootstrap(cli: &Cli) -> qsh_core::Result<()> {
     // Output connection info to stdout
     bootstrap.print_response(None)?;
 
-    let endpoint = bootstrap.endpoint();
-
     // Build session config
     let session_config = SessionConfig {
         capabilities: Capabilities {
@@ -200,22 +191,28 @@ async fn run_bootstrap(cli: &Cli) -> qsh_core::Result<()> {
         ..Default::default()
     };
 
-    // Bootstrap mode: accept single connection, then exit
-    serve_endpoint(
-        endpoint,
+    // Build server config
+    let server_config = ServerConfig {
+        bind_addr: bootstrap.local_addr(),
+        cert_pem: bootstrap.cert_pem().to_vec(),
+        key_pem: bootstrap.key_pem().to_vec(),
         session_config,
         conn_config,
-        Some(authorizer),
-        None,
-        true, // single_connection
-    )
-    .await
+    };
+
+    // Create listener with the bootstrap socket
+    let listener = QshListener::with_socket(bootstrap.socket(), server_config)
+        .await?
+        .with_authorizer(authorizer);
+
+    // Bootstrap mode: run until session expires
+    listener.run(true).await
 }
 
 async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
-    // Generate or load TLS certificate
-    let (cert, key) = if cli.has_tls_config() {
-        // Load from files
+    // Generate or load TLS certificate (now expects PEM format)
+    let (cert_pem, key_pem) = if cli.has_tls_config() {
+        // Load from files (expect PEM format)
         let cert_path = cli.cert_file.as_ref().unwrap();
         let key_path = cli.key_file.as_ref().unwrap();
 
@@ -232,43 +229,10 @@ async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
 
         (cert, key)
     } else {
-        // Generate self-signed certificate
+        // Generate self-signed certificate (returns PEM)
         info!("Generating self-signed certificate");
-        let cert =
-            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).map_err(|e| {
-                qsh_core::Error::Transport {
-                    message: format!("failed to generate certificate: {}", e),
-                }
-            })?;
-
-        let cert_der = cert.cert.der().to_vec();
-        let key_der = cert.key_pair.serialize_der();
-
-        (cert_der, key_der)
+        generate_self_signed_cert()?
     };
-
-    // Create TLS config
-    let crypto = server_crypto_config(cert, key)?;
-    let mut server_config = ServerConfig::with_crypto(Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(crypto).map_err(|e| {
-            qsh_core::Error::Transport {
-                message: format!("failed to create QUIC config: {}", e),
-            }
-        })?,
-    ));
-
-    // Configure transport (keepalive + idle timeout)
-    // Use aggressive keepalive (500ms) for fast disconnection detection (mosh uses RTT/2)
-    let mut transport = TransportConfig::default();
-    transport.keep_alive_interval(Some(std::time::Duration::from_millis(500)));
-    transport.max_idle_timeout(IdleTimeout::try_from(std::time::Duration::from_secs(30)).ok());
-    server_config.transport_config(Arc::new(transport));
-
-    // Create QUIC endpoint
-    let endpoint =
-        Endpoint::server(server_config, bind_addr).map_err(|e| qsh_core::Error::Transport {
-            message: format!("failed to bind server: {}", e),
-        })?;
 
     // Build session config
     let session_config = SessionConfig {
@@ -290,319 +254,19 @@ async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
         ..Default::default()
     };
 
-    // Optional standalone authenticator (feature-gated)
-    #[cfg(feature = "standalone")]
-    let standalone_auth: Option<StandaloneAuth> = if cli.standalone {
-        let config = StandaloneConfig {
-            host_key_path: cli.host_key.clone(),
-            authorized_keys_path: cli.authorized_keys.clone(),
-        };
-        match StandaloneAuthenticator::new(config) {
-            Ok(auth) => Some(Arc::new(auth)),
-            Err(e) => {
-                error!(error = %e, "Failed to initialize standalone authenticator");
-                return Err(e);
-            }
-        }
-    } else {
-        None
-    };
-
-    #[cfg(not(feature = "standalone"))]
-    let standalone_auth: Option<StandaloneAuth> = None;
-
-    // Normal server mode: accept multiple connections
-    serve_endpoint(
-        endpoint,
+    // Build server config
+    let server_config = ServerConfig {
+        bind_addr,
+        cert_pem,
+        key_pem,
         session_config,
         conn_config,
-        None,
-        standalone_auth,
-        false, // single_connection
-    )
-    .await
+    };
+
+    // Create and run listener
+    let listener = QshListener::bind(server_config).await?;
+    info!("Server listening on {}", listener.local_addr());
+    listener.run(false).await
 }
 
-async fn serve_endpoint(
-    endpoint: Endpoint,
-    session_config: SessionConfig,
-    conn_config: ConnectionConfig,
-    authorizer: Option<Arc<SessionAuthorizer>>,
-    standalone_auth: Option<StandaloneAuth>,
-    single_session: bool,
-) -> qsh_core::Result<()> {
-    let addr = endpoint.local_addr().ok();
-    info!(?addr, single_session, "Server listening");
-
-    // Create connection registry for session persistence (enables reconnection)
-    let registry = Arc::new(ConnectionRegistry::new(conn_config.clone()));
-
-    // Track whether we've ever had a session (for single-session mode)
-    let mut had_session = false;
-
-    // Accept connections
-    loop {
-        // In single-session mode, if we had a session and it's gone, exit
-        if single_session && had_session && registry.session_count().await == 0 {
-            info!("Session expired during wait, exiting bootstrap mode");
-            registry.shutdown().await;
-            return Ok(());
-        }
-
-        let incoming = match endpoint.accept().await {
-            Some(inc) => inc,
-            None => {
-                info!("Endpoint closed");
-                break;
-            }
-        };
-
-        let config = session_config.clone();
-        let conn_config = conn_config.clone();
-        let authorizer = authorizer.clone();
-        let standalone_auth = standalone_auth.clone();
-        let registry = registry.clone();
-
-        if single_session {
-            // Bootstrap mode: handle connection with registry for reconnection support
-            // Keep running until the session expires (handled by registry GC)
-            let result = handle_connection_with_registry(
-                incoming,
-                config,
-                conn_config,
-                authorizer,
-                standalone_auth,
-                &registry,
-            )
-            .await;
-
-            // Mark that we've had at least one session
-            had_session = true;
-
-            if let Err(e) = &result {
-                error!(error = %e, "Connection handler error");
-            }
-
-            // Check if session count dropped to 0 after this connection
-            // (session was removed by GC or explicit close)
-            let count = registry.session_count().await;
-            if count == 0 {
-                info!("Session ended, exiting bootstrap mode");
-                registry.shutdown().await;
-                return result;
-            }
-
-            // Session still exists (detached, waiting for reconnect)
-            // Continue accepting connections
-            info!(sessions = count, "Connection closed, waiting for reconnection");
-            continue;
-        }
-
-        // Normal mode: spawn connection handler and continue accepting
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection_with_registry(
-                incoming,
-                config,
-                conn_config,
-                authorizer,
-                standalone_auth,
-                &registry,
-            )
-            .await
-            {
-                error!(error = %e, "Connection handler error");
-            }
-        });
-    }
-
-    // Shutdown registry on clean exit
-    registry.shutdown().await;
-    Ok(())
-}
-
-async fn handle_connection_with_registry(
-    incoming: quinn::Incoming,
-    config: SessionConfig,
-    conn_config: ConnectionConfig,
-    authorizer: Option<Arc<SessionAuthorizer>>,
-    standalone_auth: Option<StandaloneAuth>,
-    registry: &ConnectionRegistry,
-) -> qsh_core::Result<()> {
-    let addr = incoming.remote_address();
-    info!(addr = %addr, "Incoming connection");
-
-    let conn = incoming.await.map_err(|e| qsh_core::Error::Transport {
-        message: format!("connection failed: {}", e),
-    })?;
-
-    // If standalone mode is enabled, perform mutual SSH key authentication
-    // before proceeding to the normal session Hello/HelloAck handshake.
-    #[cfg(feature = "standalone")]
-    if let Some(ref auth) = standalone_auth {
-        use qsh_server::standalone::{AuthResult, authenticate_connection, send_auth_failure};
-
-        // Open a dedicated bidirectional stream for auth handshake (server-initiated).
-        let (mut send, mut recv) =
-            conn.open_bi()
-                .await
-                .map_err(|e| qsh_core::Error::Transport {
-                    message: format!("failed to open auth stream: {}", e),
-                })?;
-
-        match authenticate_connection(auth.as_ref(), &mut send, &mut recv).await {
-            AuthResult::Success { client_fingerprint } => {
-                info!(%client_fingerprint, "Standalone client authenticated");
-            }
-            AuthResult::Failure {
-                code,
-                internal_message,
-            } => {
-                error!(
-                    code = ?code,
-                    message = %internal_message,
-                    "Standalone authentication failed"
-                );
-
-                // Best-effort attempt to send AuthFailure to the client.
-                if let Err(e) = send_auth_failure(&mut send, code, &internal_message).await {
-                    warn!(error = %e, "Failed to send AuthFailure to client");
-                }
-
-                return Err(qsh_core::Error::AuthenticationFailed);
-            }
-        }
-    }
-
-    // Suppress unused warning when standalone feature is disabled
-    let _ = &standalone_auth;
-
-    let quic = qsh_core::transport::QuicConnection::new(conn);
-    let pending = PendingSession::new(quic, authorizer, config).await?;
-
-    // Accept the session with registry support (enables reconnection)
-    let (handler, shutdown_rx) = pending.accept_with_registry(conn_config, registry).await?;
-
-    // Run the channel model session loop
-    handle_channel_model_session(handler, shutdown_rx).await
-}
-
-/// Handle a channel-model session.
-///
-/// This processes control messages (ChannelOpen, ChannelClose, GlobalRequest, etc.)
-/// and routes streams to appropriate channels.
-async fn handle_channel_model_session(
-    handler: std::sync::Arc<qsh_server::ConnectionHandler>,
-    mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
-) -> qsh_core::Result<()> {
-    info!(
-        session_id = ?handler.session_id(),
-        addr = %handler.remote_addr(),
-        rtt = ?handler.rtt(),
-        "Channel model session started"
-    );
-
-    let quic = handler.quic().clone();
-    let handler_clone = handler.clone();
-
-    // Spawn stream acceptor task
-    let accept_handler = handler.clone();
-    let accept_task = tokio::spawn(async move {
-        loop {
-            match quic.accept_stream().await {
-                Ok((stream_type, stream)) => {
-                    let h = accept_handler.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = h.handle_incoming_stream(stream_type, stream).await {
-                            warn!(error = %e, "Failed to handle incoming stream");
-                        }
-                    });
-                }
-                Err(qsh_core::Error::ConnectionClosed) => break,
-                Err(e) => {
-                    warn!(error = %e, "Failed to accept stream");
-                    break;
-                }
-            }
-        }
-    });
-
-    // Main control message loop
-    loop {
-        tokio::select! {
-            biased;
-
-            // Handle shutdown signal
-            _ = shutdown_rx.recv() => {
-                debug!("Shutdown signal received");
-                break;
-            }
-
-            // Handle control messages
-            msg = handler_clone.recv_control() => {
-                match msg {
-                    Ok(Message::ChannelOpen(payload)) => {
-                        if let Err(e) = handler_clone.handle_channel_open(payload).await {
-                            error!(error = %e, "Failed to handle ChannelOpen");
-                        }
-                    }
-                    Ok(Message::ChannelClose(payload)) => {
-                        if let Err(e) = handler_clone.handle_channel_close(payload).await {
-                            error!(error = %e, "Failed to handle ChannelClose");
-                        }
-                    }
-                    Ok(Message::ChannelAccept(payload)) => {
-                        if let Err(e) = handler_clone.handle_channel_accept(payload).await {
-                            error!(error = %e, "Failed to handle ChannelAccept");
-                        }
-                    }
-                    Ok(Message::ChannelReject(payload)) => {
-                        if let Err(e) = handler_clone.handle_channel_reject(payload).await {
-                            error!(error = %e, "Failed to handle ChannelReject");
-                        }
-                    }
-                    Ok(Message::GlobalRequest(payload)) => {
-                        if let Err(e) = handler_clone.handle_global_request(payload).await {
-                            error!(error = %e, "Failed to handle GlobalRequest");
-                        }
-                    }
-                    Ok(Message::Resize(payload)) => {
-                        if let Err(e) = handler_clone.handle_resize(payload).await {
-                            warn!(error = %e, "Failed to handle Resize");
-                        }
-                    }
-                    Ok(Message::StateAck(payload)) => {
-                        if let Err(e) = handler_clone.handle_state_ack(payload).await {
-                            warn!(error = %e, "Failed to handle StateAck");
-                        }
-                    }
-                    Ok(Message::Shutdown(payload)) => {
-                        info!(reason = ?payload.reason, "Client requested shutdown");
-                        break;
-                    }
-                    Ok(other) => {
-                        warn!(msg = ?other, "Unexpected control message");
-                    }
-                    Err(qsh_core::Error::ConnectionClosed) => {
-                        info!("Connection closed");
-                        break;
-                    }
-                    Err(e) => {
-                        error!(error = %e, "Control stream error");
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    // Cleanup
-    accept_task.abort();
-    handler.shutdown().await;
-
-    info!(
-        session_id = ?handler.session_id(),
-        "Channel model session ended"
-    );
-
-    Ok(())
-}
+// Old serve_quiche_server code removed - now using QshListener in listener.rs

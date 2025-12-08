@@ -139,6 +139,7 @@ impl PendingSession {
                 session_id: SessionId::new(),
                 server_nonce: 0,
                 zero_rtt_available: false,
+                existing_channels: vec![],
             };
             control.send(&Message::HelloAck(ack)).await?;
             return Err(Error::Protocol {
@@ -158,6 +159,7 @@ impl PendingSession {
                 session_id: SessionId::new(),
                 server_nonce: 0,
                 zero_rtt_available: false,
+                existing_channels: vec![],
             };
             control.send(&Message::HelloAck(ack)).await?;
             return Err(Error::AuthenticationFailed);
@@ -186,6 +188,7 @@ impl PendingSession {
             session_id: SessionId::new(),
             server_nonce: 0,
             zero_rtt_available: false,
+            existing_channels: vec![],
         };
         self.control.send(&Message::HelloAck(ack)).await?;
         Ok(())
@@ -211,6 +214,7 @@ impl PendingSession {
             session_id,
             server_nonce: rand::random(),
             zero_rtt_available: true,
+            existing_channels: vec![],
         };
         self.control.send(&Message::HelloAck(ack)).await?;
 
@@ -232,6 +236,9 @@ impl PendingSession {
     /// This version integrates with `ConnectionRegistry` to support session
     /// resumption across disconnects. If the client sends `resume_session`,
     /// the existing session is looked up and reattached.
+    ///
+    /// For mosh-style persistence: if the session has an existing handler with
+    /// channels (PTYs), we reuse it by updating its QUIC connection.
     pub async fn accept_with_registry(
         mut self,
         conn_config: ConnectionConfig,
@@ -254,6 +261,52 @@ impl PendingSession {
                 // Resume successful - reuse the session ID
                 let session_id = session_guard.session.session_id;
 
+                // Check if there's an existing handler we can reuse (mosh-style)
+                let existing_handler = session_guard.session.handler.lock().await.clone();
+
+                if let Some(handler) = existing_handler {
+                    // Mosh-style: reuse existing handler with its PTYs
+                    let channel_count = handler.channel_count().await;
+                    info!(
+                        session_id = ?session_id,
+                        addr = %client_addr,
+                        channels = channel_count,
+                        "Reusing existing handler with channels (mosh-style resume)"
+                    );
+
+                    // Get existing channel info BEFORE reconnecting (to get current state)
+                    let existing_channels = handler.get_existing_channels().await;
+
+                    // Update the handler's QUIC connection to the new one
+                    let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+                    handler.reconnect(self.quic, self.control, shutdown_tx).await;
+
+                    // Send HelloAck with existing session ID and channel info
+                    let ack = HelloAckPayload {
+                        protocol_version: 1,
+                        accepted: true,
+                        reject_reason: None,
+                        capabilities: self.config.capabilities.clone(),
+                        session_id,
+                        server_nonce: rand::random(),
+                        zero_rtt_available: true,
+                        existing_channels,
+                    };
+                    // Use the new control stream to send ack
+                    handler.send_control(&Message::HelloAck(ack)).await?;
+
+                    session_guard.session.touch().await;
+
+                    return Ok((handler, shutdown_rx));
+                }
+
+                // No existing handler - create new one
+                info!(
+                    session_id = ?session_id,
+                    addr = %client_addr,
+                    "Session resumed (no existing handler, creating new)"
+                );
+
                 // Send HelloAck with the existing session ID
                 let ack = HelloAckPayload {
                     protocol_version: 1,
@@ -263,14 +316,9 @@ impl PendingSession {
                     session_id,
                     server_nonce: rand::random(),
                     zero_rtt_available: true,
+                    existing_channels: vec![],
                 };
                 self.control.send(&Message::HelloAck(ack)).await?;
-
-                info!(
-                    session_id = ?session_id,
-                    addr = %client_addr,
-                    "Session resumed successfully"
-                );
 
                 // Create new connection handler with existing session ID
                 let (handler, shutdown_rx) =
@@ -304,6 +352,7 @@ impl PendingSession {
             session_id,
             server_nonce: rand::random(),
             zero_rtt_available: true,
+            existing_channels: vec![],
         };
         self.control.send(&Message::HelloAck(ack)).await?;
 
@@ -319,6 +368,12 @@ impl PendingSession {
 
         // Attach handler to session
         session_guard.session.attach(Arc::clone(&handler), client_addr).await;
+
+        debug!(
+            session_id = ?session_id,
+            session_key_prefix = ?&session_guard.session.session_key[..4],
+            "Session attached to handler"
+        );
 
         Ok((handler, shutdown_rx))
     }

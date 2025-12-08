@@ -43,6 +43,8 @@ pub struct ReconnectableConnection {
     state_changed: Notify,
     /// Reconnection handler with backoff logic.
     reconnect_handler: RwLock<ReconnectionHandler>,
+    /// Cached session data for 0-RTT resumption.
+    session_data: RwLock<Option<Vec<u8>>>,
 }
 
 // Helper to read from std RwLock without panicking on poison
@@ -63,7 +65,26 @@ impl ReconnectableConnection {
             state: RwLock::new(ConnectionState::Connected),
             state_changed: Notify::new(),
             reconnect_handler: RwLock::new(ReconnectionHandler::new()),
+            session_data: RwLock::new(None),
         }
+    }
+
+    /// Store session data for 0-RTT resumption.
+    ///
+    /// Call this after a successful connection to cache the session data
+    /// for faster reconnection.
+    pub async fn store_session_data(&self) {
+        if let Some(conn) = read_lock(&self.inner).as_ref() {
+            if let Some(data) = conn.quic().session_data().await {
+                debug!(session_data_len = data.len(), "Storing session data for 0-RTT");
+                *write_lock(&self.session_data) = Some(data);
+            }
+        }
+    }
+
+    /// Get the cached session data for 0-RTT resumption.
+    pub fn session_data(&self) -> Option<Vec<u8>> {
+        read_lock(&self.session_data).clone()
     }
 
     /// Get the current connection state.
@@ -192,11 +213,15 @@ impl ReconnectableConnection {
             // Wait for backoff delay
             tokio::time::sleep(delay).await;
 
-            // Attempt reconnection
-            let (config, session_id) = {
+            // Attempt reconnection with cached session data for 0-RTT
+            let (mut config, session_id) = {
                 let context = read_lock(&self.context);
                 (context.reconnect_config(), context.session_id())
             };
+
+            // Inject cached session data for 0-RTT resumption
+            config.session_data = read_lock(&self.session_data).clone();
+            let had_session_data = config.session_data.is_some();
 
             let result = if let Some(sid) = session_id {
                 ChannelConnection::reconnect(config, sid).await
@@ -208,9 +233,13 @@ impl ReconnectableConnection {
 
             match result {
                 Ok(conn) => {
+                    // Check if 0-RTT was used
+                    let is_resumed = conn.quic().is_resumed().await;
                     info!(
                         attempt,
                         session_id = ?conn.session_id(),
+                        resumed_0rtt = is_resumed,
+                        had_session_data,
                         "Reconnection successful"
                     );
 
@@ -221,9 +250,16 @@ impl ReconnectableConnection {
                     }
 
                     // Store new connection
+                    let conn = Arc::new(conn);
                     {
                         let mut inner = write_lock(&self.inner);
-                        *inner = Some(Arc::new(conn));
+                        *inner = Some(Arc::clone(&conn));
+                    }
+
+                    // Update session data for next reconnection (do this after storing connection)
+                    if let Some(data) = conn.quic().session_data().await {
+                        debug!(session_data_len = data.len(), "Updating session data for 0-RTT");
+                        *write_lock(&self.session_data) = Some(data);
                     }
 
                     // Reset handler for next disconnect

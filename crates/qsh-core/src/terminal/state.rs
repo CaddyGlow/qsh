@@ -544,6 +544,125 @@ impl TerminalState {
         self.current_bg = Color::Default;
         self.current_attrs = CellAttrs::default();
     }
+
+    /// Render the terminal state to ANSI escape sequences.
+    ///
+    /// This is used after reconnection to sync the client's display with the
+    /// server's terminal state. Returns bytes that can be written directly to
+    /// the terminal to reproduce the visual state.
+    pub fn render_to_ansi(&self) -> Vec<u8> {
+        use std::fmt::Write;
+        let mut output = String::with_capacity(self.screen().cells.len() * 2);
+
+        // Reset terminal and clear screen
+        output.push_str("\x1b[2J");   // Clear entire screen
+        output.push_str("\x1b[H");    // Move cursor to home position
+        output.push_str("\x1b[0m");   // Reset all attributes
+
+        let screen = self.screen();
+        let mut last_fg = Color::Default;
+        let mut last_bg = Color::Default;
+        let mut last_attrs = CellAttrs::default();
+
+        for row in 0..screen.rows() {
+            // Move to start of row
+            let _ = write!(output, "\x1b[{};1H", row + 1);
+
+            for col in 0..screen.cols() {
+                if let Some(cell) = screen.get(col, row) {
+                    // Update attributes if changed
+                    if cell.attrs != last_attrs || cell.fg != last_fg || cell.bg != last_bg {
+                        // Reset and reapply
+                        output.push_str("\x1b[0m");
+
+                        // Apply cell attributes
+                        if cell.attrs.bold {
+                            output.push_str("\x1b[1m");
+                        }
+                        if cell.attrs.dim {
+                            output.push_str("\x1b[2m");
+                        }
+                        if cell.attrs.italic {
+                            output.push_str("\x1b[3m");
+                        }
+                        if cell.attrs.underline {
+                            output.push_str("\x1b[4m");
+                        }
+                        if cell.attrs.blink {
+                            output.push_str("\x1b[5m");
+                        }
+                        if cell.attrs.reverse {
+                            output.push_str("\x1b[7m");
+                        }
+                        if cell.attrs.hidden {
+                            output.push_str("\x1b[8m");
+                        }
+                        if cell.attrs.strikethrough {
+                            output.push_str("\x1b[9m");
+                        }
+
+                        // Apply foreground color
+                        match cell.fg {
+                            Color::Default => {}
+                            Color::Indexed(n) if n < 8 => {
+                                let _ = write!(output, "\x1b[{}m", 30 + n);
+                            }
+                            Color::Indexed(n) if n < 16 => {
+                                let _ = write!(output, "\x1b[{}m", 90 + n - 8);
+                            }
+                            Color::Indexed(n) => {
+                                let _ = write!(output, "\x1b[38;5;{}m", n);
+                            }
+                            Color::Rgb(r, g, b) => {
+                                let _ = write!(output, "\x1b[38;2;{};{};{}m", r, g, b);
+                            }
+                        }
+
+                        // Apply background color
+                        match cell.bg {
+                            Color::Default => {}
+                            Color::Indexed(n) if n < 8 => {
+                                let _ = write!(output, "\x1b[{}m", 40 + n);
+                            }
+                            Color::Indexed(n) if n < 16 => {
+                                let _ = write!(output, "\x1b[{}m", 100 + n - 8);
+                            }
+                            Color::Indexed(n) => {
+                                let _ = write!(output, "\x1b[48;5;{}m", n);
+                            }
+                            Color::Rgb(r, g, b) => {
+                                let _ = write!(output, "\x1b[48;2;{};{};{}m", r, g, b);
+                            }
+                        }
+
+                        last_attrs = cell.attrs;
+                        last_fg = cell.fg;
+                        last_bg = cell.bg;
+                    }
+
+                    output.push(cell.ch);
+                }
+            }
+        }
+
+        // Reset attributes and move cursor to stored position
+        output.push_str("\x1b[0m");
+        let _ = write!(
+            output,
+            "\x1b[{};{}H",
+            self.cursor.row + 1,
+            self.cursor.col + 1
+        );
+
+        // Show/hide cursor based on visibility
+        if self.cursor.visible {
+            output.push_str("\x1b[?25h"); // Show cursor
+        } else {
+            output.push_str("\x1b[?25l"); // Hide cursor
+        }
+
+        output.into_bytes()
+    }
 }
 
 impl Default for TerminalState {

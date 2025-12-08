@@ -30,7 +30,7 @@ pub mod terminal;
 #[cfg(feature = "standalone")]
 pub mod standalone;
 
-pub use channel::{FileChannel, ForwardChannel, TerminalChannel};
+pub use channel::{FileChannel, ForwardChannel, TerminalChannel, TerminalEvent};
 pub use cli::{Cli, CpCli, FilePath};
 pub use connection::{
     ChannelConnection, ChannelHandle, ConnectionConfig, LatencyStats, LatencyTracker, connect_quic,

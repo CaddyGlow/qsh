@@ -26,8 +26,8 @@ compression = ["qsh-core/compression"]
 [dependencies]
 qsh-core = { workspace = true }
 tokio = { workspace = true }
-quinn = { workspace = true }
-rustls = { workspace = true }
+tokio-quiche = { workspace = true }
+quiche = { workspace = true }
 russh = { workspace = true }
 russh-keys = { workspace = true }
 async-trait = { workspace = true }

@@ -64,6 +64,34 @@ pub enum Error {
     /// Channel error.
     #[error("channel error: {message}")]
     Channel { message: String },
+
+    /// Network unreachable (ICMP).
+    #[error("network unreachable: {0}")]
+    NetworkUnreachable(std::io::Error),
+
+    /// Host unreachable (ICMP).
+    #[error("host unreachable: {0}")]
+    HostUnreachable(std::io::Error),
+
+    /// Connection refused (ICMP port unreachable).
+    #[error("connection refused")]
+    ConnectionRefused,
+
+    /// Network interface down.
+    #[error("interface down")]
+    InterfaceDown,
+
+    /// Permission denied (firewall).
+    #[error("permission denied: {0}")]
+    PermissionDenied(std::io::Error),
+
+    /// QUIC handshake failed.
+    #[error("handshake failed: {message}")]
+    HandshakeFailed { message: String },
+
+    /// TLS/Certificate error.
+    #[error("certificate error: {message}")]
+    CertificateError { message: String },
 }
 
 impl Error {
@@ -78,6 +106,12 @@ impl Error {
                 | Error::ConnectionClosed
                 | Error::Timeout
                 | Error::Io(_)
+                | Error::NetworkUnreachable(_)
+                | Error::HostUnreachable(_)
+                | Error::ConnectionRefused
+                | Error::InterfaceDown
+                | Error::HandshakeFailed { .. }
+                | Error::PermissionDenied(_) // EPERM from socket ops is typically network/firewall related
         )
     }
 
@@ -92,6 +126,7 @@ impl Error {
                 | Error::SessionExpired
                 | Error::SessionNotFound(_)
                 | Error::Protocol { .. }
+                | Error::CertificateError { .. }
         )
     }
 }

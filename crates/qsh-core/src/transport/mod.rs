@@ -1,7 +1,7 @@
 //! Transport abstractions for qsh.
 //!
 //! This module provides traits for abstracting over different transport layers:
-//! - Real QUIC (Quinn)
+//! - Real QUIC (tokio-quiche)
 //! - Mock transport for testing
 //!
 //! Stream types (SSH-style channel model):
@@ -10,11 +10,19 @@
 //! - ChannelOut(id): unidirectional server->client (terminal output, file data)
 //! - ChannelBidi(id): bidirectional (port forwards, tunnel)
 
-mod quic;
+mod quiche;
 
-pub use quic::{
-    QuicConnection, QuicSender, QuicStream, client_crypto_config, server_crypto_config,
+pub use quiche::{
+    QuicheConnection, QuicheSender, QuicheStream,
+    classify_io_error, enable_error_queue,
+    client_config, server_config, server_config_with_ticket_key, generate_self_signed_cert,
+    load_certs_from_pem, load_key_from_pem, cert_hash,
 };
+
+// Re-export as Quinn-compatible names for easier migration
+pub use quiche::QuicheConnection as QuicConnection;
+pub use quiche::QuicheSender as QuicSender;
+pub use quiche::QuicheStream as QuicStream;
 
 use std::future::Future;
 use std::net::SocketAddr;

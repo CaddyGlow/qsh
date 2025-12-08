@@ -50,6 +50,8 @@ struct TerminalChannelInner {
     last_sent_state: Mutex<Option<TerminalState>>,
     /// Whether the channel is closed.
     closed: AtomicBool,
+    /// Whether output stream is disconnected (skip sending until reconnect).
+    disconnected: AtomicBool,
     /// Handle to the output relay task.
     relay_task: Mutex<Option<JoinHandle<()>>>,
     /// Shutdown signal.
@@ -148,6 +150,7 @@ impl TerminalChannel {
             acked_generation: AtomicU64::new(0),
             last_sent_state: Mutex::new(None),
             closed: AtomicBool::new(false),
+            disconnected: AtomicBool::new(false),
             relay_task: Mutex::new(None),
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
         });
@@ -165,16 +168,12 @@ impl TerminalChannel {
                     output = output_rx.recv() => {
                         match output {
                             Some(data) => {
-                                if let Err(e) = inner_clone.process_output(data).await {
-                                    error!(
-                                        channel_id = %inner_clone.channel_id,
-                                        error = %e,
-                                        "Failed to process PTY output"
-                                    );
-                                    break;
-                                }
+                                // Process output - updates terminal state and sends if connected
+                                // Disconnection is handled internally, we never break the loop
+                                let _ = inner_clone.process_output(data).await;
                             }
                             None => {
+                                // PTY has exited - this is the only reason to close the channel
                                 info!(channel_id = %inner_clone.channel_id, "PTY output closed");
                                 break;
                             }
@@ -183,7 +182,7 @@ impl TerminalChannel {
                 }
             }
 
-            // Mark channel as closed and close the output stream to signal client
+            // Mark channel as closed only when PTY actually exits
             inner_clone.closed.store(true, Ordering::SeqCst);
             let mut stream_guard = inner_clone.output_stream.lock().await;
             if let Some(ref mut stream) = *stream_guard {
@@ -196,16 +195,15 @@ impl TerminalChannel {
                 }
             }
             *stream_guard = None;
-            info!(channel_id = %inner_clone.channel_id, "Terminal channel closed");
+            info!(channel_id = %inner_clone.channel_id, "Terminal channel closed (PTY exited)");
         });
 
         *inner.relay_task.lock().await = Some(relay_task);
 
         // Get initial state
         let initial_state = {
-            let mut p = parser.lock().await;
-            let state = p.state().clone();
-            state
+            let p = parser.lock().await;
+            p.state().clone()
         };
 
         let channel = Self { inner };
@@ -357,6 +355,52 @@ impl TerminalChannel {
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::SeqCst)
     }
+
+    /// Reconnect the channel's output stream to a new QUIC connection.
+    ///
+    /// This is used during mosh-style reconnection to redirect terminal output
+    /// to a new client connection while keeping the PTY alive.
+    pub async fn reconnect_output(&self, quic: &QuicConnection) -> Result<()> {
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return Err(Error::ConnectionClosed);
+        }
+
+        // Open new output stream on the new connection
+        let new_stream = quic
+            .open_stream(StreamType::ChannelOut(self.inner.channel_id))
+            .await
+            .map_err(|e| Error::Transport {
+                message: format!("failed to open output stream on reconnect: {}", e),
+            })?;
+
+        // Swap the output stream
+        let mut stream_guard = self.inner.output_stream.lock().await;
+
+        // Close old stream if present (best effort)
+        if let Some(ref mut old_stream) = *stream_guard {
+            let _ = old_stream.finish().await;
+        }
+
+        *stream_guard = Some(new_stream);
+
+        // Clear disconnected flag so output resumes
+        self.inner.disconnected.store(false, Ordering::SeqCst);
+
+        info!(
+            channel_id = %self.inner.channel_id,
+            "Terminal channel output reconnected"
+        );
+
+        // Note: We don't send StateUpdate here because:
+        // 1. It would block before HelloAck is sent, causing a deadlock
+        // 2. The terminal state is already included in HelloAck.existing_channels
+        // 3. The client can render the state from the HelloAck directly
+        //
+        // After reconnection, normal PTY output will resume flowing through
+        // this new stream automatically.
+
+        Ok(())
+    }
 }
 
 impl TerminalChannelInner {
@@ -366,7 +410,7 @@ impl TerminalChannelInner {
             return Ok(());
         }
 
-        // Update terminal state
+        // Update terminal state (always, even when disconnected)
         {
             let mut parser = self.parser.lock().await;
             parser.process(&data);
@@ -374,6 +418,11 @@ impl TerminalChannelInner {
 
         // Broadcast to any local subscribers
         let _ = self.output_tx.send(data.clone());
+
+        // Skip sending if disconnected - state is tracked, client will get it on reconnect
+        if self.disconnected.load(Ordering::SeqCst) {
+            return Ok(());
+        }
 
         // Send to client
         let mut stream_guard = self.output_stream.lock().await;
@@ -389,7 +438,17 @@ impl TerminalChannelInner {
                     confirmed_input_seq: confirmed_seq,
                 }),
             });
-            stream.send(&output).await?;
+            if let Err(e) = stream.send(&output).await {
+                // Connection lost - mark disconnected and stop trying to send
+                if !self.disconnected.swap(true, Ordering::SeqCst) {
+                    info!(
+                        channel_id = %channel_id,
+                        error = %e,
+                        "Output stream disconnected, waiting for reconnection"
+                    );
+                }
+                return Ok(());
+            }
 
             // Then send state update for reconnection/prediction support
             let new_state = {
@@ -419,7 +478,7 @@ impl TerminalChannelInner {
                         .as_micros() as u64,
                 }),
             });
-            stream.send(&update).await?;
+            let _ = stream.send(&update).await; // Best effort for state update
         }
 
         Ok(())

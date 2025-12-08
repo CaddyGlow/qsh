@@ -67,6 +67,10 @@ pub struct ConnectionRegistry {
     gc_task: std::sync::Mutex<Option<JoinHandle<()>>>,
     /// Shutdown signal.
     shutdown_tx: watch::Sender<bool>,
+    /// Session count change notification (sends current count on each change).
+    session_count_tx: watch::Sender<usize>,
+    /// Receiver for session count changes.
+    session_count_rx: watch::Receiver<usize>,
 }
 
 impl ConnectionRegistry {
@@ -78,9 +82,11 @@ impl ConnectionRegistry {
             Arc::new(AsyncMutex::new(HashMap::new()));
         let (cleanup_tx, mut cleanup_rx) = mpsc::unbounded_channel::<ConnectionRegistryCommand>();
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (session_count_tx, session_count_rx) = watch::channel(0usize);
 
         let sessions_gc = Arc::clone(&sessions);
         let sessions_by_id_gc = Arc::clone(&sessions_by_id);
+        let session_count_tx_gc = session_count_tx.clone();
         let linger = config.linger_timeout;
 
         let gc_task = tokio::spawn(async move {
@@ -97,18 +103,25 @@ impl ConnectionRegistry {
                                     debug!("Removed session {:?}", session.session_id);
                                     // Also remove from session_id index
                                     sessions_by_id_gc.lock().await.remove(&session.session_id);
+                                    // Notify session count changed
+                                    let _ = session_count_tx_gc.send(guard.len());
                                 }
                             }
                         }
                     }
                     _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                        run_connection_gc(&sessions_gc, &sessions_by_id_gc, linger).await;
+                        let removed = run_connection_gc(&sessions_gc, &sessions_by_id_gc, linger).await;
+                        if removed > 0 {
+                            let count = sessions_gc.lock().await.len();
+                            let _ = session_count_tx_gc.send(count);
+                        }
                     }
                 }
             }
 
             // Final cleanup
             run_connection_gc(&sessions_gc, &sessions_by_id_gc, Duration::from_secs(0)).await;
+            let _ = session_count_tx_gc.send(0);
         });
 
         Self {
@@ -118,6 +131,8 @@ impl ConnectionRegistry {
             cleanup_tx,
             gc_task: std::sync::Mutex::new(Some(gc_task)),
             shutdown_tx,
+            session_count_tx,
+            session_count_rx,
         }
     }
 
@@ -167,6 +182,9 @@ impl ConnectionRegistry {
         let session = Arc::new(ConnectionSession::new(session_key, client_addr));
         guard.insert(session_key, Arc::clone(&session));
 
+        // Notify session count changed
+        let _ = self.session_count_tx.send(guard.len());
+
         // Also add to session_id index
         self.sessions_by_id
             .lock()
@@ -205,20 +223,18 @@ impl ConnectionRegistry {
         // Get the session
         let session = self.sessions.lock().await.get(&stored_key).cloned()?;
 
-        // Check if it's already attached
-        if session.is_attached().await {
-            info!(
-                ?session_id,
-                "Session resume: detaching existing connection"
-            );
-            // Detach the existing connection (client reconnected)
-            session.detach().await;
-        }
+        // Note: We DON'T detach here - we want to preserve the handler (and its PTY)
+        // for mosh-style reconnection. The caller (accept_with_registry) will:
+        // 1. Check if there's an existing handler
+        // 2. If so, reuse it by calling handler.reconnect() with the new connection
+        // 3. If not, create a new handler
+        let has_handler = session.handler.lock().await.is_some();
 
         session.touch().await;
 
         info!(
             ?session_id,
+            has_existing_handler = has_handler,
             "Session resumed"
         );
 
@@ -245,7 +261,38 @@ impl ConnectionRegistry {
 
     /// Get the number of active sessions.
     pub async fn session_count(&self) -> usize {
-        self.sessions.lock().await.len()
+        let sessions = self.sessions.lock().await;
+        let count = sessions.len();
+        debug!(
+            count,
+            session_ids = ?sessions.values().map(|s| s.session_id).collect::<Vec<_>>(),
+            "Session count check"
+        );
+        count
+    }
+
+    /// Wait for the session count to change.
+    ///
+    /// Returns the new session count when it changes.
+    /// This is more efficient than polling `session_count()`.
+    pub async fn wait_session_count_change(&self) -> usize {
+        let mut rx = self.session_count_rx.clone();
+        // Mark current value as seen
+        rx.borrow_and_update();
+        // Wait for next change
+        if rx.changed().await.is_ok() {
+            *rx.borrow()
+        } else {
+            // Channel closed, return current count
+            self.session_count().await
+        }
+    }
+
+    /// Get current session count without locking.
+    ///
+    /// Uses the watch channel's cached value - slightly cheaper than `session_count()`.
+    pub fn session_count_cached(&self) -> usize {
+        *self.session_count_rx.borrow()
     }
 
     /// Shutdown the registry.
@@ -292,16 +339,19 @@ impl ConnectionSessionGuard {
 }
 
 /// Run garbage collection on the connection registry.
+///
+/// Returns the number of sessions removed.
 async fn run_connection_gc(
     sessions: &Arc<AsyncMutex<HashMap<[u8; SESSION_KEY_LEN], Arc<ConnectionSession>>>>,
     sessions_by_id: &Arc<AsyncMutex<HashMap<SessionId, [u8; SESSION_KEY_LEN]>>>,
     linger: Duration,
-) {
+) -> usize {
     let snapshot: Vec<Arc<ConnectionSession>> = {
         let guard = sessions.lock().await;
         guard.values().cloned().collect()
     };
 
+    let mut removed = 0;
     for session in snapshot {
         let idle = session.idle_duration().await;
         let attached = session.is_attached().await;
@@ -322,8 +372,10 @@ async fn run_connection_gc(
             let mut guard = sessions.lock().await;
             guard.remove(&session.session_key);
             sessions_by_id.lock().await.remove(&session.session_id);
+            removed += 1;
         }
     }
+    removed
 }
 
 #[cfg(test)]

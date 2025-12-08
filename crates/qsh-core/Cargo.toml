@@ -9,7 +9,7 @@ description = "Core library for qsh - protocol, types, terminal state"
 [features]
 default = ["compression"]
 tunnel = ["tun"]
-standalone = ["dep:ssh-key", "dep:rpassword", "dep:libc", "dep:ring", "dep:ssh-agent-client-rs"]
+standalone = ["dep:ssh-key", "dep:rpassword", "dep:ring", "dep:ssh-agent-client-rs"]
 compression = ["dep:zstd"]
 
 [dependencies]
@@ -26,8 +26,11 @@ vte = { workspace = true }
 unicode-width = { workspace = true }
 ipnet = { workspace = true }
 tun = { workspace = true, optional = true }
-quinn = { workspace = true }
-rustls = { workspace = true }
+tokio-quiche = { workspace = true }
+quiche = { workspace = true }
+rustls-pemfile = { workspace = true }
+rcgen = { workspace = true }
+libc = { workspace = true }
 sha2 = "0.10"
 rand = { workspace = true }
 getrandom = "0.2"
@@ -39,7 +42,6 @@ zstd = { version = "0.13", optional = true }
 # Standalone auth dependencies (optional)
 ssh-key = { workspace = true, optional = true }
 rpassword = { workspace = true, optional = true }
-libc = { workspace = true, optional = true }
 ring = { workspace = true, optional = true }
 ssh-agent-client-rs = { workspace = true, optional = true }
 

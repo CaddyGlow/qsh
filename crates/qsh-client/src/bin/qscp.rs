@@ -1099,6 +1099,7 @@ async fn connect(
         zero_rtt_available: false,
         keep_alive_interval: Some(std::time::Duration::from_millis(500)),
         max_idle_timeout: std::time::Duration::from_secs(15),
+        session_data: None,
     };
 
     info!(addr = %config.server_addr, "Connecting to server");
@@ -1178,6 +1179,7 @@ async fn connect(
         zero_rtt_available: false,
         keep_alive_interval: Some(std::time::Duration::from_millis(500)),
         max_idle_timeout: std::time::Duration::from_secs(15),
+        session_data: None,
     };
 
     // Connect using the channel model

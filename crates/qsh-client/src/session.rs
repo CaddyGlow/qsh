@@ -143,6 +143,7 @@ mod tests {
             zero_rtt_available: false,
             keep_alive_interval: None,
             max_idle_timeout: std::time::Duration::from_secs(30),
+            session_data: None,
         }
     }
 
