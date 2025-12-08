@@ -273,7 +273,13 @@ impl StatusOverlay {
     ///
     /// Returns empty string if not visible.
     pub fn render(&self, cols: u16) -> String {
-        if !self.visible {
+        // Force-show overlay during reconnection/disconnection (like mosh)
+        let should_render = self.visible
+            || matches!(
+                self.status,
+                ConnectionStatus::Reconnecting | ConnectionStatus::Disconnected
+            );
+        if !should_render {
             return String::new();
         }
 
@@ -494,7 +500,9 @@ mod tests {
 
     #[test]
     fn overlay_render_when_hidden() {
-        let overlay = StatusOverlay::new();
+        let mut overlay = StatusOverlay::new();
+        // Set to Connected status (Disconnected/Reconnecting force-render even when hidden)
+        overlay.set_status(ConnectionStatus::Connected);
         assert!(overlay.render(80).is_empty());
     }
 

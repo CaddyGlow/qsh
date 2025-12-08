@@ -378,19 +378,11 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
 
 
 async fn render_overlay_if_visible(overlay: &StatusOverlay, stdout: &mut StdoutWriter) {
-    // Force-show overlay during reconnection/disconnection (like mosh)
-    let should_render = overlay.is_visible()
-        || matches!(
-            overlay.status(),
-            ConnectionStatus::Reconnecting | ConnectionStatus::Disconnected
-        );
-
-    if should_render {
-        let term_size = get_term_size();
-        let overlay_output = overlay.render(term_size.cols);
-        if !overlay_output.is_empty() {
-            let _ = stdout.write(overlay_output.as_bytes()).await;
-        }
+    // render() handles visibility logic including force-show during reconnection
+    let term_size = get_term_size();
+    let overlay_output = overlay.render(term_size.cols);
+    if !overlay_output.is_empty() {
+        let _ = stdout.write(overlay_output.as_bytes()).await;
     }
 }
 
