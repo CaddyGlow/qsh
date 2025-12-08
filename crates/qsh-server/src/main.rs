@@ -17,7 +17,8 @@ use tracing::{debug, error, info, warn};
 use qsh_core::protocol::{Capabilities, Message};
 use qsh_core::transport::{Connection, server_crypto_config};
 use qsh_server::{
-    BootstrapServer, Cli, ConnectionConfig, PendingSession, SessionAuthorizer, SessionConfig,
+    BootstrapServer, Cli, ConnectionConfig, ConnectionRegistry, PendingSession, SessionAuthorizer,
+    SessionConfig,
 };
 
 #[cfg(feature = "standalone")]
@@ -328,13 +329,26 @@ async fn serve_endpoint(
     conn_config: ConnectionConfig,
     authorizer: Option<Arc<SessionAuthorizer>>,
     standalone_auth: Option<StandaloneAuth>,
-    single_connection: bool,
+    single_session: bool,
 ) -> qsh_core::Result<()> {
     let addr = endpoint.local_addr().ok();
-    info!(?addr, single_connection, "Server listening");
+    info!(?addr, single_session, "Server listening");
+
+    // Create connection registry for session persistence (enables reconnection)
+    let registry = Arc::new(ConnectionRegistry::new(conn_config.clone()));
+
+    // Track whether we've ever had a session (for single-session mode)
+    let mut had_session = false;
 
     // Accept connections
     loop {
+        // In single-session mode, if we had a session and it's gone, exit
+        if single_session && had_session && registry.session_count().await == 0 {
+            info!("Session expired during wait, exiting bootstrap mode");
+            registry.shutdown().await;
+            return Ok(());
+        }
+
         let incoming = match endpoint.accept().await {
             Some(inc) => inc,
             None => {
@@ -347,37 +361,72 @@ async fn serve_endpoint(
         let conn_config = conn_config.clone();
         let authorizer = authorizer.clone();
         let standalone_auth = standalone_auth.clone();
+        let registry = registry.clone();
 
-        if single_connection {
-            // Bootstrap mode: handle single connection synchronously, then exit
-            let result =
-                handle_connection(incoming, config, conn_config, authorizer, standalone_auth).await;
+        if single_session {
+            // Bootstrap mode: handle connection with registry for reconnection support
+            // Keep running until the session expires (handled by registry GC)
+            let result = handle_connection_with_registry(
+                incoming,
+                config,
+                conn_config,
+                authorizer,
+                standalone_auth,
+                &registry,
+            )
+            .await;
+
+            // Mark that we've had at least one session
+            had_session = true;
+
             if let Err(e) = &result {
                 error!(error = %e, "Connection handler error");
             }
-            info!("Single connection completed, exiting");
-            return result;
+
+            // Check if session count dropped to 0 after this connection
+            // (session was removed by GC or explicit close)
+            let count = registry.session_count().await;
+            if count == 0 {
+                info!("Session ended, exiting bootstrap mode");
+                registry.shutdown().await;
+                return result;
+            }
+
+            // Session still exists (detached, waiting for reconnect)
+            // Continue accepting connections
+            info!(sessions = count, "Connection closed, waiting for reconnection");
+            continue;
         }
 
         // Normal mode: spawn connection handler and continue accepting
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_connection(incoming, config, conn_config, authorizer, standalone_auth).await
+            if let Err(e) = handle_connection_with_registry(
+                incoming,
+                config,
+                conn_config,
+                authorizer,
+                standalone_auth,
+                &registry,
+            )
+            .await
             {
                 error!(error = %e, "Connection handler error");
             }
         });
     }
 
+    // Shutdown registry on clean exit
+    registry.shutdown().await;
     Ok(())
 }
 
-async fn handle_connection(
+async fn handle_connection_with_registry(
     incoming: quinn::Incoming,
     config: SessionConfig,
     conn_config: ConnectionConfig,
     authorizer: Option<Arc<SessionAuthorizer>>,
     standalone_auth: Option<StandaloneAuth>,
+    registry: &ConnectionRegistry,
 ) -> qsh_core::Result<()> {
     let addr = incoming.remote_address();
     info!(addr = %addr, "Incoming connection");
@@ -389,7 +438,7 @@ async fn handle_connection(
     // If standalone mode is enabled, perform mutual SSH key authentication
     // before proceeding to the normal session Hello/HelloAck handshake.
     #[cfg(feature = "standalone")]
-    if let Some(auth) = standalone_auth {
+    if let Some(ref auth) = standalone_auth {
         use qsh_server::standalone::{AuthResult, authenticate_connection, send_auth_failure};
 
         // Open a dedicated bidirectional stream for auth handshake (server-initiated).
@@ -424,11 +473,14 @@ async fn handle_connection(
         }
     }
 
+    // Suppress unused warning when standalone feature is disabled
+    let _ = &standalone_auth;
+
     let quic = qsh_core::transport::QuicConnection::new(conn);
     let pending = PendingSession::new(quic, authorizer, config).await?;
 
-    // Accept the session and create the connection handler (channel model only)
-    let (handler, shutdown_rx) = pending.accept_channel_model(conn_config).await?;
+    // Accept the session with registry support (enables reconnection)
+    let (handler, shutdown_rx) = pending.accept_with_registry(conn_config, registry).await?;
 
     // Run the channel model session loop
     handle_channel_model_session(handler, shutdown_rx).await

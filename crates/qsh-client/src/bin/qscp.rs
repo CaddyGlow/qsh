@@ -15,7 +15,10 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
-use qsh_client::{BootstrapMode, ChannelConnection, CpCli, FileChannel, FilePath, SshConfig, bootstrap};
+use qsh_client::{ChannelConnection, CpCli, FileChannel, FilePath};
+
+#[cfg(not(feature = "standalone"))]
+use qsh_client::{BootstrapMode, SshConfig, bootstrap};
 use qsh_core::file::checksum::StreamingHasher;
 use qsh_core::file::compress::{Compressor, Decompressor, is_compressed_extension};
 use qsh_core::file::delta::{DeltaEncoder, DeltaOp, DeltaSignature};

@@ -2,17 +2,22 @@
 //!
 //! Manages SSH-style connections with multiple channels (terminals, file transfers,
 //! port forwards) multiplexed over a single QUIC connection.
+//!
+//! Sessions are indexed by both session key (for initial auth) and session ID
+//! (for reconnection). When a client reconnects with a session ID, the existing
+//! session state (terminals, forwards) is preserved.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use tokio::task::JoinHandle;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use qsh_core::constants::SESSION_KEY_LEN;
 use qsh_core::error::Result;
+use qsh_core::protocol::SessionId;
 
 use crate::connection::{ConnectionConfig, ConnectionSession};
 
@@ -46,15 +51,20 @@ enum ConnectionRegistryCommand {
 /// Unlike `SessionRegistry` which manages per-PTY sessions, `ConnectionRegistry`
 /// manages connections that can have multiple channels (terminals, file transfers,
 /// port forwards) multiplexed over a single QUIC connection.
+///
+/// Sessions are indexed by both session key (for initial auth) and session ID
+/// (for reconnection lookup).
 pub struct ConnectionRegistry {
     /// Active sessions keyed by session key.
     sessions: Arc<AsyncMutex<HashMap<[u8; SESSION_KEY_LEN], Arc<ConnectionSession>>>>,
+    /// Index from session ID to session key (for reconnection lookup).
+    sessions_by_id: Arc<AsyncMutex<HashMap<SessionId, [u8; SESSION_KEY_LEN]>>>,
     /// Default configuration for new connections.
     config: ConnectionConfig,
     /// Channel for cleanup commands.
     cleanup_tx: mpsc::UnboundedSender<ConnectionRegistryCommand>,
-    /// GC task handle.
-    gc_task: JoinHandle<()>,
+    /// GC task handle (wrapped in Mutex to allow take without consuming self).
+    gc_task: std::sync::Mutex<Option<JoinHandle<()>>>,
     /// Shutdown signal.
     shutdown_tx: watch::Sender<bool>,
 }
@@ -64,10 +74,13 @@ impl ConnectionRegistry {
     pub fn new(config: ConnectionConfig) -> Self {
         let sessions: Arc<AsyncMutex<HashMap<[u8; SESSION_KEY_LEN], Arc<ConnectionSession>>>> =
             Arc::new(AsyncMutex::new(HashMap::new()));
+        let sessions_by_id: Arc<AsyncMutex<HashMap<SessionId, [u8; SESSION_KEY_LEN]>>> =
+            Arc::new(AsyncMutex::new(HashMap::new()));
         let (cleanup_tx, mut cleanup_rx) = mpsc::unbounded_channel::<ConnectionRegistryCommand>();
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
         let sessions_gc = Arc::clone(&sessions);
+        let sessions_by_id_gc = Arc::clone(&sessions_by_id);
         let linger = config.linger_timeout;
 
         let gc_task = tokio::spawn(async move {
@@ -82,25 +95,28 @@ impl ConnectionRegistry {
                                 let mut guard = sessions_gc.lock().await;
                                 if let Some(session) = guard.remove(&key) {
                                     debug!("Removed session {:?}", session.session_id);
+                                    // Also remove from session_id index
+                                    sessions_by_id_gc.lock().await.remove(&session.session_id);
                                 }
                             }
                         }
                     }
                     _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                        run_connection_gc(&sessions_gc, linger).await;
+                        run_connection_gc(&sessions_gc, &sessions_by_id_gc, linger).await;
                     }
                 }
             }
 
             // Final cleanup
-            run_connection_gc(&sessions_gc, Duration::from_secs(0)).await;
+            run_connection_gc(&sessions_gc, &sessions_by_id_gc, Duration::from_secs(0)).await;
         });
 
         Self {
             sessions,
+            sessions_by_id,
             config,
             cleanup_tx,
-            gc_task,
+            gc_task: std::sync::Mutex::new(Some(gc_task)),
             shutdown_tx,
         }
     }
@@ -151,9 +167,62 @@ impl ConnectionRegistry {
         let session = Arc::new(ConnectionSession::new(session_key, client_addr));
         guard.insert(session_key, Arc::clone(&session));
 
+        // Also add to session_id index
+        self.sessions_by_id
+            .lock()
+            .await
+            .insert(session.session_id, session_key);
+
         info!(session_id = ?session.session_id, "Created new connection session");
 
         Ok(ConnectionSessionGuard {
+            session,
+            cleanup_tx: self.cleanup_tx.clone(),
+        })
+    }
+
+    /// Look up a session by session ID (for reconnection).
+    ///
+    /// Returns the session if it exists and the session key matches.
+    /// The session key check prevents session hijacking.
+    pub async fn get_session_for_resume(
+        &self,
+        session_id: SessionId,
+        session_key: &[u8; SESSION_KEY_LEN],
+    ) -> Option<ConnectionSessionGuard> {
+        // Look up session key from session ID
+        let stored_key = self.sessions_by_id.lock().await.get(&session_id).copied()?;
+
+        // Verify session key matches (prevents hijacking)
+        if &stored_key != session_key {
+            warn!(
+                ?session_id,
+                "Session resume rejected: session key mismatch"
+            );
+            return None;
+        }
+
+        // Get the session
+        let session = self.sessions.lock().await.get(&stored_key).cloned()?;
+
+        // Check if it's already attached
+        if session.is_attached().await {
+            info!(
+                ?session_id,
+                "Session resume: detaching existing connection"
+            );
+            // Detach the existing connection (client reconnected)
+            session.detach().await;
+        }
+
+        session.touch().await;
+
+        info!(
+            ?session_id,
+            "Session resumed"
+        );
+
+        Some(ConnectionSessionGuard {
             session,
             cleanup_tx: self.cleanup_tx.clone(),
         })
@@ -180,10 +249,19 @@ impl ConnectionRegistry {
     }
 
     /// Shutdown the registry.
-    pub async fn shutdown(self) {
+    pub async fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
-        if !self.gc_task.is_finished() {
-            let _ = self.gc_task.await;
+
+        // Take and await the GC task
+        let gc_task = self
+            .gc_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(task) = gc_task {
+            if !task.is_finished() {
+                let _ = task.await;
+            }
         }
 
         // Close all sessions
@@ -216,6 +294,7 @@ impl ConnectionSessionGuard {
 /// Run garbage collection on the connection registry.
 async fn run_connection_gc(
     sessions: &Arc<AsyncMutex<HashMap<[u8; SESSION_KEY_LEN], Arc<ConnectionSession>>>>,
+    sessions_by_id: &Arc<AsyncMutex<HashMap<SessionId, [u8; SESSION_KEY_LEN]>>>,
     linger: Duration,
 ) {
     let snapshot: Vec<Arc<ConnectionSession>> = {
@@ -239,8 +318,10 @@ async fn run_connection_gc(
                 handler.shutdown().await;
             }
 
+            // Remove from both indices
             let mut guard = sessions.lock().await;
             guard.remove(&session.session_key);
+            sessions_by_id.lock().await.remove(&session.session_id);
         }
     }
 }

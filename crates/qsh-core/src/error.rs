@@ -66,6 +66,36 @@ pub enum Error {
     Channel { message: String },
 }
 
+impl Error {
+    /// Returns true if this error is transient and reconnection may help.
+    ///
+    /// Transient errors include network/transport failures where the server
+    /// session may still be alive and reconnection could succeed.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Error::Transport { .. }
+                | Error::ConnectionClosed
+                | Error::Timeout
+                | Error::Io(_)
+        )
+    }
+
+    /// Returns true if this error is fatal and reconnection won't help.
+    ///
+    /// Fatal errors indicate the session is unrecoverable - the server
+    /// rejected the session or there's a protocol-level issue.
+    pub fn is_fatal(&self) -> bool {
+        matches!(
+            self,
+            Error::AuthenticationFailed
+                | Error::SessionExpired
+                | Error::SessionNotFound(_)
+                | Error::Protocol { .. }
+        )
+    }
+}
+
 /// Convenience result type for qsh operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -104,5 +134,47 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
         let err: Error = io_err.into();
         assert!(matches!(err, Error::Io(_)));
+    }
+
+    #[test]
+    fn transient_errors() {
+        assert!(Error::Transport {
+            message: "connection lost".into()
+        }
+        .is_transient());
+        assert!(Error::ConnectionClosed.is_transient());
+        assert!(Error::Timeout.is_transient());
+        assert!(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset"
+        ))
+        .is_transient());
+
+        // These should not be transient
+        assert!(!Error::AuthenticationFailed.is_transient());
+        assert!(!Error::SessionExpired.is_transient());
+        assert!(!Error::Protocol {
+            message: "bad".into()
+        }
+        .is_transient());
+    }
+
+    #[test]
+    fn fatal_errors() {
+        assert!(Error::AuthenticationFailed.is_fatal());
+        assert!(Error::SessionExpired.is_fatal());
+        assert!(Error::SessionNotFound(42).is_fatal());
+        assert!(Error::Protocol {
+            message: "invalid".into()
+        }
+        .is_fatal());
+
+        // These should not be fatal
+        assert!(!Error::Transport {
+            message: "lost".into()
+        }
+        .is_fatal());
+        assert!(!Error::ConnectionClosed.is_fatal());
+        assert!(!Error::Timeout.is_fatal());
     }
 }

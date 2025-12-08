@@ -12,11 +12,12 @@ use tracing::{debug, error, info, warn};
 use qsh_client::cli::{OverlayPosition as CliOverlayPosition, SshBootstrapMode};
 use qsh_client::overlay::{ConnectionStatus, OverlayPosition, StatusOverlay};
 use qsh_client::{
-    BootstrapMode, ChannelConnection, Cli, ConnectionConfig, EscapeCommand, EscapeHandler,
-    EscapeResult, ForwarderHandle, LocalForwarder, ProxyHandle, RawModeGuard, RemoteForwarder,
-    RemoteForwarderHandle, Socks5Proxy, SshConfig, StdinReader, StdoutWriter, TerminalChannel,
-    bootstrap, connect_quic, get_terminal_size, parse_dynamic_forward, parse_escape_key,
-    parse_local_forward, parse_remote_forward, restore_terminal,
+    BootstrapMode, ChannelConnection, Cli, ConnectionConfig, ConnectionState, EscapeCommand,
+    EscapeHandler, EscapeResult, ForwarderHandle, LocalForwarder, ProxyHandle, RawModeGuard,
+    ReconnectableConnection, RemoteForwarder, RemoteForwarderHandle, SessionContext, Socks5Proxy,
+    SshConfig, StdinReader, StdoutWriter, TerminalSessionState, bootstrap,
+    connect_quic, get_terminal_size, parse_dynamic_forward, parse_escape_key, parse_local_forward,
+    parse_remote_forward, restore_terminal,
 };
 
 #[cfg(feature = "standalone")]
@@ -24,7 +25,7 @@ use qsh_client::standalone::authenticate as standalone_authenticate;
 #[cfg(feature = "standalone")]
 use qsh_client::{DirectAuthenticator, DirectConfig};
 
-use qsh_core::protocol::{StateDiff, TermSize};
+use qsh_core::protocol::TermSize;
 
 fn main() {
     // Parse CLI arguments
@@ -72,23 +73,6 @@ fn main() {
         error!(error = %e, "Connection failed");
         eprintln!("qsh: {}", e);
         std::process::exit(1);
-    }
-}
-
-fn extract_generation(diff: &StateDiff) -> Option<u64> {
-    match diff {
-        StateDiff::Full(state) => Some(state.generation),
-        StateDiff::Incremental { to_gen, .. } => Some(*to_gen),
-        StateDiff::CursorOnly { generation, .. } => Some(*generation),
-    }
-}
-
-/// Extract cursor position from a state diff.
-fn extract_cursor(diff: &StateDiff) -> Option<(u16, u16)> {
-    match diff {
-        StateDiff::Full(state) => Some((state.cursor.col, state.cursor.row)),
-        StateDiff::Incremental { cursor, .. } => cursor.as_ref().map(|c| (c.col, c.row)),
-        StateDiff::CursorOnly { cursor, .. } => Some((cursor.col, cursor.row)),
     }
 }
 
@@ -192,7 +176,7 @@ async fn run_client_direct(cli: &Cli, host: &str, user: Option<&str>) -> qsh_cor
     info!("Standalone authentication succeeded");
 
     // Complete qsh protocol handshake using channel model.
-    let conn = ChannelConnection::from_quic(quic_conn, conn_config).await?;
+    let conn = ChannelConnection::from_quic(quic_conn, conn_config.clone()).await?;
     info!(rtt = ?conn.rtt(), session_id = ?conn.session_id(), "Connected to server");
 
     // Open a terminal channel (unless -N forwarding-only mode)
@@ -239,23 +223,16 @@ async fn run_client_direct(cli: &Cli, host: &str, user: Option<&str>) -> qsh_cor
         return Ok(());
     }
 
-    let term_size = get_term_size();
-    let terminal_params = qsh_core::protocol::TerminalParams {
-        term_size,
-        term_type: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
-        env: collect_terminal_env(),
-        shell: None,
-        command: cli.command_string(),
-        allocate_pty: cli.should_allocate_pty(),
-        last_generation: 0,
-        last_input_seq: 0,
-    };
+    // Create session context for reconnection support (with authenticator for re-auth)
+    let context = SessionContext::new(conn_config, conn.session_id())
+        .with_authenticator(authenticator);
 
-    let terminal = conn.open_terminal(terminal_params).await?;
-    info!(channel_id = ?terminal.channel_id(), "Terminal channel opened");
+    // Create reconnectable connection wrapper
+    let reconnectable = std::sync::Arc::new(ReconnectableConnection::new(conn, context));
 
+    // Run the channel session with reconnection support
     let user_host = format_user_host(user, host);
-    run_channel_session(conn, terminal, cli, Some(user_host)).await
+    run_reconnectable_session(reconnectable, cli, Some(user_host)).await
 }
 
 /// Run client using the SSH-style channel model (experimental).
@@ -324,7 +301,7 @@ async fn run_client_channel_model(
     };
 
     // Connect using the channel model (no implicit terminal)
-    let conn = ChannelConnection::connect(config).await?;
+    let conn = ChannelConnection::connect(config.clone()).await?;
     info!(
         rtt = ?conn.rtt(),
         session_id = ?conn.session_id(),
@@ -378,24 +355,15 @@ async fn run_client_channel_model(
         return Ok(());
     }
 
-    let term_size = get_term_size();
-    let terminal_params = qsh_core::protocol::TerminalParams {
-        term_size,
-        term_type: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
-        env: collect_terminal_env(),
-        shell: None,
-        command: cli.command_string(),
-        allocate_pty: cli.should_allocate_pty(),
-        last_generation: 0,
-        last_input_seq: 0,
-    };
+    // Create session context for reconnection support
+    let context = SessionContext::new(config, conn.session_id());
 
-    let terminal = conn.open_terminal(terminal_params).await?;
-    info!(channel_id = ?terminal.channel_id(), "Terminal channel opened");
+    // Create reconnectable connection wrapper
+    let reconnectable = std::sync::Arc::new(ReconnectableConnection::new(conn, context));
 
-    // Run the channel session
+    // Run the channel session with reconnection support
     let user_host = format_user_host(user, host);
-    run_channel_session(conn, terminal, cli, Some(user_host)).await
+    run_reconnectable_session(reconnectable, cli, Some(user_host)).await
 }
 
 async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Result<()> {
@@ -410,7 +378,14 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
 
 
 async fn render_overlay_if_visible(overlay: &StatusOverlay, stdout: &mut StdoutWriter) {
-    if overlay.is_visible() {
+    // Force-show overlay during reconnection/disconnection (like mosh)
+    let should_render = overlay.is_visible()
+        || matches!(
+            overlay.status(),
+            ConnectionStatus::Reconnecting | ConnectionStatus::Disconnected
+        );
+
+    if should_render {
         let term_size = get_term_size();
         let overlay_output = overlay.render(term_size.cols);
         if !overlay_output.is_empty() {
@@ -418,13 +393,6 @@ async fn render_overlay_if_visible(overlay: &StatusOverlay, stdout: &mut StdoutW
         }
     }
 }
-
-/// Clear overlay line from terminal (best-effort).
-async fn clear_overlay(stdout: &mut StdoutWriter, _position: OverlayPosition) {
-    // Overlays draw on first row today; clear that row to hide artifacts.
-    let _ = stdout.write(b"\x1b[s\x1b[1;1H\x1b[2K\x1b[u").await;
-}
-
 
 fn get_term_size() -> TermSize {
     match get_terminal_size() {
@@ -639,45 +607,21 @@ fn create_status_overlay(cli: &Cli, user_host: Option<String>) -> StatusOverlay 
     overlay
 }
 
-/// Run a terminal session using the channel model (experimental).
+/// Run a terminal session with reconnection support.
 ///
-/// This is a simplified version of run_session that works with TerminalChannel
-/// instead of ClientConnection.
-async fn run_channel_session(
-    conn: ChannelConnection,
-    terminal: TerminalChannel,
+/// This wraps the terminal session in a reconnection loop. When the connection
+/// is lost, it waits for reconnection and reopens the terminal channel with
+/// state recovery (last_generation/last_input_seq).
+async fn run_reconnectable_session(
+    reconnectable: std::sync::Arc<ReconnectableConnection>,
     cli: &Cli,
     user_host: Option<String>,
 ) -> qsh_core::Result<()> {
-    info!(
-        caps = ?conn.server_capabilities(),
-        "Server capabilities"
-    );
-
-    // Wrap connection in Arc for sharing with forwards
-    let conn = std::sync::Arc::new(conn);
-
-    // Start forwards before entering terminal mode
-    let _forward_handles = start_forwards(cli, &conn).await?;
+    // Track terminal state for recovery after reconnection
+    let mut terminal_state = TerminalSessionState::new();
 
     // Create status overlay
-    let mut overlay = create_status_overlay(cli, user_host);
-    overlay.set_status(ConnectionStatus::Connected);
-
-    // Initialize RTT from connection
-    overlay.metrics_mut().update_rtt(conn.rtt());
-    overlay.metrics_mut().record_heard();
-
-    // Overlay refresh interval
-    let mut overlay_refresh = tokio::time::interval(Duration::from_secs(2));
-    overlay_refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
-    // Parse toggle key
-    let toggle_key = parse_toggle_key(&cli.overlay_key);
-
-    // Parse escape key and create handler
-    let escape_key = parse_escape_key(&cli.escape_key);
-    let mut escape_handler = EscapeHandler::new(escape_key);
+    let mut overlay = create_status_overlay(cli, user_host.clone());
 
     // Determine if we're in interactive mode (PTY allocated)
     let is_interactive = cli.should_allocate_pty();
@@ -699,115 +643,220 @@ async fn run_channel_session(
         None
     };
 
+    // Overlay refresh interval
+    let mut overlay_refresh = tokio::time::interval(Duration::from_secs(2));
+    overlay_refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    // Parse toggle key
+    let toggle_key = parse_toggle_key(&cli.overlay_key);
+
+    // Parse escape key and create handler
+    let escape_key = parse_escape_key(&cli.escape_key);
+    let mut escape_handler = EscapeHandler::new(escape_key);
+
     // Create stdin/stdout handlers
     let mut stdin = StdinReader::new();
     let mut stdout = StdoutWriter::new();
 
-    // Set up SIGWINCH signal handler
-    #[cfg(unix)]
-    let mut sigwinch =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
-            .map_err(qsh_core::Error::Io)?;
-
-    // Main session loop
+    // Reconnection loop
     loop {
-        #[cfg(unix)]
-        let resize_event = sigwinch.recv();
-        #[cfg(not(unix))]
-        let resize_event = std::future::pending::<Option<()>>();
+        // Wait for connection to be available
+        overlay.set_status(match reconnectable.state() {
+            ConnectionState::Connected => ConnectionStatus::Connected,
+            ConnectionState::Reconnecting => ConnectionStatus::Reconnecting,
+            ConnectionState::Disconnected => ConnectionStatus::Disconnected,
+        });
+        render_overlay_if_visible(&overlay, &mut stdout).await;
 
-        tokio::select! {
-            biased;
-
-            // Handle terminal resize
-            _ = resize_event => {
-                if let Ok(new_size) = get_terminal_size() {
-                    debug!(cols = new_size.cols, rows = new_size.rows, "Terminal resized");
-                    // TODO: Send resize message to server through channel
-                }
-            }
-
-            // Handle user input
-            result = stdin.read() => {
-                let data = match result {
-                    Some(data) => data,
-                    None => {
-                        info!("EOF on stdin");
-                        break;
-                    }
-                };
-
-                // Check toggle key (only if overlay is allowed)
-                if let (Some(key), true) = (toggle_key, data.len() == 1) {
-                    if data[0] == key {
-                        let visible = overlay.is_visible();
-                        overlay.set_visible(!visible);
-                        render_overlay_if_visible(&overlay, &mut stdout).await;
-                        continue;
-                    }
-                }
-
-                // Check escape sequence
-                match escape_handler.process(&data) {
-                    EscapeResult::Command(EscapeCommand::Disconnect) => {
-                        info!("Escape sequence: disconnect");
-                        break;
-                    }
-                    EscapeResult::Command(EscapeCommand::ToggleOverlay) => {
-                        let visible = overlay.is_visible();
-                        overlay.set_visible(!visible);
-                        render_overlay_if_visible(&overlay, &mut stdout).await;
-                        continue;
-                    }
-                    EscapeResult::Command(EscapeCommand::SendEscapeKey) => {
-                        // Send the escape character itself
-                        let _ = terminal.queue_input(&[escape_key.unwrap_or(0x1e)], false);
-                        continue;
-                    }
-                    EscapeResult::Waiting => {
-                        // Waiting for command key, don't send anything yet
-                        continue;
-                    }
-                    EscapeResult::PassThrough(pass_data) => {
-                        // Queue the input
-                        if let Err(e) = terminal.queue_input(&pass_data, false) {
-                            warn!(error = %e, "Failed to queue input");
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Handle terminal output
-            result = terminal.recv_output() => {
-                match result {
-                    Ok(output) => {
-                        overlay.metrics_mut().record_heard();
-
-                        // Output the data
-                        if let Err(e) = stdout.write(&output.data).await {
-                            warn!(error = %e, "stdout write error");
-                            break;
-                        }
-
-                        // Render status overlay
-                        render_overlay_if_visible(&overlay, &mut stdout).await;
-                    }
-                    Err(qsh_core::Error::ConnectionClosed) => {
-                        info!("Channel closed");
-                        break;
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "recv_output error");
-                        break;
-                    }
-                }
-            }
-
-            // Overlay refresh
-            _ = overlay_refresh.tick() => {
-                overlay.metrics_mut().update_rtt(conn.rtt());
+        let conn = match reconnectable.wait_connected().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                error!(error = %e, "Connection permanently lost");
+                overlay.set_status(ConnectionStatus::Disconnected);
                 render_overlay_if_visible(&overlay, &mut stdout).await;
+                return Err(e);
+            }
+        };
+
+        info!(
+            session_id = ?conn.session_id(),
+            last_gen = terminal_state.last_generation,
+            last_seq = terminal_state.last_input_seq,
+            "Opening terminal channel"
+        );
+
+        // Open terminal channel with recovery state
+        let term_size = get_term_size();
+        let terminal_params = qsh_core::protocol::TerminalParams {
+            term_size,
+            term_type: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
+            env: collect_terminal_env(),
+            shell: None,
+            command: cli.command_string(),
+            allocate_pty: cli.should_allocate_pty(),
+            last_generation: terminal_state.last_generation,
+            last_input_seq: terminal_state.last_input_seq,
+        };
+
+        let terminal = match conn.open_terminal(terminal_params).await {
+            Ok(t) => t,
+            Err(e) => {
+                if e.is_transient() {
+                    warn!(error = %e, "Failed to open terminal, triggering reconnect");
+                    reconnectable.handle_error(&e).await;
+                    continue;
+                } else {
+                    error!(error = %e, "Fatal error opening terminal");
+                    return Err(e);
+                }
+            }
+        };
+
+        info!(channel_id = ?terminal.channel_id(), "Terminal channel opened");
+
+        // Update overlay for connected state
+        overlay.set_status(ConnectionStatus::Connected);
+        overlay.metrics_mut().update_rtt(conn.rtt());
+        overlay.metrics_mut().record_heard();
+
+        // Start forwards (only on first connection)
+        // TODO: Handle forward reconnection
+
+        // Set up SIGWINCH signal handler
+        #[cfg(unix)]
+        let mut sigwinch =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+                .map_err(qsh_core::Error::Io)?;
+
+        // Inner I/O loop
+        let session_result: Result<(), qsh_core::Error> = loop {
+            #[cfg(unix)]
+            let resize_event = sigwinch.recv();
+            #[cfg(not(unix))]
+            let resize_event = std::future::pending::<Option<()>>();
+
+            tokio::select! {
+                biased;
+
+                // Handle terminal resize
+                _ = resize_event => {
+                    if let Ok(new_size) = get_terminal_size() {
+                        debug!(cols = new_size.cols, rows = new_size.rows, "Terminal resized");
+                        // TODO: Send resize message to server through channel
+                    }
+                }
+
+                // Handle user input
+                result = stdin.read() => {
+                    let data = match result {
+                        Some(data) => data,
+                        None => {
+                            info!("EOF on stdin");
+                            break Ok(());
+                        }
+                    };
+
+                    // Check toggle key (only if overlay is allowed)
+                    if let (Some(key), true) = (toggle_key, data.len() == 1) {
+                        if data[0] == key {
+                            let visible = overlay.is_visible();
+                            overlay.set_visible(!visible);
+                            render_overlay_if_visible(&overlay, &mut stdout).await;
+                            continue;
+                        }
+                    }
+
+                    // Check escape sequence
+                    match escape_handler.process(&data) {
+                        EscapeResult::Command(EscapeCommand::Disconnect) => {
+                            info!("Escape sequence: disconnect");
+                            break Ok(());
+                        }
+                        EscapeResult::Command(EscapeCommand::ToggleOverlay) => {
+                            let visible = overlay.is_visible();
+                            overlay.set_visible(!visible);
+                            render_overlay_if_visible(&overlay, &mut stdout).await;
+                            continue;
+                        }
+                        EscapeResult::Command(EscapeCommand::SendEscapeKey) => {
+                            // Send the escape character itself
+                            let _ = terminal.queue_input(&[escape_key.unwrap_or(0x1e)], false);
+                            continue;
+                        }
+                        EscapeResult::Waiting => {
+                            // Waiting for command key, don't send anything yet
+                            continue;
+                        }
+                        EscapeResult::PassThrough(pass_data) => {
+                            // Queue the input
+                            if let Err(e) = terminal.queue_input(&pass_data, false) {
+                                warn!(error = %e, "Failed to queue input");
+                                break Err(e);
+                            }
+                        }
+                    }
+                }
+
+                // Handle terminal output
+                result = terminal.recv_output() => {
+                    match result {
+                        Ok(output) => {
+                            overlay.metrics_mut().record_heard();
+
+                            // Track confirmed input seq for recovery
+                            terminal_state.last_input_seq = output.confirmed_input_seq;
+
+                            // Output the data
+                            if let Err(e) = stdout.write(&output.data).await {
+                                warn!(error = %e, "stdout write error");
+                                break Err(e.into());
+                            }
+
+                            // Render status overlay
+                            render_overlay_if_visible(&overlay, &mut stdout).await;
+                        }
+                        Err(qsh_core::Error::ConnectionClosed) => {
+                            info!("Channel closed");
+                            break Ok(());
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "recv_output error");
+                            break Err(e);
+                        }
+                    }
+                }
+
+                // Overlay refresh
+                _ = overlay_refresh.tick() => {
+                    if let Some(rtt) = reconnectable.rtt() {
+                        overlay.metrics_mut().update_rtt(rtt);
+                    }
+                    render_overlay_if_visible(&overlay, &mut stdout).await;
+                }
+            }
+        };
+
+        // Handle session result
+        match session_result {
+            Ok(()) => {
+                // Clean exit (EOF, user disconnect, channel closed)
+                info!("Session ended cleanly");
+                terminal.mark_closed();
+                break;
+            }
+            Err(e) if e.is_transient() => {
+                // Transient error - trigger reconnection and continue loop
+                warn!(error = %e, "Transient error, attempting reconnection");
+                overlay.set_status(ConnectionStatus::Reconnecting);
+                render_overlay_if_visible(&overlay, &mut stdout).await;
+                reconnectable.handle_error(&e).await;
+                // Continue outer loop - will wait for reconnection
+            }
+            Err(e) => {
+                // Fatal error
+                error!(error = %e, "Fatal session error");
+                terminal.mark_closed();
+                return Err(e);
             }
         }
     }
@@ -815,12 +864,11 @@ async fn run_channel_session(
     // Restore terminal
     restore_terminal();
 
-    // Close the terminal channel
-    terminal.mark_closed();
-
-    // Close the connection
-    info!("Shutting down channel model connection...");
-    conn.shutdown().await?;
+    // Final shutdown
+    if let Some(conn) = reconnectable.connection() {
+        info!("Shutting down connection...");
+        let _ = conn.shutdown().await;
+    }
 
     Ok(())
 }

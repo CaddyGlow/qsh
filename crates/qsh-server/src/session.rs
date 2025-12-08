@@ -226,6 +226,102 @@ impl PendingSession {
 
         Ok((handler, shutdown_rx))
     }
+
+    /// Finalize handshake with registry support (for session persistence).
+    ///
+    /// This version integrates with `ConnectionRegistry` to support session
+    /// resumption across disconnects. If the client sends `resume_session`,
+    /// the existing session is looked up and reattached.
+    pub async fn accept_with_registry(
+        mut self,
+        conn_config: ConnectionConfig,
+        registry: &crate::registry::ConnectionRegistry,
+    ) -> Result<(Arc<ConnectionHandler>, tokio::sync::mpsc::Receiver<()>)> {
+        let client_addr = self.quic.remote_addr();
+
+        // Check if this is a session resume attempt
+        if let Some(resume_id) = self.hello.resume_session {
+            info!(
+                session_id = ?resume_id,
+                addr = %client_addr,
+                "Session resume requested"
+            );
+
+            // Look up existing session by ID
+            if let Some(session_guard) =
+                registry.get_session_for_resume(resume_id, &self.hello.session_key).await
+            {
+                // Resume successful - reuse the session ID
+                let session_id = session_guard.session.session_id;
+
+                // Send HelloAck with the existing session ID
+                let ack = HelloAckPayload {
+                    protocol_version: 1,
+                    accepted: true,
+                    reject_reason: None,
+                    capabilities: self.config.capabilities.clone(),
+                    session_id,
+                    server_nonce: rand::random(),
+                    zero_rtt_available: true,
+                };
+                self.control.send(&Message::HelloAck(ack)).await?;
+
+                info!(
+                    session_id = ?session_id,
+                    addr = %client_addr,
+                    "Session resumed successfully"
+                );
+
+                // Create new connection handler with existing session ID
+                let (handler, shutdown_rx) =
+                    ConnectionHandler::new(self.quic, self.control, session_id, conn_config);
+
+                // Attach new handler to session
+                session_guard.session.attach(Arc::clone(&handler), client_addr).await;
+
+                return Ok((handler, shutdown_rx));
+            } else {
+                // Session not found or expired - fall through to create new session
+                info!(
+                    session_id = ?resume_id,
+                    "Session resume failed: session not found or expired"
+                );
+            }
+        }
+
+        // Create new session
+        let session_guard = registry
+            .get_or_create_session(self.hello.session_key, client_addr)
+            .await?;
+        let session_id = session_guard.session.session_id;
+
+        // Send HelloAck
+        let ack = HelloAckPayload {
+            protocol_version: 1,
+            accepted: true,
+            reject_reason: None,
+            capabilities: self.config.capabilities.clone(),
+            session_id,
+            server_nonce: rand::random(),
+            zero_rtt_available: true,
+        };
+        self.control.send(&Message::HelloAck(ack)).await?;
+
+        info!(
+            session_id = ?session_id,
+            addr = %client_addr,
+            "New connection established (channel model with registry)"
+        );
+
+        // Create the connection handler
+        let (handler, shutdown_rx) =
+            ConnectionHandler::new(self.quic, self.control, session_id, conn_config);
+
+        // Attach handler to session
+        session_guard.session.attach(Arc::clone(&handler), client_addr).await;
+
+        Ok((handler, shutdown_rx))
+    }
 }
 
 

@@ -21,7 +21,9 @@ pub mod file;
 pub mod forward;
 pub mod overlay;
 pub mod prediction;
+pub mod reconnectable;
 pub mod render;
+pub mod session;
 pub mod ssh;
 pub mod terminal;
 
@@ -40,6 +42,8 @@ pub use forward::{
     Socks5Proxy, parse_dynamic_forward, parse_local_forward, parse_remote_forward,
 };
 pub use ssh::{BootstrapHandle, BootstrapMode, SshConfig, bootstrap};
+pub use reconnectable::ReconnectableConnection;
+pub use session::{ConnectionState, SessionContext, TerminalSessionState};
 pub use terminal::{RawModeGuard, StdinReader, StdoutWriter, get_terminal_size, restore_terminal};
 
 #[cfg(feature = "standalone")]

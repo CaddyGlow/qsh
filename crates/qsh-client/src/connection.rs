@@ -17,7 +17,8 @@ use tracing::{debug, info};
 use qsh_core::constants::DEFAULT_MAX_FORWARDS;
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
-    Capabilities, HelloPayload, Message, ResizePayload, ShutdownPayload, ShutdownReason, TermSize,
+    Capabilities, HelloPayload, Message, ResizePayload, SessionId, ShutdownPayload, ShutdownReason,
+    TermSize,
 };
 use qsh_core::transport::{
     Connection, QuicConnection, QuicSender, QuicStream, StreamPair, client_crypto_config,
@@ -253,7 +254,7 @@ use qsh_core::protocol::{
     ChannelAcceptData, ChannelAcceptPayload, ChannelClosePayload, ChannelCloseReason, ChannelId,
     ChannelOpenPayload, ChannelParams, ChannelRejectCode, ChannelRejectPayload, DirectTcpIpParams,
     DynamicForwardParams, FileTransferParams, ForwardedTcpIpParams, GlobalReplyData,
-    GlobalReplyResult, GlobalRequest, GlobalRequestPayload, SessionId, TerminalParams,
+    GlobalReplyResult, GlobalRequest, GlobalRequestPayload, TerminalParams,
 };
 use qsh_core::transport::StreamType;
 use tokio::net::TcpStream;
@@ -319,7 +320,32 @@ impl ChannelConnection {
 
     /// Complete the qsh protocol handshake on an existing QUIC connection.
     pub async fn from_quic(conn: quinn::Connection, config: ConnectionConfig) -> Result<Self> {
-        info!("QUIC connection established (channel model)");
+        Self::from_quic_with_resume(conn, config, None).await
+    }
+
+    /// Reconnect to an existing session using the session ID.
+    ///
+    /// This is used for transparent reconnection after network interruption.
+    /// The server will resume the existing session if it's still valid.
+    pub async fn reconnect(
+        config: ConnectionConfig,
+        session_id: SessionId,
+    ) -> Result<Self> {
+        info!(addr = %config.server_addr, ?session_id, "Reconnecting (channel model)");
+        let conn = connect_quic(&config).await?;
+        Self::from_quic_with_resume(conn, config, Some(session_id)).await
+    }
+
+    /// Complete the qsh protocol handshake with optional session resumption.
+    async fn from_quic_with_resume(
+        conn: quinn::Connection,
+        config: ConnectionConfig,
+        resume_session: Option<SessionId>,
+    ) -> Result<Self> {
+        info!(
+            resume = resume_session.is_some(),
+            "QUIC connection established (channel model)"
+        );
         let quic = Arc::new(QuicConnection::new(conn));
 
         // Open control stream
@@ -341,11 +367,14 @@ impl ChannelConnection {
                 max_forwards: DEFAULT_MAX_FORWARDS,
                 tunnel: false,
             },
-            resume_session: None,
+            resume_session,
         };
 
         control.send(&Message::Hello(hello)).await?;
-        debug!("Sent Hello (channel model)");
+        debug!(
+            resume = resume_session.is_some(),
+            "Sent Hello (channel model)"
+        );
 
         // Wait for HelloAck
         let hello_ack = match control.recv().await? {
