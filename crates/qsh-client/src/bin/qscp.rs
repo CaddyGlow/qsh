@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
-use qsh_client::{ChannelConnection, CpCli, FileChannel, FilePath};
+use qsh_client::{random_local_port, ChannelConnection, CpCli, FileChannel, FilePath};
 
 #[cfg(not(feature = "standalone"))]
 use qsh_client::{BootstrapMode, SshConfig, bootstrap};
@@ -1100,6 +1100,7 @@ async fn connect(
         keep_alive_interval: Some(std::time::Duration::from_millis(500)),
         max_idle_timeout: std::time::Duration::from_secs(15),
         session_data: None,
+        local_port: Some(random_local_port()),
     };
 
     info!(addr = %config.server_addr, "Connecting to server");
@@ -1180,6 +1181,7 @@ async fn connect(
         keep_alive_interval: Some(std::time::Duration::from_millis(500)),
         max_idle_timeout: std::time::Duration::from_secs(15),
         session_data: None,
+        local_port: Some(random_local_port()),
     };
 
     // Connect using the channel model

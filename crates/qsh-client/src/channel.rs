@@ -18,6 +18,7 @@ use qsh_core::protocol::{
     TerminalOutputData,
 };
 use qsh_core::terminal::TerminalState;
+use qsh_core::timing::{timestamp16, TIMESTAMP_NONE};
 use qsh_core::transport::{QuicSender, QuicStream, StreamPair};
 
 use crate::prediction::PredictionEngine;
@@ -162,6 +163,8 @@ impl TerminalChannel {
                 sequence: seq,
                 data: data.to_vec(),
                 predictable,
+                timestamp: timestamp16(),
+                timestamp_reply: TIMESTAMP_NONE,
             }),
         });
 
@@ -186,6 +189,8 @@ impl TerminalChannel {
                 sequence: seq,
                 data: data.to_vec(),
                 predictable,
+                timestamp: timestamp16(),
+                timestamp_reply: TIMESTAMP_NONE,
             }),
         });
 

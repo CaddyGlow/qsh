@@ -47,15 +47,15 @@ pub struct Cli {
     #[arg(short = 'b', long = "bind", default_value = "0.0.0.0")]
     pub bind_addr: IpAddr,
 
-    /// Port to listen on (0 = auto-select from range 4500-4600 in bootstrap mode)
+    /// Port to listen on (0 = auto-select from Mosh port range in bootstrap mode)
     #[arg(short = 'p', long = "port", default_value = "4433")]
     pub port: u16,
 
-    /// Port range to use in bootstrap mode (START-END, inclusive)
+    /// Port range to use in bootstrap mode (START-END, inclusive, Mosh-style)
     #[arg(
         long = "port-range",
         value_parser = parse_port_range,
-        default_value = "4500-4600",
+        default_value = "60001-60999",
         value_name = "START-END"
     )]
     pub port_range: (u16, u16),

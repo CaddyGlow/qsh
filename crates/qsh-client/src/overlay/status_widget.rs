@@ -2,6 +2,7 @@
 //!
 //! Displays connection status, RTT, and other metrics.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// Position of the status overlay.
@@ -31,16 +32,39 @@ pub enum ConnectionStatus {
     Disconnected,
 }
 
+/// Rolling window duration for packet loss and RTT calculation.
+const METRICS_WINDOW: Duration = Duration::from_secs(30);
+
+/// Maximum samples to keep in rolling window (one per second for 30s).
+const METRICS_MAX_SAMPLES: usize = 60;
+
+/// A sample of packet counts for rolling window loss calculation.
+#[derive(Debug, Clone, Copy)]
+struct PacketSample {
+    timestamp: Instant,
+    sent: u64,
+    lost: u64,
+}
+
+/// A sample of RTT for rolling window minimum calculation.
+#[derive(Debug, Clone, Copy)]
+struct RttSample {
+    timestamp: Instant,
+    rtt: Duration,
+}
+
 /// Connection metrics for display.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectionMetrics {
-    /// Current RTT.
+    /// Current RTT (latest sample).
     pub rtt: Option<Duration>,
+    /// Rolling minimum RTT over 30s window.
+    pub rtt_min: Option<Duration>,
     /// Smoothed RTT estimate.
     pub rtt_smoothed: Option<Duration>,
     /// RTT jitter/variance.
     pub jitter: Option<Duration>,
-    /// Estimated packet loss percentage.
+    /// Estimated packet loss percentage (rolling 30s window).
     pub packet_loss: Option<f64>,
     /// Total bytes sent.
     pub bytes_sent: u64,
@@ -54,6 +78,10 @@ pub struct ConnectionMetrics {
     pub last_heard: Option<Instant>,
     /// Time of last successful internal keepalive (if tracked separately from data).
     pub last_keepalive: Option<Instant>,
+    /// Rolling window of packet samples for loss calculation.
+    packet_samples: VecDeque<PacketSample>,
+    /// Rolling window of RTT samples for minimum calculation.
+    rtt_samples: VecDeque<RttSample>,
 }
 
 impl ConnectionMetrics {
@@ -61,18 +89,55 @@ impl ConnectionMetrics {
     pub fn new() -> Self {
         Self {
             session_start: Some(Instant::now()),
+            packet_samples: VecDeque::with_capacity(METRICS_MAX_SAMPLES),
+            rtt_samples: VecDeque::with_capacity(METRICS_MAX_SAMPLES),
             ..Default::default()
         }
     }
 
     /// Update RTT with new sample.
     ///
-    /// Note: When using Quinn's `conn.rtt()`, the value is already smoothed
-    /// by QUIC's internal RTT estimator, so we store it directly.
+    /// Tracks samples in a rolling 30s window and computes:
+    /// - `rtt`: Latest sample
+    /// - `rtt_min`: Minimum over the window (reflects true network latency)
+    /// - `rtt_smoothed`: Latest sample (QUIC already smooths)
+    /// - `jitter`: Variation between samples
     pub fn update_rtt(&mut self, sample: Duration) {
+        let now = Instant::now();
         let prev = self.rtt_smoothed.unwrap_or(sample);
+
         self.rtt = Some(sample);
         self.rtt_smoothed = Some(sample);
+
+        // Add sample to rolling window
+        self.rtt_samples.push_back(RttSample {
+            timestamp: now,
+            rtt: sample,
+        });
+
+        // Prune samples older than the window
+        while let Some(front) = self.rtt_samples.front() {
+            if now.duration_since(front.timestamp) > METRICS_WINDOW {
+                self.rtt_samples.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        // Limit buffer size
+        while self.rtt_samples.len() > METRICS_MAX_SAMPLES {
+            self.rtt_samples.pop_front();
+        }
+
+        // Compute 10th percentile RTT (filters out retransmission-inflated samples
+        // while still reflecting current network conditions)
+        if !self.rtt_samples.is_empty() {
+            let mut rtts: Vec<Duration> = self.rtt_samples.iter().map(|s| s.rtt).collect();
+            rtts.sort();
+            // 10th percentile index (at least index 0)
+            let p10_idx = (rtts.len() as f64 * 0.1).floor() as usize;
+            self.rtt_min = Some(rtts[p10_idx]);
+        }
 
         // Jitter: difference from previous sample
         let diff = Duration::from_nanos(sample.as_nanos().abs_diff(prev.as_nanos()) as u64);
@@ -102,7 +167,57 @@ impl ConnectionMetrics {
         self.reconnect_count = self.reconnect_count.saturating_add(1);
     }
 
-    /// Update packet loss ratio (0.0 - 1.0).
+    /// Update packet loss using cumulative packet counts.
+    ///
+    /// Calculates loss over a rolling 30-second window by comparing
+    /// current counts to counts from 30 seconds ago.
+    ///
+    /// # Arguments
+    /// * `sent` - Total packets sent (cumulative)
+    /// * `lost` - Total packets lost (cumulative)
+    pub fn update_packet_counts(&mut self, sent: u64, lost: u64) {
+        let now = Instant::now();
+
+        // Add new sample
+        self.packet_samples.push_back(PacketSample {
+            timestamp: now,
+            sent,
+            lost,
+        });
+
+        // Prune samples older than the window
+        while let Some(front) = self.packet_samples.front() {
+            if now.duration_since(front.timestamp) > METRICS_WINDOW {
+                self.packet_samples.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        // Limit buffer size
+        while self.packet_samples.len() > METRICS_MAX_SAMPLES {
+            self.packet_samples.pop_front();
+        }
+
+        // Calculate rolling loss from oldest to newest sample
+        if let (Some(oldest), Some(newest)) = (
+            self.packet_samples.front(),
+            self.packet_samples.back(),
+        ) {
+            let sent_delta = newest.sent.saturating_sub(oldest.sent);
+            let lost_delta = newest.lost.saturating_sub(oldest.lost);
+
+            if sent_delta > 0 {
+                let loss = (lost_delta as f64 / sent_delta as f64).clamp(0.0, 1.0);
+                self.packet_loss = Some(loss);
+            }
+        }
+    }
+
+    /// Update packet loss ratio directly (0.0 - 1.0).
+    ///
+    /// Prefer `update_packet_counts()` for rolling window calculation.
+    /// This method is kept for backward compatibility.
     pub fn update_packet_loss(&mut self, loss: f64) {
         self.packet_loss = Some(loss.clamp(0.0, 1.0));
     }
@@ -302,9 +417,11 @@ impl StatusOverlay {
 
         // Build status bar content
         let user_host = self.user_host.as_deref().unwrap_or("?");
+        // Use rolling minimum RTT (true network latency without retransmission delays)
         let rtt_str = self
             .metrics
-            .rtt_smoothed
+            .rtt_min
+            .or(self.metrics.rtt_smoothed) // fallback if no min yet
             .map(|d| format!("{}ms", d.as_millis()))
             .unwrap_or_else(|| "-".to_string());
         let loss_str = self
@@ -387,7 +504,8 @@ impl StatusOverlay {
 
         let rtt_str = self
             .metrics
-            .rtt_smoothed
+            .rtt_min
+            .or(self.metrics.rtt_smoothed)
             .map(|d| format!("{}ms", d.as_millis()))
             .unwrap_or_else(|| "?".to_string());
 
@@ -610,5 +728,57 @@ mod tests {
         let status_part = parts.last().unwrap_or(&"");
         assert!(status_part.contains('s')); // uses keepalive-based elapsed (~1.5s)
         assert!(!status_part.contains("30s")); // should pick most recent signal
+    }
+
+    #[test]
+    fn metrics_rolling_packet_loss() {
+        let mut metrics = ConnectionMetrics::new();
+
+        // Initial state - no loss data
+        assert!(metrics.packet_loss.is_none());
+
+        // First sample: 100 sent, 0 lost
+        metrics.update_packet_counts(100, 0);
+        // Need at least 2 samples for delta calculation
+        assert!(metrics.packet_loss.is_none() || metrics.packet_loss == Some(0.0));
+
+        // Second sample: 200 sent, 10 lost (10% loss in this window)
+        metrics.update_packet_counts(200, 10);
+        assert!(metrics.packet_loss.is_some());
+        let loss = metrics.packet_loss.unwrap();
+        assert!((loss - 0.10).abs() < 0.01, "Expected ~10% loss, got {}", loss);
+
+        // Third sample: 300 sent, 10 lost (0% loss in this window)
+        metrics.update_packet_counts(300, 10);
+        let loss = metrics.packet_loss.unwrap();
+        // Delta: 100 sent, 0 lost -> 0% loss in latest window
+        // But overall window still includes older samples
+        assert!(loss <= 0.10);
+    }
+
+    #[test]
+    fn metrics_rolling_loss_no_packets() {
+        let mut metrics = ConnectionMetrics::new();
+
+        // No packets sent - should not panic or produce NaN
+        metrics.update_packet_counts(0, 0);
+        metrics.update_packet_counts(0, 0);
+        assert!(
+            metrics.packet_loss.is_none() || metrics.packet_loss == Some(0.0),
+            "Loss should be None or 0 when no packets sent"
+        );
+    }
+
+    #[test]
+    fn metrics_rolling_loss_clamped() {
+        let mut metrics = ConnectionMetrics::new();
+
+        // Edge case: more lost than sent (shouldn't happen, but handle gracefully)
+        metrics.update_packet_counts(100, 0);
+        metrics.update_packet_counts(200, 150); // 50 lost out of 100 delta = 50%
+
+        let loss = metrics.packet_loss.unwrap();
+        assert!(loss <= 1.0, "Loss should be clamped to 1.0");
+        assert!(loss >= 0.0, "Loss should be non-negative");
     }
 }

@@ -11,12 +11,13 @@
 //!   - Terminal: last_input_seq / last_generation
 //!   - File: offset tracking
 //!   - Forward: TCP retransmit
-//! - Exponential backoff with jitter
+//! - Mosh-style constant retry (RTT/2 delay, no exponential backoff)
 //! - Retry until server rejects (expired/auth) or user cancels
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use rand::Rng;
 use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 
@@ -26,6 +27,13 @@ use qsh_core::session::ReconnectionHandler;
 
 use crate::connection::ChannelConnection;
 use crate::session::{ConnectionState, SessionContext};
+
+/// Mosh-style port hopping constants.
+/// Mosh hops every 10s without response; we hop after this many failed attempts.
+const PORT_HOP_AFTER_FAILURES: u32 = 5;
+/// Port range for hopping (same as Mosh: 60001-60999).
+const PORT_RANGE_LOW: u16 = 60001;
+const PORT_RANGE_HIGH: u16 = 60999;
 
 /// Reconnectable connection wrapper.
 ///
@@ -45,6 +53,8 @@ pub struct ReconnectableConnection {
     reconnect_handler: RwLock<ReconnectionHandler>,
     /// Cached session data for 0-RTT resumption.
     session_data: RwLock<Option<Vec<u8>>>,
+    /// Last known RTT before disconnect (for Mosh-style retry delay).
+    last_rtt: RwLock<Option<Duration>>,
 }
 
 // Helper to read from std RwLock without panicking on poison
@@ -66,6 +76,7 @@ impl ReconnectableConnection {
             state_changed: Notify::new(),
             reconnect_handler: RwLock::new(ReconnectionHandler::new()),
             session_data: RwLock::new(None),
+            last_rtt: RwLock::new(None),
         }
     }
 
@@ -158,6 +169,15 @@ impl ReconnectableConnection {
             *state = ConnectionState::Reconnecting;
         }
 
+        // Store last RTT before clearing connection (for Mosh-style retry delay)
+        {
+            if let Some(conn) = read_lock(&self.inner).as_ref() {
+                let rtt = conn.rtt().await;
+                *write_lock(&self.last_rtt) = Some(rtt);
+                debug!(rtt_ms = rtt.as_millis(), "Stored RTT for reconnection delay");
+            }
+        }
+
         // Clear current connection
         {
             let mut inner = write_lock(&self.inner);
@@ -182,6 +202,10 @@ impl ReconnectableConnection {
 
     /// Perform the reconnection loop.
     async fn do_reconnect(&self) {
+        // Track consecutive failures for port hopping (Mosh-style)
+        let mut consecutive_failures: u32 = 0;
+        let mut current_local_port: Option<u16> = None;
+
         loop {
             // Check if we should retry
             let should_retry = {
@@ -197,10 +221,11 @@ impl ReconnectableConnection {
                 return;
             }
 
-            // Get delay and increment attempt counter
+            // Get delay and increment attempt counter (Mosh-style: RTT/2)
             let delay = {
+                let rtt = read_lock(&self.last_rtt).clone();
                 let mut handler = write_lock(&self.reconnect_handler);
-                handler.next_delay()
+                handler.next_delay(rtt)
             };
 
             let attempt = {
@@ -208,7 +233,13 @@ impl ReconnectableConnection {
                 handler.attempt()
             };
 
-            debug!(attempt, delay_ms = delay.as_millis(), "Reconnection attempt");
+            debug!(
+                attempt,
+                delay_ms = delay.as_millis(),
+                consecutive_failures,
+                local_port = ?current_local_port,
+                "Reconnection attempt"
+            );
 
             // Wait for backoff delay
             tokio::time::sleep(delay).await;
@@ -223,6 +254,9 @@ impl ReconnectableConnection {
             config.session_data = read_lock(&self.session_data).clone();
             let had_session_data = config.session_data.is_some();
 
+            // Apply port hopping if needed (Mosh-style)
+            config.local_port = current_local_port;
+
             let result = if let Some(sid) = session_id {
                 ChannelConnection::reconnect(config, sid).await
             } else {
@@ -235,13 +269,30 @@ impl ReconnectableConnection {
                 Ok(conn) => {
                     // Check if 0-RTT was used
                     let is_resumed = conn.quic().is_resumed().await;
-                    info!(
-                        attempt,
-                        session_id = ?conn.session_id(),
-                        resumed_0rtt = is_resumed,
-                        had_session_data,
-                        "Reconnection successful"
-                    );
+                    if is_resumed {
+                        info!(
+                            attempt,
+                            session_id = ?conn.session_id(),
+                            local_port = ?current_local_port,
+                            "Reconnection successful (0-RTT)"
+                        );
+                    } else if had_session_data {
+                        // We had session data but didn't get 0-RTT - something's wrong
+                        warn!(
+                            attempt,
+                            session_id = ?conn.session_id(),
+                            local_port = ?current_local_port,
+                            "Reconnection successful but 0-RTT failed (had session data)"
+                        );
+                    } else {
+                        // No session data - expected 1-RTT
+                        info!(
+                            attempt,
+                            session_id = ?conn.session_id(),
+                            local_port = ?current_local_port,
+                            "Reconnection successful (1-RTT, no session data cached)"
+                        );
+                    }
 
                     // Update context with new session ID
                     {
@@ -285,7 +336,26 @@ impl ReconnectableConnection {
                     return;
                 }
                 Err(e) => {
-                    warn!(attempt, error = %e, "Reconnection attempt failed");
+                    consecutive_failures += 1;
+                    warn!(
+                        attempt,
+                        consecutive_failures,
+                        error = %e,
+                        "Reconnection attempt failed"
+                    );
+
+                    // Mosh-style port hopping: try a new local port after repeated failures
+                    if consecutive_failures >= PORT_HOP_AFTER_FAILURES {
+                        let new_port =
+                            rand::thread_rng().gen_range(PORT_RANGE_LOW..=PORT_RANGE_HIGH);
+                        info!(
+                            new_port,
+                            consecutive_failures,
+                            "Port hopping: trying new local port"
+                        );
+                        current_local_port = Some(new_port);
+                        consecutive_failures = 0;
+                    }
                     // Continue loop to retry
                 }
             }
@@ -295,8 +365,13 @@ impl ReconnectableConnection {
     /// Get the current RTT (if connected).
     pub async fn rtt(&self) -> Option<Duration> {
         match read_lock(&self.inner).as_ref() {
-            Some(c) => Some(c.rtt().await),
-            None => None,
+            Some(c) => {
+                let rtt = c.rtt().await;
+                // Cache RTT for reconnection delay calculation
+                *write_lock(&self.last_rtt) = Some(rtt);
+                Some(rtt)
+            }
+            None => read_lock(&self.last_rtt).clone(),
         }
     }
 

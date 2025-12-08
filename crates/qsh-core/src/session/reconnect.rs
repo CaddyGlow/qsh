@@ -2,7 +2,7 @@
 //!
 //! Provides reconnection logic including:
 //! - Reconnection state machine
-//! - Exponential backoff
+//! - Mosh-style constant retry (RTT/2 delay, no exponential backoff)
 //! - State recovery negotiation
 //! - Input replay
 
@@ -33,6 +33,11 @@ pub enum ReconnectResult {
     Rejected { reason: String },
 }
 
+/// Mosh-style retry constants (from mosh/src/network/network.cc).
+const MIN_RETRY_DELAY_MS: u64 = 50; // Mosh MIN_RTO
+const MAX_RETRY_DELAY_MS: u64 = 250; // Mosh sends at SRTT/2, clamped to SEND_INTERVAL_MAX
+const DEFAULT_RETRY_DELAY_MS: u64 = 50; // When RTT unknown, use MIN_RTO (aggressive like Mosh)
+
 /// Reconnection handler state machine.
 #[derive(Debug)]
 pub struct ReconnectionHandler {
@@ -40,10 +45,8 @@ pub struct ReconnectionHandler {
     max_attempts: u32,
     /// Current attempt number (1-indexed).
     current_attempt: u32,
-    /// Base delay for exponential backoff.
-    base_delay: Duration,
-    /// Maximum delay cap.
-    max_delay: Duration,
+    /// Default delay when RTT is unknown (Mosh-style constant, not exponential).
+    default_delay: Duration,
     /// When reconnection process started.
     started_at: Option<Instant>,
     /// Whether we have a 0-RTT session ticket.
@@ -64,12 +67,12 @@ impl ReconnectionHandler {
     /// Create a new reconnection handler with default settings.
     ///
     /// Like mosh, retries indefinitely until server session expires or user cancels.
+    /// Uses constant retry delay (RTT/2) instead of exponential backoff.
     pub fn new() -> Self {
         Self {
             max_attempts: u32::MAX, // Retry forever like mosh
             current_attempt: 0,
-            base_delay: Duration::from_millis(100),
-            max_delay: Duration::from_secs(10),
+            default_delay: Duration::from_millis(DEFAULT_RETRY_DELAY_MS),
             started_at: None,
             has_session_ticket: false,
             last_generation: 0,
@@ -78,12 +81,11 @@ impl ReconnectionHandler {
     }
 
     /// Create a handler with custom settings.
-    pub fn with_config(max_attempts: u32, base_delay: Duration, max_delay: Duration) -> Self {
+    pub fn with_config(max_attempts: u32, default_delay: Duration) -> Self {
         Self {
             max_attempts,
             current_attempt: 0,
-            base_delay,
-            max_delay,
+            default_delay,
             started_at: None,
             has_session_ticket: false,
             last_generation: 0,
@@ -111,23 +113,40 @@ impl ReconnectionHandler {
     }
 
     /// Get the delay before the next reconnection attempt.
-    pub fn next_delay(&mut self) -> Duration {
+    ///
+    /// Uses Mosh-style constant retry: RTT/2 (or default 100ms), clamped to [50ms, 250ms].
+    /// This is fundamentally different from TCP's exponential backoff because:
+    /// - State synchronization is idempotent (only latest state matters)
+    /// - We want fast recovery, not congestion avoidance
+    /// - The server-side session stays alive regardless of retry rate
+    pub fn next_delay(&mut self, rtt: Option<Duration>) -> Duration {
         self.current_attempt += 1;
 
-        // Exponential backoff: base_delay * 2^(attempt-1)
-        let multiplier = 2u64.saturating_pow(self.current_attempt.saturating_sub(1));
-        let delay = self.base_delay.saturating_mul(multiplier as u32);
-
-        // Add jitter (up to 25% of delay)
-        let jitter_range = delay.as_millis() as u64 / 4;
-        let jitter = if jitter_range > 0 {
-            // Simple deterministic "jitter" based on attempt count
-            Duration::from_millis((self.current_attempt as u64 * 17) % jitter_range.max(1))
-        } else {
-            Duration::ZERO
+        // Mosh-style: use RTT/2 if known, otherwise default
+        let base = match rtt {
+            Some(rtt) => rtt / 2,
+            None => self.default_delay,
         };
 
-        (delay + jitter).min(self.max_delay)
+        // Clamp to Mosh's bounds: MIN_RTO (50ms) to SEND_INTERVAL_MAX (250ms)
+        let base_ms = base.as_millis() as u64;
+        let clamped_ms = base_ms.clamp(MIN_RETRY_DELAY_MS, MAX_RETRY_DELAY_MS);
+
+        // Add jitter (up to 25% of delay) to prevent thundering herd
+        let jitter_range = clamped_ms / 4;
+        let jitter_ms = if jitter_range > 0 {
+            // Simple deterministic "jitter" based on attempt count
+            (self.current_attempt as u64 * 17) % jitter_range.max(1)
+        } else {
+            0
+        };
+
+        Duration::from_millis(clamped_ms + jitter_ms)
+    }
+
+    /// Get the delay before the next reconnection attempt (without RTT info).
+    pub fn next_delay_default(&mut self) -> Duration {
+        self.next_delay(None)
     }
 
     /// Get the current attempt number.
@@ -288,63 +307,59 @@ mod tests {
     }
 
     #[test]
-    fn handler_exponential_backoff() {
-        let mut handler = ReconnectionHandler::with_config(
-            10,
-            Duration::from_millis(100),
-            Duration::from_secs(5),
-        );
+    fn handler_mosh_style_constant_delay() {
+        let mut handler = ReconnectionHandler::with_config(10, Duration::from_millis(50));
 
         handler.start(0, 0, false);
 
-        // First delay should be ~100ms
-        let d1 = handler.next_delay();
-        assert!(d1 >= Duration::from_millis(100));
-        assert!(d1 < Duration::from_millis(200));
+        // Without RTT: all delays should be constant ~50ms (MIN_RTO, with jitter)
+        let d1 = handler.next_delay(None);
+        assert!(d1 >= Duration::from_millis(50));
+        assert!(d1 <= Duration::from_millis(63)); // 50 + 25% jitter max
 
-        // Second delay should be ~200ms
-        let d2 = handler.next_delay();
-        assert!(d2 >= Duration::from_millis(200));
-        assert!(d2 < Duration::from_millis(400));
+        let d2 = handler.next_delay(None);
+        assert!(d2 >= Duration::from_millis(50));
+        assert!(d2 <= Duration::from_millis(63));
 
-        // Third delay should be ~400ms
-        let d3 = handler.next_delay();
-        assert!(d3 >= Duration::from_millis(400));
-        assert!(d3 < Duration::from_millis(800));
+        // No exponential increase - delays stay constant
+        let d3 = handler.next_delay(None);
+        assert!(d3 >= Duration::from_millis(50));
+        assert!(d3 <= Duration::from_millis(63));
     }
 
     #[test]
-    fn handler_max_delay_cap() {
-        let mut handler = ReconnectionHandler::with_config(
-            20,
-            Duration::from_millis(100),
-            Duration::from_secs(1),
-        );
-
+    fn handler_rtt_based_delay() {
+        let mut handler = ReconnectionHandler::new();
         handler.start(0, 0, false);
 
-        // Exhaust backoff to hit cap
-        for _ in 0..15 {
-            handler.next_delay();
-        }
+        // With 200ms RTT: delay should be RTT/2 = 100ms
+        let d1 = handler.next_delay(Some(Duration::from_millis(200)));
+        assert!(d1 >= Duration::from_millis(100));
+        assert!(d1 <= Duration::from_millis(125));
 
-        let d = handler.next_delay();
-        assert!(d <= Duration::from_secs(1));
+        // With 20ms RTT: delay should be clamped to MIN (50ms)
+        let d2 = handler.next_delay(Some(Duration::from_millis(20)));
+        assert!(d2 >= Duration::from_millis(50));
+        assert!(d2 <= Duration::from_millis(63)); // 50 + 25% jitter
+
+        // With 1000ms RTT: delay should be clamped to MAX (250ms)
+        let d3 = handler.next_delay(Some(Duration::from_millis(1000)));
+        assert!(d3 >= Duration::from_millis(250));
+        assert!(d3 <= Duration::from_millis(313)); // 250 + 25% jitter
     }
 
     #[test]
     fn handler_max_attempts() {
-        let mut handler =
-            ReconnectionHandler::with_config(3, Duration::from_millis(10), Duration::from_secs(1));
+        let mut handler = ReconnectionHandler::with_config(3, Duration::from_millis(50));
 
         handler.start(0, 0, false);
 
         assert!(handler.should_retry());
-        handler.next_delay();
+        handler.next_delay(None);
         assert!(handler.should_retry());
-        handler.next_delay();
+        handler.next_delay(None);
         assert!(handler.should_retry());
-        handler.next_delay();
+        handler.next_delay(None);
         assert!(!handler.should_retry()); // Max attempts reached
     }
 
@@ -352,8 +367,8 @@ mod tests {
     fn handler_reset() {
         let mut handler = ReconnectionHandler::new();
         handler.start(0, 0, false);
-        handler.next_delay();
-        handler.next_delay();
+        handler.next_delay(None);
+        handler.next_delay(None);
 
         assert_eq!(handler.attempt(), 2);
 

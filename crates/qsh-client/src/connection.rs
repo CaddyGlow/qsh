@@ -11,8 +11,23 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use rand::Rng;
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
+
+// ============================================================================
+// Mosh-style Port Range (from mosh/src/network/network.cc)
+// ============================================================================
+
+/// Mosh-style local port range for client connections.
+/// Using the same range as Mosh ensures NAT/firewall compatibility.
+pub const LOCAL_PORT_RANGE_LOW: u16 = 60001;
+pub const LOCAL_PORT_RANGE_HIGH: u16 = 60999;
+
+/// Generate a random local port in the Mosh range.
+pub fn random_local_port() -> u16 {
+    rand::thread_rng().gen_range(LOCAL_PORT_RANGE_LOW..=LOCAL_PORT_RANGE_HIGH)
+}
 
 use qsh_core::constants::DEFAULT_MAX_FORWARDS;
 use qsh_core::error::{Error, Result};
@@ -148,6 +163,168 @@ impl std::fmt::Display for LatencyStats {
     }
 }
 
+// ============================================================================
+// Heartbeat Tracker (Mosh-style RTT)
+// ============================================================================
+
+/// Mosh-style heartbeat tracker for RTT measurement.
+///
+/// Uses Jacobson/Karamcheti algorithm (RFC 6298) for SRTT calculation.
+#[derive(Debug)]
+pub struct HeartbeatTracker {
+    /// Smoothed RTT in milliseconds.
+    srtt: f64,
+    /// RTT variance.
+    rttvar: f64,
+    /// Whether we've received at least one RTT sample.
+    hit: bool,
+    /// Pending heartbeat: (sequence, sent_at)
+    pending: Option<(u16, Instant)>,
+    /// Last received timestamp from peer.
+    last_peer_timestamp: Option<u16>,
+    /// When we received the last peer timestamp.
+    last_peer_received_at: Option<Instant>,
+}
+
+impl HeartbeatTracker {
+    /// Initial SRTT before any measurements (ms).
+    const INITIAL_SRTT: f64 = 1000.0;
+    /// Initial RTTVAR before any measurements (ms).
+    const INITIAL_RTTVAR: f64 = 500.0;
+    /// Alpha for SRTT smoothing (1/8, same as mosh).
+    const ALPHA: f64 = 0.125;
+    /// Beta for RTTVAR smoothing (1/4).
+    const BETA: f64 = 0.25;
+    /// Minimum RTO in ms.
+    pub const MIN_RTO: f64 = 50.0;
+    /// Maximum RTO in ms.
+    pub const MAX_RTO: f64 = 1000.0;
+
+    /// Create a new heartbeat tracker.
+    pub fn new() -> Self {
+        Self {
+            srtt: Self::INITIAL_SRTT,
+            rttvar: Self::INITIAL_RTTVAR,
+            hit: false,
+            pending: None,
+            last_peer_timestamp: None,
+            last_peer_received_at: None,
+        }
+    }
+
+    /// Get current timestamp (ms mod 65536) like mosh.
+    pub fn timestamp16() -> u16 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| (d.as_millis() % 65536) as u16)
+            .unwrap_or(0)
+    }
+
+    /// Calculate difference between two 16-bit timestamps, handling wrap.
+    fn timestamp_diff(a: u16, b: u16) -> i32 {
+        let diff = a.wrapping_sub(b) as i16;
+        diff as i32
+    }
+
+    /// Record sending a heartbeat. Returns the heartbeat to send.
+    pub fn send_heartbeat(&mut self) -> qsh_core::protocol::HeartbeatPayload {
+        let timestamp = Self::timestamp16();
+        self.pending = Some((timestamp, Instant::now()));
+
+        // Include reply if we have a recent peer timestamp
+        let timestamp_reply = if let (Some(peer_ts), Some(received_at)) =
+            (self.last_peer_timestamp, self.last_peer_received_at)
+        {
+            // Correct for hold time (how long we held it before sending)
+            let hold_ms = received_at.elapsed().as_millis() as u16;
+            peer_ts.wrapping_add(hold_ms)
+        } else {
+            u16::MAX // No reply yet
+        };
+
+        qsh_core::protocol::HeartbeatPayload {
+            timestamp,
+            timestamp_reply,
+        }
+    }
+
+    /// Process a received heartbeat. Returns the measured RTT if available.
+    pub fn receive_heartbeat(
+        &mut self,
+        payload: &qsh_core::protocol::HeartbeatPayload,
+    ) -> Option<Duration> {
+        // Store peer's timestamp for echoing back
+        self.last_peer_timestamp = Some(payload.timestamp);
+        self.last_peer_received_at = Some(Instant::now());
+
+        // If we have a pending heartbeat and this is a reply, calculate RTT
+        if payload.has_reply() {
+            if let Some((sent_ts, sent_at)) = self.pending.take() {
+                // Check if this reply is for our pending heartbeat
+                // (timestamp_reply should be close to sent_ts)
+                let diff = Self::timestamp_diff(payload.timestamp_reply, sent_ts).abs();
+                if diff < 5000 {
+                    // Use local timing for accuracy
+                    let rtt_ms = sent_at.elapsed().as_secs_f64() * 1000.0;
+
+                    // Ignore large values (> 5 seconds) - likely stale
+                    if rtt_ms < 5000.0 {
+                        self.update_srtt(rtt_ms);
+                        return Some(Duration::from_secs_f64(rtt_ms / 1000.0));
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Update SRTT with a new sample (Jacobson/Karamcheti algorithm, same as mosh).
+    fn update_srtt(&mut self, rtt: f64) {
+        if !self.hit {
+            // First measurement
+            self.srtt = rtt;
+            self.rttvar = rtt / 2.0;
+            self.hit = true;
+        } else {
+            // Subsequent measurements
+            self.rttvar = (1.0 - Self::BETA) * self.rttvar + Self::BETA * (self.srtt - rtt).abs();
+            self.srtt = (1.0 - Self::ALPHA) * self.srtt + Self::ALPHA * rtt;
+        }
+    }
+
+    /// Get the smoothed RTT.
+    pub fn srtt(&self) -> Option<Duration> {
+        if self.hit {
+            Some(Duration::from_secs_f64(self.srtt / 1000.0))
+        } else {
+            None
+        }
+    }
+
+    /// Get the smoothed RTT in milliseconds.
+    pub fn srtt_ms(&self) -> f64 {
+        self.srtt
+    }
+
+    /// Get the RTO (retransmission timeout).
+    pub fn rto(&self) -> Duration {
+        let rto = (self.srtt + 4.0 * self.rttvar).clamp(Self::MIN_RTO, Self::MAX_RTO);
+        Duration::from_secs_f64(rto / 1000.0)
+    }
+
+    /// Check if we have measured RTT at least once.
+    pub fn has_measurement(&self) -> bool {
+        self.hit
+    }
+}
+
+impl Default for HeartbeatTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Client connection configuration.
 #[derive(Debug, Clone)]
 pub struct ConnectionConfig {
@@ -179,6 +356,11 @@ pub struct ConnectionConfig {
     /// to enable 0-RTT fast reconnection. This is obtained by calling
     /// `QuicConnection::session_data()` after a successful connection.
     pub session_data: Option<Vec<u8>>,
+    /// Local port to bind (None = OS-assigned random port).
+    ///
+    /// Used for Mosh-style port hopping: if reconnection fails repeatedly,
+    /// try a new local port in case the old one is blocked by NAT/firewall.
+    pub local_port: Option<u16>,
 }
 
 impl Default for ConnectionConfig {
@@ -197,6 +379,8 @@ impl Default for ConnectionConfig {
             keep_alive_interval: Some(Duration::from_millis(500)),
             max_idle_timeout: Duration::from_secs(15),
             session_data: None,
+            // Mosh-style: use random port from 60001-60999 range
+            local_port: Some(random_local_port()),
         }
     }
 }
@@ -209,11 +393,15 @@ impl Default for ConnectionConfig {
 /// If `config.session_data` is provided, attempts 0-RTT session resumption
 /// for faster reconnection.
 pub async fn connect_quic(config: &ConnectionConfig) -> Result<QuicConnection> {
-    // Bind UDP socket
-    let bind_addr = if config.server_addr.is_ipv4() {
-        "0.0.0.0:0"
+    // Bind UDP socket (use specified port or OS-assigned random port)
+    let bind_addr: SocketAddr = if config.server_addr.is_ipv4() {
+        format!("0.0.0.0:{}", config.local_port.unwrap_or(0))
+            .parse()
+            .unwrap()
     } else {
-        "[::]:0"
+        format!("[::]:{}", config.local_port.unwrap_or(0))
+            .parse()
+            .unwrap()
     };
 
     let socket = UdpSocket::bind(bind_addr)

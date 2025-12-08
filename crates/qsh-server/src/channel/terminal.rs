@@ -16,6 +16,7 @@ use qsh_core::protocol::{
     TerminalOutputData, TerminalParams,
 };
 use qsh_core::terminal::{TerminalParser, TerminalState};
+use qsh_core::timing::{timestamp16, TIMESTAMP_NONE};
 use qsh_core::transport::{Connection, QuicConnection, QuicStream, StreamPair, StreamType};
 
 use crate::pty::{Pty, PtyRelay};

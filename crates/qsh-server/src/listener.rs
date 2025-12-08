@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use qsh_core::error::{Error, Result};
-use qsh_core::protocol::Message;
+use qsh_core::protocol::{HeartbeatPayload, Message};
 use qsh_core::transport::{enable_error_queue, server_config, Connection, QuicConnection};
 
 use crate::connection::{ConnectionConfig, ConnectionHandler};
@@ -547,6 +547,17 @@ async fn run_session_loop(
                     Ok(Message::StateAck(payload)) => {
                         if let Err(e) = handler_clone.handle_state_ack(payload).await {
                             warn!(error = %e, "Failed to handle StateAck");
+                        }
+                    }
+                    Ok(Message::Heartbeat(payload)) => {
+                        // Echo heartbeat immediately for RTT measurement
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| (d.as_millis() % 65536) as u16)
+                            .unwrap_or(0);
+                        let reply = Message::Heartbeat(HeartbeatPayload::reply(now_ms, payload.timestamp));
+                        if let Err(e) = handler_clone.send_control(&reply).await {
+                            warn!(error = %e, "Failed to send heartbeat reply");
                         }
                     }
                     Ok(Message::Shutdown(payload)) => {

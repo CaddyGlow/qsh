@@ -268,9 +268,11 @@ impl QuicheSender {
 // QuicheConnectionInner - Internal connection state
 // =============================================================================
 
-/// Keepalive interval - send pings at this interval to prevent idle timeout.
-/// Should be less than the idle timeout (typically 40-50% of idle timeout).
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
+/// Mosh-style keepalive constants.
+/// Like Mosh's SRTT/2 approach: adaptive to network conditions.
+const KEEPALIVE_MIN_INTERVAL: Duration = Duration::from_millis(50); // Mosh MIN_RTO
+const KEEPALIVE_MAX_INTERVAL: Duration = Duration::from_millis(500); // Max keepalive rate
+const KEEPALIVE_DEFAULT_INTERVAL: Duration = Duration::from_millis(500); // When RTT unknown
 
 /// Internal state for a quiche connection.
 pub struct QuicheConnectionInner {
@@ -456,14 +458,29 @@ impl QuicheConnectionInner {
     /// - Send periodic PING frames to keep the connection alive
     /// - If the peer stops responding, quiche's timeout mechanism detects it
     /// - The connection stays alive during normal user idle periods
+    /// - Keepalive interval adapts to RTT (like Mosh's SRTT/2 approach)
     pub async fn drive_io(&self) -> Result<()> {
         let mut buf = [0u8; 65535];
+
+        // Compute RTT-adaptive keepalive interval (Mosh-style: RTT/2)
+        let keepalive_interval = {
+            let conn = self.conn.lock().await;
+            let rtt = conn.path_stats().next().map(|p| p.rtt);
+            match rtt {
+                Some(rtt) => {
+                    // Mosh-style: RTT/2, clamped to [50ms, 500ms]
+                    let interval = rtt / 2;
+                    interval.clamp(KEEPALIVE_MIN_INTERVAL, KEEPALIVE_MAX_INTERVAL)
+                }
+                None => KEEPALIVE_DEFAULT_INTERVAL,
+            }
+        };
 
         // Check if we need to send a keepalive ping (mosh-style heartbeat)
         let should_send_keepalive = {
             let now = std::time::Instant::now();
             let last_keepalive = self.last_keepalive.lock().unwrap();
-            now.duration_since(*last_keepalive) >= KEEPALIVE_INTERVAL
+            now.duration_since(*last_keepalive) >= keepalive_interval
         };
 
         if should_send_keepalive {
@@ -631,7 +648,10 @@ impl QuicheConnectionInner {
         self.closed.load(Ordering::SeqCst)
     }
 
-    /// Get RTT estimate.
+    /// Get smoothed RTT estimate.
+    ///
+    /// Note: Under packet loss, SRTT can grow very large due to retransmissions.
+    /// Use `min_rtt()` for a cleaner measurement.
     pub async fn rtt(&self) -> Duration {
         let conn = self.conn.lock().await;
         // Use path_stats for RTT in newer quiche
@@ -640,6 +660,15 @@ impl QuicheConnectionInner {
         } else {
             Duration::from_millis(50) // Default fallback
         }
+    }
+
+    /// Get minimum observed RTT.
+    ///
+    /// This represents the best-case latency without retransmission delays.
+    /// Preferred for display as it shows the true network latency.
+    pub async fn min_rtt(&self) -> Option<Duration> {
+        let conn = self.conn.lock().await;
+        conn.path_stats().next().and_then(|p| p.min_rtt)
     }
 
     /// Get packet loss ratio.
@@ -798,9 +827,17 @@ impl QuicheConnection {
         self.inner.is_resumed().await
     }
 
-    /// Get async RTT estimate.
+    /// Get async RTT estimate (smoothed).
     pub async fn rtt_async(&self) -> Duration {
         self.inner.rtt().await
+    }
+
+    /// Get minimum observed RTT.
+    ///
+    /// This is the best-case latency without retransmission delays.
+    /// Preferred for display as it shows true network latency.
+    pub async fn min_rtt(&self) -> Option<Duration> {
+        self.inner.min_rtt().await
     }
 }
 
@@ -1046,7 +1083,7 @@ pub fn client_config(verify_peer: bool) -> Result<quiche::Config> {
     config.set_initial_max_stream_data_uni(1_000_000);
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(100);
-    config.set_disable_active_migration(true);
+    // Connection migration enabled (like Mosh's roaming support)
 
     if !verify_peer {
         config.verify_peer(false);
@@ -1149,7 +1186,7 @@ pub fn server_config_with_ticket_key(
     config.set_initial_max_stream_data_uni(1_000_000);
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(100);
-    config.set_disable_active_migration(true);
+    // Connection migration enabled (like Mosh's roaming support)
 
     Ok(config)
 }

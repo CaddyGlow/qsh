@@ -22,17 +22,18 @@ use qsh_client::render::StateRenderer;
 use qsh_core::terminal::TerminalParser;
 use qsh_client::{
     BootstrapMode, ChannelConnection, Cli, ConnectionConfig, ConnectionState, EscapeCommand,
-    EscapeHandler, EscapeResult, ForwarderHandle, LocalForwarder, ProxyHandle, RawModeGuard,
-    ReconnectableConnection, RemoteForwarder, RemoteForwarderHandle, SessionContext, Socks5Proxy,
-    SshConfig, StdinReader, StdoutWriter, TerminalSessionState, bootstrap, get_terminal_size,
-    parse_dynamic_forward, parse_escape_key, parse_local_forward, parse_remote_forward,
-    restore_terminal,
+    EscapeHandler, EscapeResult, ForwarderHandle, HeartbeatTracker, LocalForwarder, ProxyHandle,
+    RawModeGuard, ReconnectableConnection, RemoteForwarder, RemoteForwarderHandle, SessionContext,
+    Socks5Proxy, SshConfig, StdinReader, StdoutWriter, TerminalSessionState, bootstrap,
+    get_terminal_size, parse_dynamic_forward, parse_escape_key, parse_local_forward,
+    parse_remote_forward, random_local_port, restore_terminal,
 };
+use qsh_core::protocol::Message;
 
 #[cfg(feature = "standalone")]
 use qsh_client::standalone::authenticate as standalone_authenticate;
 #[cfg(feature = "standalone")]
-use qsh_client::{DirectAuthenticator, DirectConfig};
+use qsh_client::{connect_quic, DirectAuthenticator, DirectConfig};
 
 use qsh_core::protocol::TermSize;
 
@@ -167,9 +168,10 @@ async fn run_client_direct(cli: &Cli, host: &str, user: Option<&str>) -> qsh_cor
         keep_alive_interval: cli.keep_alive_interval(),
         max_idle_timeout: cli.max_idle_timeout(),
         session_data: None,
+        local_port: Some(random_local_port()),
     };
 
-    info!(addr = %conn_config.server_addr, "Connecting directly to server");
+    info!(addr = %conn_config.server_addr, local_port = ?conn_config.local_port, "Connecting directly to server");
     let quic_conn = connect_quic(&conn_config).await?;
 
     // Perform standalone authentication on a dedicated server-initiated stream.
@@ -240,6 +242,9 @@ async fn run_client_direct(cli: &Cli, host: &str, user: Option<&str>) -> qsh_cor
     // Create reconnectable connection wrapper
     let reconnectable = std::sync::Arc::new(ReconnectableConnection::new(conn, context));
 
+    // Cache session data for 0-RTT reconnection (critical for Mosh-style fast recovery)
+    reconnectable.store_session_data().await;
+
     // Run the channel session with reconnection support
     let user_host = format_user_host(user, host);
     run_reconnectable_session(reconnectable, cli, Some(user_host)).await
@@ -309,6 +314,7 @@ async fn run_client_channel_model(
         keep_alive_interval: cli.keep_alive_interval(),
         max_idle_timeout: cli.max_idle_timeout(),
         session_data: None,
+        local_port: Some(random_local_port()), // Mosh-style port range
     };
 
     // Connect using the channel model (no implicit terminal)
@@ -371,6 +377,9 @@ async fn run_client_channel_model(
 
     // Create reconnectable connection wrapper
     let reconnectable = std::sync::Arc::new(ReconnectableConnection::new(conn, context));
+
+    // Cache session data for 0-RTT reconnection (critical for Mosh-style fast recovery)
+    reconnectable.store_session_data().await;
 
     // Run the channel session with reconnection support
     let user_host = format_user_host(user, host);
@@ -692,9 +701,13 @@ async fn run_reconnectable_session(
         None
     };
 
-    // Overlay refresh interval
+    // Overlay refresh interval (for periodic RTT/stats updates)
     let mut overlay_refresh = tokio::time::interval(Duration::from_secs(2));
     overlay_refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    // Fast refresh interval for escape info bar (when showing stats)
+    let mut escape_info_refresh = tokio::time::interval(Duration::from_millis(250));
+    escape_info_refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     // Parse toggle key
     let toggle_key = parse_toggle_key(&cli.overlay_key);
@@ -837,7 +850,8 @@ async fn run_reconnectable_session(
         // Update notification engine for connected state
         notification.server_heard(std::time::Instant::now());
         notification.server_acked(std::time::Instant::now());
-        notification.update_rtt(initial_rtt);
+        // Don't set initial RTT from quiche - it reports idle timeout (30s) before samples.
+        // Wait for heartbeat SRTT samples to get accurate RTT measurements.
         notification.clear_network_error();
 
         // Clear reconnect error tracking
@@ -851,6 +865,11 @@ async fn run_reconnectable_session(
         // Frame rate tracking (for info display)
         let mut frame_count: u64 = 0;
         let frame_rate_start = std::time::Instant::now();
+
+        // Heartbeat tracking for RTT measurement (mosh-style but faster)
+        let mut heartbeat_tracker = HeartbeatTracker::new();
+        let mut heartbeat_timer = tokio::time::interval(Duration::from_millis(500));
+        heartbeat_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         // Initialize prediction engine with current RTT and cursor
         if prediction_enabled {
@@ -894,6 +913,38 @@ async fn run_reconnectable_session(
                     if let Ok(new_size) = get_terminal_size() {
                         debug!(cols = new_size.cols, rows = new_size.rows, "Terminal resized");
                         // TODO: Send resize message to server through channel
+                    }
+                }
+
+                // Send heartbeat for RTT measurement
+                _ = heartbeat_timer.tick() => {
+                    if let Some(conn) = reconnectable.connection() {
+                        let hb = heartbeat_tracker.send_heartbeat();
+                        if let Err(e) = conn.send_control(&Message::Heartbeat(hb)).await {
+                            debug!(error = %e, "Failed to send heartbeat");
+                        }
+                    }
+                }
+
+                // Handle control messages (including heartbeat replies)
+                result = async {
+                    if let Some(conn) = reconnectable.connection() {
+                        conn.recv_control().await.ok()
+                    } else {
+                        std::future::pending::<Option<Message>>().await
+                    }
+                } => {
+                    if let Some(msg) = result {
+                        match msg {
+                            Message::Heartbeat(hb) => {
+                                if let Some(rtt) = heartbeat_tracker.receive_heartbeat(&hb) {
+                                    debug!(rtt_ms = rtt.as_millis(), "Heartbeat RTT sample");
+                                }
+                            }
+                            other => {
+                                debug!(?other, "Received control message");
+                            }
+                        }
                     }
                 }
 
@@ -1148,15 +1199,28 @@ async fn run_reconnectable_session(
 
                 // Overlay refresh
                 _ = overlay_refresh.tick() => {
-                    if let Some(rtt) = reconnectable.rtt().await {
-                        overlay.metrics_mut().update_rtt(rtt);
-                        notification.update_rtt(rtt);
+                    // Use SRTT for everything (mosh-style)
+                    if let Some(srtt) = heartbeat_tracker.srtt() {
+                        notification.update_rtt(srtt);
+                        overlay.metrics_mut().update_rtt(srtt);
 
                         // Update prediction engine RTT for adaptive display
                         if prediction_enabled {
                             let mut prediction = terminal.prediction_mut().await;
-                            prediction.update_rtt(rtt);
+                            prediction.update_rtt(srtt);
                             prediction.check_glitches();
+                        }
+                    }
+
+                    // Update packet loss metric from QUIC stats (rolling 30s window)
+                    if let Some(conn) = reconnectable.connection() {
+                        let sent = conn.quic().packets_sent().await;
+                        let lost = conn.quic().packets_lost().await;
+                        overlay.metrics_mut().update_packet_counts(sent, lost);
+
+                        // Notification uses the rolling loss from overlay
+                        if let Some(loss) = overlay.metrics_mut().packet_loss {
+                            notification.update_packet_loss(loss);
                         }
                     }
 
@@ -1182,6 +1246,24 @@ async fn run_reconnectable_session(
 
                     // Render overlays
                     render_overlay_if_visible(&overlay, &mut stdout).await;
+                    render_notification(&notification, &mut stdout).await;
+                }
+
+                // Fast refresh for escape info bar (only active when waiting)
+                _ = escape_info_refresh.tick(), if escape_handler.is_waiting() => {
+                    // Update RTT from heartbeat tracker (SRTT like mosh)
+                    if let Some(srtt) = heartbeat_tracker.srtt() {
+                        notification.update_rtt(srtt);
+                    }
+
+                    // Refresh the info bar with current stats
+                    let elapsed = frame_rate_start.elapsed().as_secs_f64();
+                    let fps = if elapsed > 0.0 {
+                        Some(frame_count as f64 / elapsed)
+                    } else {
+                        None
+                    };
+                    notification.show_info(fps, true);
                     render_notification(&notification, &mut stdout).await;
                 }
             }

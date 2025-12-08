@@ -608,6 +608,16 @@ pub struct TerminalInputData {
     pub data: Vec<u8>,
     /// Hint: these bytes may be predicted locally.
     pub predictable: bool,
+    /// Sender's timestamp (ms mod 65536) for RTT measurement.
+    #[serde(default)]
+    pub timestamp: u16,
+    /// Echo of last received timestamp (0xFFFF = none).
+    #[serde(default = "default_timestamp_none")]
+    pub timestamp_reply: u16,
+}
+
+fn default_timestamp_none() -> u16 {
+    crate::timing::TIMESTAMP_NONE
 }
 
 /// Terminal output (server -> client).
@@ -705,6 +715,8 @@ pub enum Message {
     HelloAck(HelloAckPayload),
     /// Graceful shutdown notification.
     Shutdown(ShutdownPayload),
+    /// Heartbeat for RTT measurement (mosh-style timestamp echo).
+    Heartbeat(HeartbeatPayload),
 
     // =========================================================================
     // Global requests (control stream)
@@ -894,6 +906,41 @@ pub enum ShutdownReason {
     AuthFailure,
     /// Shell process exited (exit command or ctrl-d).
     ShellExited,
+}
+
+/// Heartbeat payload for RTT measurement (mosh-style).
+///
+/// Uses 16-bit timestamps (milliseconds mod 65536) like mosh for minimal overhead.
+/// Each side echoes the received timestamp back, adjusted for hold time.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HeartbeatPayload {
+    /// Sender's current timestamp (ms mod 65536).
+    pub timestamp: u16,
+    /// Echo of last received timestamp + hold time, or u16::MAX if none.
+    pub timestamp_reply: u16,
+}
+
+impl HeartbeatPayload {
+    /// Create a new heartbeat with current timestamp and no reply.
+    pub fn new(timestamp: u16) -> Self {
+        Self {
+            timestamp,
+            timestamp_reply: u16::MAX,
+        }
+    }
+
+    /// Create a heartbeat reply echoing the given timestamp.
+    pub fn reply(timestamp: u16, echo: u16) -> Self {
+        Self {
+            timestamp,
+            timestamp_reply: echo,
+        }
+    }
+
+    /// Check if this heartbeat has a valid reply timestamp.
+    pub fn has_reply(&self) -> bool {
+        self.timestamp_reply != u16::MAX
+    }
 }
 
 // =============================================================================
@@ -1507,6 +1554,8 @@ mod tests {
                 sequence: 1,
                 data: vec![0x61],
                 predictable: true,
+                timestamp: 0,
+                timestamp_reply: u16::MAX,
             }),
         });
     }

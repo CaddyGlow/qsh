@@ -79,8 +79,8 @@ pub const MAX_FORWARD_CHUNK: usize = 64 * 1024;
 // Bootstrap Constants
 // =============================================================================
 
-/// Default QUIC port range for server.
-pub const DEFAULT_QUIC_PORT_RANGE: (u16, u16) = (4500, 4600);
+/// Default QUIC port range for server (matches Mosh: 60001-60999).
+pub const DEFAULT_QUIC_PORT_RANGE: (u16, u16) = (60001, 60999);
 
 // =============================================================================
 // Tunnel Constants (Feature: tunnel)

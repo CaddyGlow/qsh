@@ -23,6 +23,18 @@ const POWER_SAVE_THRESHOLD: Duration = Duration::from_secs(60);
 /// Default message expiration time (non-permanent messages).
 const MESSAGE_EXPIRATION: Duration = Duration::from_secs(1);
 
+/// Format RTT for display, showing fractional ms for small values.
+fn format_rtt(d: Duration) -> String {
+    let ms = d.as_secs_f64() * 1000.0;
+    if ms < 1.0 {
+        format!("{:.1}ms", ms)
+    } else if ms < 10.0 {
+        format!("{:.1}ms", ms)
+    } else {
+        format!("{:.0}ms", ms)
+    }
+}
+
 /// Notification display style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NotificationStyle {
@@ -214,7 +226,7 @@ impl NotificationEngine {
     pub fn show_info(&mut self, frame_rate: Option<f64>, permanent: bool) {
         let rtt_str = self
             .rtt
-            .map(|d| format!("{}ms", d.as_millis()))
+            .map(|d| format_rtt(d))
             .unwrap_or_else(|| "-".to_string());
 
         let loss_str = self
@@ -467,7 +479,7 @@ impl NotificationEngine {
         let user_host = self.user_host.as_deref().unwrap_or("?");
         let rtt_str = self
             .rtt
-            .map(|d| format!("{}ms", d.as_millis()))
+            .map(|d| format_rtt(d))
             .unwrap_or_else(|| "-".to_string());
         let loss_str = self
             .packet_loss
