@@ -1440,6 +1440,7 @@ mod tests {
             session_id: SessionId::from_bytes([0; 16]),
             server_nonce: 0,
             zero_rtt_available: false,
+            existing_channels: Vec::new(),
         });
 
         let _resize = Message::Resize(ResizePayload {

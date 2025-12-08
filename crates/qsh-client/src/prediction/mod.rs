@@ -7,5 +7,6 @@
 mod engine;
 
 pub use engine::{
-    DisplayPreference, PredictedEcho, PredictedStyle, Prediction, PredictionEngine, PredictionState,
+    CellPrediction, DisplayPreference, PredictedEcho, PredictedStyle, Prediction, PredictionEngine,
+    PredictionState,
 };

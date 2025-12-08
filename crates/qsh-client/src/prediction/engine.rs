@@ -5,8 +5,10 @@
 //! - Only underline when RTT > FLAG_TRIGGER_HIGH (80ms) or glitches occur
 //! - Validate predictions against actual server state
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
+
+use qsh_core::terminal::TerminalState;
 
 /// RTT threshold below which predictions are hidden (connection is fast enough).
 const SRTT_TRIGGER_LOW: Duration = Duration::from_millis(20);
@@ -42,6 +44,8 @@ pub enum DisplayPreference {
     /// Show predictions adaptively based on RTT (default, mosh-style).
     #[default]
     Adaptive,
+    /// Experimental: More aggressive prediction with position-based validation.
+    Experimental,
 }
 
 /// Style for displaying predicted characters.
@@ -81,6 +85,21 @@ pub struct PredictedEcho {
     pub style: PredictedStyle,
 }
 
+/// A cell prediction with position and metadata.
+#[derive(Debug, Clone)]
+pub struct CellPrediction {
+    /// The predicted character.
+    pub char: char,
+    /// Display style.
+    pub style: PredictedStyle,
+    /// Input sequence number.
+    pub sequence: u64,
+    /// Epoch when this prediction was made.
+    pub epoch: u64,
+    /// When this prediction was made.
+    pub timestamp: Instant,
+}
+
 /// Engine for managing predictive local echo.
 #[derive(Debug)]
 pub struct PredictionEngine {
@@ -102,6 +121,16 @@ pub struct PredictionEngine {
     glitch_trigger: u32,
     /// Current smoothed RTT.
     current_rtt: Duration,
+
+    // Position-based prediction tracking (mosh-style)
+    /// Predicted cursor position (col, row).
+    predicted_cursor: Option<(u16, u16)>,
+    /// Cell predictions by position.
+    cell_predictions: HashMap<(u16, u16), CellPrediction>,
+    /// Current prediction epoch (increments on each new_user_byte batch).
+    prediction_epoch: u64,
+    /// Last epoch that was confirmed.
+    confirmed_epoch: u64,
 }
 
 impl Default for PredictionEngine {
@@ -123,6 +152,11 @@ impl PredictionEngine {
             flagging: false,
             glitch_trigger: 0,
             current_rtt: Duration::ZERO,
+            // Position-based tracking
+            predicted_cursor: None,
+            cell_predictions: HashMap::new(),
+            prediction_epoch: 0,
+            confirmed_epoch: 0,
         }
     }
 
@@ -160,7 +194,7 @@ impl PredictionEngine {
     pub fn should_display(&self) -> bool {
         match self.display_preference {
             DisplayPreference::Never => false,
-            DisplayPreference::Always => true,
+            DisplayPreference::Always | DisplayPreference::Experimental => true,
             DisplayPreference::Adaptive => self.srtt_trigger || self.glitch_trigger > 0,
         }
     }
@@ -291,6 +325,11 @@ impl PredictionEngine {
         self.state = PredictionState::Confident;
         self.misprediction_count = 0;
         self.glitch_trigger = 0;
+        // Reset position-based tracking
+        self.predicted_cursor = None;
+        self.cell_predictions.clear();
+        self.prediction_epoch += 1;
+        self.confirmed_epoch = self.prediction_epoch;
     }
 
     /// Get current prediction state.
@@ -311,6 +350,229 @@ impl PredictionEngine {
     /// Check if flagging (underlining) is active.
     pub fn is_flagging(&self) -> bool {
         self.flagging
+    }
+
+    // =========================================================================
+    // Position-based prediction methods (mosh-style)
+    // =========================================================================
+
+    /// Initialize cursor position from terminal state.
+    ///
+    /// Call this when starting predictions or after reconnection.
+    pub fn init_cursor(&mut self, col: u16, row: u16) {
+        self.predicted_cursor = Some((col, row));
+    }
+
+    /// Get the predicted cursor position.
+    pub fn get_predicted_cursor(&self) -> Option<(u16, u16)> {
+        self.predicted_cursor
+    }
+
+    /// Get iterator over cell predictions.
+    pub fn get_cell_predictions(&self) -> impl Iterator<Item = ((u16, u16), &CellPrediction)> {
+        self.cell_predictions.iter().map(|(&pos, pred)| (pos, pred))
+    }
+
+    /// Process a user input byte with cursor context.
+    ///
+    /// This handles different input types:
+    /// - Printable ASCII (0x20-0x7E): Creates cell prediction, advances cursor
+    /// - Backspace (0x08, 0x7F): Moves cursor left
+    /// - Carriage Return (0x0D): Moves cursor to column 0, becomes tentative
+    /// - Other control chars: Becomes tentative (unpredictable effects)
+    ///
+    /// Returns `Some(PredictedEcho)` if a prediction should be displayed.
+    pub fn new_user_byte(
+        &mut self,
+        byte: u8,
+        cursor: (u16, u16),
+        term_width: u16,
+        input_seq: u64,
+    ) -> Option<PredictedEcho> {
+        // Initialize predicted cursor if not set
+        if self.predicted_cursor.is_none() {
+            self.predicted_cursor = Some(cursor);
+        }
+
+        let (mut pred_col, mut pred_row) = self.predicted_cursor.unwrap_or(cursor);
+
+        match byte {
+            // Printable ASCII (0x20 space through 0x7E tilde)
+            0x20..=0x7E => {
+                let ch = byte as char;
+
+                // Check if we should predict this character
+                if !self.should_predict(ch) {
+                    // Become tentative but don't display
+                    if self.state == PredictionState::Confident {
+                        self.become_tentative();
+                    }
+                    return None;
+                }
+
+                // Create cell prediction at current predicted cursor
+                let style = self.current_style();
+                let cell_pred = CellPrediction {
+                    char: ch,
+                    style,
+                    sequence: input_seq,
+                    epoch: self.prediction_epoch,
+                    timestamp: Instant::now(),
+                };
+                self.cell_predictions.insert((pred_col, pred_row), cell_pred);
+
+                // Also add to pending queue for legacy tracking
+                self.pending.push_back(Prediction {
+                    sequence: input_seq,
+                    char: ch,
+                    col: pred_col,
+                    row: pred_row,
+                    timestamp: Instant::now(),
+                });
+
+                // Advance predicted cursor
+                pred_col += 1;
+                if pred_col >= term_width {
+                    // Wrap to next line
+                    pred_col = 0;
+                    pred_row += 1;
+                    // Note: We don't scroll here - server will handle that
+                }
+                self.predicted_cursor = Some((pred_col, pred_row));
+
+                Some(PredictedEcho {
+                    sequence: input_seq,
+                    char: ch,
+                    style,
+                })
+            }
+
+            // Backspace (BS) or DEL
+            0x08 | 0x7F => {
+                // Move predicted cursor left
+                if pred_col > 0 {
+                    pred_col -= 1;
+                    self.predicted_cursor = Some((pred_col, pred_row));
+                    // Optionally remove cell prediction at new position
+                    self.cell_predictions.remove(&(pred_col, pred_row));
+                }
+                None
+            }
+
+            // Carriage Return
+            0x0D => {
+                // Move to column 0
+                pred_col = 0;
+                self.predicted_cursor = Some((pred_col, pred_row));
+                // CR may have side effects (like Enter), become tentative
+                self.become_tentative();
+                None
+            }
+
+            // Line Feed
+            0x0A => {
+                // Move to next row, col 0 (typical newline behavior)
+                pred_col = 0;
+                pred_row += 1;
+                self.predicted_cursor = Some((pred_col, pred_row));
+                // LF has side effects, become tentative
+                self.become_tentative();
+                None
+            }
+
+            // Tab
+            0x09 => {
+                // Advance to next tab stop (every 8 columns)
+                let next_tab = ((pred_col / 8) + 1) * 8;
+                pred_col = next_tab.min(term_width.saturating_sub(1));
+                self.predicted_cursor = Some((pred_col, pred_row));
+                None
+            }
+
+            // Escape - start of escape sequence, become tentative
+            0x1B => {
+                self.become_tentative();
+                None
+            }
+
+            // Other control characters - unpredictable, become tentative
+            _ => {
+                self.become_tentative();
+                None
+            }
+        }
+    }
+
+    /// Get the current display style based on state and flagging.
+    fn current_style(&self) -> PredictedStyle {
+        match self.state {
+            PredictionState::Confident => {
+                if self.flagging {
+                    PredictedStyle::Underline
+                } else {
+                    PredictedStyle::Normal
+                }
+            }
+            PredictionState::Tentative => PredictedStyle::Dim,
+            PredictionState::Disabled => PredictedStyle::Normal, // Shouldn't display anyway
+        }
+    }
+
+    /// Transition to tentative state without triggering full misprediction.
+    fn become_tentative(&mut self) {
+        if self.state == PredictionState::Confident {
+            self.state = PredictionState::Tentative;
+        }
+    }
+
+    /// Validate predictions against server state.
+    ///
+    /// Compares predicted cells against actual server terminal state
+    /// and handles mispredictions.
+    pub fn validate(&mut self, server_state: &TerminalState) {
+        let screen = server_state.screen();
+        let server_cursor = (server_state.cursor.col, server_state.cursor.row);
+
+        // Check cursor prediction
+        if let Some((pred_col, pred_row)) = self.predicted_cursor {
+            if server_cursor.0 != pred_col || server_cursor.1 != pred_row {
+                // Cursor misprediction - clear cursor prediction
+                // but don't count as full misprediction (cursor position can drift)
+                self.predicted_cursor = None;
+            }
+        }
+
+        // Check cell predictions
+        let mut to_remove = Vec::new();
+        let mut had_misprediction = false;
+
+        for (&(col, row), pred) in &self.cell_predictions {
+            if let Some(actual_cell) = screen.get(col, row) {
+                if actual_cell.ch == pred.char {
+                    // Correct prediction - mark for removal (will be cleaned by confirm)
+                    to_remove.push((col, row));
+                } else {
+                    // Misprediction - character doesn't match
+                    to_remove.push((col, row));
+                    had_misprediction = true;
+                }
+            }
+        }
+
+        // Remove validated/mispredicted cells
+        for pos in to_remove {
+            self.cell_predictions.remove(&pos);
+        }
+
+        // Handle misprediction
+        if had_misprediction {
+            self.misprediction();
+        }
+    }
+
+    /// Clear confirmed cell predictions up to the given sequence.
+    pub fn confirm_cells(&mut self, sequence: u64) {
+        self.cell_predictions.retain(|_, pred| pred.sequence > sequence);
     }
 }
 
@@ -562,5 +824,232 @@ mod tests {
         engine.set_display_preference(DisplayPreference::Never);
         engine.update_rtt(Duration::from_millis(100));
         assert!(!engine.should_display());
+    }
+
+    // =========================================================================
+    // Tests for new_user_byte() and position-based prediction
+    // =========================================================================
+
+    #[test]
+    fn new_user_byte_initializes_cursor() {
+        let mut engine = PredictionEngine::new();
+        engine.set_display_preference(DisplayPreference::Always);
+
+        // Before any input, cursor should be None
+        assert!(engine.get_predicted_cursor().is_none());
+
+        // After processing a byte, cursor should be set
+        engine.new_user_byte(b'a', (5, 10), 80, 1);
+        assert!(engine.get_predicted_cursor().is_some());
+    }
+
+    #[test]
+    fn new_user_byte_advances_cursor() {
+        let mut engine = PredictionEngine::new();
+        engine.set_display_preference(DisplayPreference::Always);
+
+        // Start at col 0, row 0
+        engine.new_user_byte(b'a', (0, 0), 80, 1);
+        assert_eq!(engine.get_predicted_cursor(), Some((1, 0)));
+
+        engine.new_user_byte(b'b', (1, 0), 80, 1);
+        assert_eq!(engine.get_predicted_cursor(), Some((2, 0)));
+
+        engine.new_user_byte(b'c', (2, 0), 80, 1);
+        assert_eq!(engine.get_predicted_cursor(), Some((3, 0)));
+    }
+
+    #[test]
+    fn new_user_byte_wraps_at_terminal_width() {
+        let mut engine = PredictionEngine::new();
+        engine.set_display_preference(DisplayPreference::Always);
+
+        // Start at the last column
+        engine.init_cursor(79, 0);
+
+        // Typing should wrap to next line
+        engine.new_user_byte(b'a', (79, 0), 80, 1);
+        assert_eq!(engine.get_predicted_cursor(), Some((0, 1)));
+    }
+
+    #[test]
+    fn new_user_byte_backspace_moves_cursor_back() {
+        let mut engine = PredictionEngine::new();
+        engine.set_display_preference(DisplayPreference::Always);
+        engine.init_cursor(5, 0);
+
+        // Backspace should move cursor back
+        engine.new_user_byte(0x08, (5, 0), 80, 1); // BS
+        assert_eq!(engine.get_predicted_cursor(), Some((4, 0)));
+
+        // DEL should also move back
+        engine.new_user_byte(0x7F, (4, 0), 80, 1);
+        assert_eq!(engine.get_predicted_cursor(), Some((3, 0)));
+
+        // But not past column 0
+        engine.init_cursor(0, 0);
+        engine.new_user_byte(0x08, (0, 0), 80, 1);
+        assert_eq!(engine.get_predicted_cursor(), Some((0, 0)));
+    }
+
+    #[test]
+    fn new_user_byte_carriage_return_moves_to_col_0() {
+        let mut engine = PredictionEngine::new();
+        engine.set_display_preference(DisplayPreference::Always);
+        engine.init_cursor(40, 5);
+
+        engine.new_user_byte(0x0D, (40, 5), 80, 1); // CR
+        assert_eq!(engine.get_predicted_cursor(), Some((0, 5)));
+    }
+
+    #[test]
+    fn new_user_byte_line_feed_moves_to_next_row() {
+        let mut engine = PredictionEngine::new();
+        engine.set_display_preference(DisplayPreference::Always);
+        engine.init_cursor(20, 5);
+
+        engine.new_user_byte(0x0A, (20, 5), 80, 1); // LF
+        assert_eq!(engine.get_predicted_cursor(), Some((0, 6)));
+    }
+
+    #[test]
+    fn new_user_byte_tab_advances_to_tab_stop() {
+        let mut engine = PredictionEngine::new();
+        engine.set_display_preference(DisplayPreference::Always);
+
+        // From col 0, tab should go to col 8
+        engine.init_cursor(0, 0);
+        engine.new_user_byte(0x09, (0, 0), 80, 1); // TAB
+        assert_eq!(engine.get_predicted_cursor(), Some((8, 0)));
+
+        // From col 5, tab should go to col 8
+        engine.init_cursor(5, 0);
+        engine.new_user_byte(0x09, (5, 0), 80, 1);
+        assert_eq!(engine.get_predicted_cursor(), Some((8, 0)));
+
+        // From col 8, tab should go to col 16
+        engine.init_cursor(8, 0);
+        engine.new_user_byte(0x09, (8, 0), 80, 1);
+        assert_eq!(engine.get_predicted_cursor(), Some((16, 0)));
+    }
+
+    #[test]
+    fn new_user_byte_creates_cell_predictions() {
+        let mut engine = PredictionEngine::new();
+        engine.set_display_preference(DisplayPreference::Always);
+        engine.init_cursor(0, 0);
+
+        engine.new_user_byte(b'h', (0, 0), 80, 1);
+        engine.new_user_byte(b'i', (1, 0), 80, 1);
+
+        let predictions: Vec<_> = engine.get_cell_predictions().collect();
+        assert_eq!(predictions.len(), 2);
+
+        // Check that predictions exist at correct positions
+        let has_h_at_0_0 = predictions.iter().any(|((col, row), p)| {
+            *col == 0 && *row == 0 && p.char == 'h'
+        });
+        let has_i_at_1_0 = predictions.iter().any(|((col, row), p)| {
+            *col == 1 && *row == 0 && p.char == 'i'
+        });
+        assert!(has_h_at_0_0);
+        assert!(has_i_at_1_0);
+    }
+
+    #[test]
+    fn new_user_byte_escape_becomes_tentative() {
+        let mut engine = PredictionEngine::new();
+        engine.set_display_preference(DisplayPreference::Always);
+        assert_eq!(engine.state(), PredictionState::Confident);
+
+        engine.new_user_byte(0x1B, (0, 0), 80, 1); // ESC
+        assert_eq!(engine.state(), PredictionState::Tentative);
+    }
+
+    #[test]
+    fn confirm_cells_removes_confirmed() {
+        let mut engine = PredictionEngine::new();
+        engine.set_display_preference(DisplayPreference::Always);
+        engine.init_cursor(0, 0);
+
+        // Create predictions with different sequences
+        engine.new_user_byte(b'a', (0, 0), 80, 1);
+        engine.new_user_byte(b'b', (1, 0), 80, 2);
+        engine.new_user_byte(b'c', (2, 0), 80, 3);
+
+        let count_before = engine.get_cell_predictions().count();
+        assert_eq!(count_before, 3);
+
+        // Confirm up to sequence 2
+        engine.confirm_cells(2);
+
+        let count_after = engine.get_cell_predictions().count();
+        assert_eq!(count_after, 1);
+
+        // Only sequence 3 should remain
+        let remaining: Vec<_> = engine.get_cell_predictions().collect();
+        assert_eq!(remaining[0].1.char, 'c');
+        assert_eq!(remaining[0].1.sequence, 3);
+    }
+
+    #[test]
+    fn reset_clears_cell_predictions() {
+        let mut engine = PredictionEngine::new();
+        engine.set_display_preference(DisplayPreference::Always);
+        engine.init_cursor(0, 0);
+
+        engine.new_user_byte(b'a', (0, 0), 80, 1);
+        engine.new_user_byte(b'b', (1, 0), 80, 1);
+        assert!(engine.get_cell_predictions().count() > 0);
+
+        engine.reset();
+        assert_eq!(engine.get_cell_predictions().count(), 0);
+        assert!(engine.get_predicted_cursor().is_none());
+    }
+
+    #[test]
+    fn validate_clears_matching_predictions() {
+        use qsh_core::terminal::TerminalState;
+
+        let mut engine = PredictionEngine::new();
+        engine.set_display_preference(DisplayPreference::Always);
+        engine.init_cursor(0, 0);
+
+        // Create prediction
+        engine.new_user_byte(b'X', (0, 0), 80, 1);
+        assert_eq!(engine.get_cell_predictions().count(), 1);
+
+        // Create terminal state with matching character
+        let mut state = TerminalState::new(80, 24);
+        state.screen_mut().set(0, 0, qsh_core::terminal::Cell::new('X'));
+        state.cursor.col = 1;
+        state.cursor.row = 0;
+
+        // Validate should clear the matching prediction
+        engine.validate(&state);
+        assert_eq!(engine.get_cell_predictions().count(), 0);
+    }
+
+    #[test]
+    fn validate_misprediction_triggers_degradation() {
+        use qsh_core::terminal::TerminalState;
+
+        let mut engine = PredictionEngine::new();
+        engine.set_display_preference(DisplayPreference::Always);
+        engine.init_cursor(0, 0);
+        assert_eq!(engine.state(), PredictionState::Confident);
+
+        // Create prediction for 'X'
+        engine.new_user_byte(b'X', (0, 0), 80, 1);
+
+        // But server has 'Y' - this is a misprediction
+        let mut state = TerminalState::new(80, 24);
+        state.screen_mut().set(0, 0, qsh_core::terminal::Cell::new('Y'));
+        state.cursor.col = 1;
+        state.cursor.row = 0;
+
+        // Validate should detect misprediction and degrade state
+        engine.validate(&state);
+        assert_eq!(engine.state(), PredictionState::Tentative);
     }
 }

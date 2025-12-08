@@ -10,15 +10,17 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
 
 use qsh_client::cli::{OverlayPosition as CliOverlayPosition, SshBootstrapMode};
-use qsh_client::overlay::{ConnectionStatus, OverlayPosition, StatusOverlay};
-use qsh_client::prediction::{DisplayPreference, PredictedStyle};
+use qsh_client::overlay::{ConnectionStatus, OverlayPosition, PredictionOverlay, StatusOverlay};
+use qsh_client::prediction::{DisplayPreference, Prediction};
+use qsh_client::render::StateRenderer;
+use qsh_core::terminal::TerminalParser;
 use qsh_client::{
     BootstrapMode, ChannelConnection, Cli, ConnectionConfig, ConnectionState, EscapeCommand,
     EscapeHandler, EscapeResult, ForwarderHandle, LocalForwarder, ProxyHandle, RawModeGuard,
     ReconnectableConnection, RemoteForwarder, RemoteForwarderHandle, SessionContext, Socks5Proxy,
-    SshConfig, StdinReader, StdoutWriter, TerminalSessionState, bootstrap,
-    connect_quic, get_terminal_size, parse_dynamic_forward, parse_escape_key, parse_local_forward,
-    parse_remote_forward, restore_terminal,
+    SshConfig, StdinReader, StdoutWriter, TerminalSessionState, bootstrap, get_terminal_size,
+    parse_dynamic_forward, parse_escape_key, parse_local_forward, parse_remote_forward,
+    restore_terminal,
 };
 
 #[cfg(feature = "standalone")]
@@ -389,24 +391,6 @@ async fn render_overlay_if_visible(overlay: &StatusOverlay, stdout: &mut StdoutW
     }
 }
 
-/// Render a predicted character with the appropriate style.
-fn render_predicted_char(ch: char, style: PredictedStyle) -> Vec<u8> {
-    match style {
-        PredictedStyle::Normal => {
-            // Just the character, no special styling
-            ch.to_string().into_bytes()
-        }
-        PredictedStyle::Underline => {
-            // Underline SGR, char, reset
-            format!("\x1b[4m{}\x1b[24m", ch).into_bytes()
-        }
-        PredictedStyle::Dim => {
-            // Dim SGR, char, reset
-            format!("\x1b[2m{}\x1b[22m", ch).into_bytes()
-        }
-    }
-}
-
 /// Check if a byte represents a predictable (printable ASCII) character.
 fn is_predictable_char(b: u8) -> bool {
     // Printable ASCII: 0x20 (space) through 0x7E (~)
@@ -678,7 +662,18 @@ async fn run_reconnectable_session(
     let mut stdout = StdoutWriter::new();
 
     // Prediction settings
-    let prediction_enabled = !cli.no_prediction && is_interactive;
+    let prediction_mode = cli.effective_prediction_mode();
+    let prediction_enabled = prediction_mode != qsh_client::cli::PredictionMode::Off && is_interactive;
+
+    // Mosh-style state tracking
+    // StateRenderer maintains local framebuffer for differential rendering
+    let mut renderer = StateRenderer::new();
+    // PredictionOverlay for displaying predicted characters
+    let mut prediction_overlay = PredictionOverlay::new();
+    // Client-side terminal state (tracks what we think server looks like)
+    // Initialized inside loop when terminal is opened and we know the size
+    #[allow(unused_assignments)]
+    let mut client_parser: Option<TerminalParser> = None;
 
     // Reconnection loop
     loop {
@@ -770,12 +765,27 @@ async fn run_reconnectable_session(
         overlay.metrics_mut().update_rtt(conn.rtt());
         overlay.metrics_mut().record_heard();
 
-        // Initialize prediction engine with current RTT
+        // Initialize/reset client-side terminal state tracking
+        client_parser = Some(TerminalParser::new(term_size.cols, term_size.rows));
+        prediction_overlay.clear_all();
+        renderer.invalidate();
+
+        // Initialize prediction engine with current RTT and cursor
         if prediction_enabled {
             let mut prediction = terminal.prediction_mut().await;
             prediction.update_rtt(conn.rtt());
-            // Set display preference to adaptive (mosh-style)
-            prediction.set_display_preference(DisplayPreference::Adaptive);
+
+            // Set display preference based on prediction mode
+            let display_pref = match prediction_mode {
+                qsh_client::cli::PredictionMode::Adaptive => DisplayPreference::Adaptive,
+                qsh_client::cli::PredictionMode::Always => DisplayPreference::Always,
+                qsh_client::cli::PredictionMode::Experimental => DisplayPreference::Experimental,
+                qsh_client::cli::PredictionMode::Off => DisplayPreference::Never, // Should not reach
+            };
+            prediction.set_display_preference(display_pref);
+
+            // Initialize cursor position from terminal state (start at 0,0 for new sessions)
+            prediction.init_cursor(0, 0);
         }
 
         // Start forwards (only on first connection)
@@ -860,30 +870,62 @@ async fn run_reconnectable_session(
                                 }
                             };
 
-                            // If prediction enabled and input is predictable, echo immediately
-                            if has_predictable {
+                            // If prediction enabled, process input with mosh-style tracking
+                            if prediction_enabled {
                                 let mut prediction = terminal.prediction_mut().await;
+
+                                // Get current cursor position (from client parser or predicted)
+                                let cursor = if let Some(pred_cursor) = prediction.get_predicted_cursor() {
+                                    pred_cursor
+                                } else if let Some(ref parser) = client_parser {
+                                    let state = parser.state();
+                                    (state.cursor.col, state.cursor.row)
+                                } else {
+                                    (0, 0)
+                                };
 
                                 // Only render if prediction engine says we should display
                                 if prediction.should_display() {
-                                    let mut predicted_count = 0u32;
+                                    // Process each byte with position tracking
                                     for &byte in &pass_data {
-                                        if is_predictable_char(byte) {
-                                            let ch = byte as char;
-                                            // Note: We use (0, 0) for position since we're doing
-                                            // simple inline echo, not position-based overlay
-                                            if let Some(echo) = prediction.predict(ch, 0, 0, seq) {
-                                                let rendered = render_predicted_char(echo.char, echo.style);
-                                                let _ = stdout.write(&rendered).await;
-                                                predicted_count += 1;
-                                            }
+                                        if let Some(echo) = prediction.new_user_byte(byte, cursor, term_size.cols, seq) {
+                                            // Add to overlay for position-based rendering
+                                            let pred_cursor = prediction.get_predicted_cursor().unwrap_or(cursor);
+                                            // The cursor after new_user_byte points to the next position,
+                                            // so the character was placed at pred_cursor - 1 (wrapping handled)
+                                            let char_col = if pred_cursor.0 == 0 && pred_cursor.1 > cursor.1 {
+                                                // Wrapped to next line, char was at end of previous line
+                                                term_size.cols.saturating_sub(1)
+                                            } else {
+                                                pred_cursor.0.saturating_sub(1)
+                                            };
+                                            let char_row = if pred_cursor.0 == 0 && pred_cursor.1 > cursor.1 {
+                                                pred_cursor.1.saturating_sub(1)
+                                            } else {
+                                                pred_cursor.1
+                                            };
+
+                                            // Render prediction at position using position-based overlay
+                                            let pred = Prediction {
+                                                sequence: echo.sequence,
+                                                char: echo.char,
+                                                col: char_col,
+                                                row: char_row,
+                                                timestamp: std::time::Instant::now(),
+                                            };
+                                            prediction_overlay.add(&pred, echo.style);
                                         }
                                     }
-                                    // Move cursor back so server output overwrites predictions
-                                    // Use CUB (Cursor Back) escape sequence
-                                    if predicted_count > 0 {
-                                        let cursor_back = format!("\x1b[{}D", predicted_count);
-                                        let _ = stdout.write(cursor_back.as_bytes()).await;
+
+                                    // Render the prediction overlay
+                                    let overlay_output = prediction_overlay.render();
+                                    if !overlay_output.is_empty() {
+                                        let _ = stdout.write(overlay_output.as_bytes()).await;
+                                    }
+                                } else {
+                                    // Still process bytes for cursor tracking even if not displaying
+                                    for &byte in &pass_data {
+                                        let _ = prediction.new_user_byte(byte, cursor, term_size.cols, seq);
                                     }
                                 }
                             }
@@ -900,13 +942,35 @@ async fn run_reconnectable_session(
                             // Track confirmed input seq for recovery
                             terminal_state.last_input_seq = output.confirmed_input_seq;
 
-                            // Confirm predictions up to this sequence
-                            if prediction_enabled {
-                                let mut prediction = terminal.prediction_mut().await;
-                                prediction.confirm(output.confirmed_input_seq);
+                            // Update client-side terminal state
+                            if let Some(ref mut parser) = client_parser {
+                                parser.process(&output.data);
                             }
 
-                            // Output the data
+                            // Validate and confirm predictions
+                            if prediction_enabled {
+                                let mut prediction = terminal.prediction_mut().await;
+
+                                // Validate predictions against client state
+                                if let Some(ref parser) = client_parser {
+                                    let client_state = parser.state();
+                                    prediction.validate(client_state);
+                                    // Update predicted cursor to match server
+                                    prediction.init_cursor(
+                                        client_state.cursor.col,
+                                        client_state.cursor.row
+                                    );
+                                }
+
+                                // Confirm predictions up to this sequence
+                                prediction.confirm(output.confirmed_input_seq);
+                                prediction.confirm_cells(output.confirmed_input_seq);
+
+                                // Clear confirmed predictions from overlay
+                                prediction_overlay.clear_confirmed(output.confirmed_input_seq);
+                            }
+
+                            // Output the data (server output is authoritative)
                             if let Err(e) = stdout.write(&output.data).await {
                                 warn!(error = %e, "stdout write error");
                                 break Err(e.into());
@@ -925,11 +989,27 @@ async fn run_reconnectable_session(
                             if prediction_enabled {
                                 let mut prediction = terminal.prediction_mut().await;
                                 prediction.reset();
+                                prediction_overlay.clear_all();
                             }
 
                             // Render the full state to the terminal (mosh-style resync)
-                            if let qsh_core::terminal::StateDiff::Full(state) = update.diff {
+                            if let qsh_core::terminal::StateDiff::Full(ref state) = update.diff {
                                 info!("Received state sync after reconnection");
+
+                                // Update client parser to match server state
+                                if let Some(ref mut parser) = client_parser {
+                                    *parser = TerminalParser::new(
+                                        state.screen().cols(),
+                                        state.screen().rows()
+                                    );
+                                }
+
+                                // Update predicted cursor from synced state
+                                if prediction_enabled {
+                                    let mut prediction = terminal.prediction_mut().await;
+                                    prediction.init_cursor(state.cursor.col, state.cursor.row);
+                                }
+
                                 let ansi_data = state.render_to_ansi();
                                 if let Err(e) = stdout.write(&ansi_data).await {
                                     warn!(error = %e, "stdout write error during state sync");

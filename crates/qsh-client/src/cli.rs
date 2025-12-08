@@ -49,6 +49,23 @@ pub enum SshBootstrapMode {
     Russh,
 }
 
+/// Prediction mode for local echo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum PredictionMode {
+    /// Adaptive: Show predictions based on RTT thresholds (mosh-style).
+    /// Uses SRTT triggers: show predictions when RTT > 30ms,
+    /// underline when RTT > 80ms or glitches occur.
+    #[default]
+    Adaptive,
+    /// Always show predictions with underline styling.
+    Always,
+    /// Experimental: Always predict with mosh-style cell tracking.
+    /// More aggressive prediction with position-based validation.
+    Experimental,
+    /// Disable prediction entirely.
+    Off,
+}
+
 /// Tunnel argument with optional IP assignment (feature-gated).
 #[cfg(feature = "tunnel")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,8 +211,13 @@ pub struct Cli {
     pub bootstrap_server_args: Option<String>,
 
     /// Force predictive echo off (safer for password prompts)
-    #[arg(long = "no-prediction")]
+    /// Shorthand for --prediction=off
+    #[arg(long = "no-prediction", conflicts_with = "prediction_mode")]
     pub no_prediction: bool,
+
+    /// Prediction mode for local echo
+    #[arg(long = "prediction", value_enum, default_value = "adaptive")]
+    pub prediction_mode: PredictionMode,
 
     /// Show connection status overlay
     #[arg(long = "status")]
@@ -333,6 +355,20 @@ impl Cli {
                     .join(" "),
             )
         }
+    }
+
+    /// Get the effective prediction mode, considering both --prediction and --no-prediction flags.
+    pub fn effective_prediction_mode(&self) -> PredictionMode {
+        if self.no_prediction {
+            PredictionMode::Off
+        } else {
+            self.prediction_mode
+        }
+    }
+
+    /// Check if prediction is enabled (any mode except Off).
+    pub fn prediction_enabled(&self) -> bool {
+        self.effective_prediction_mode() != PredictionMode::Off
     }
 
     /// Determine if PTY should be allocated based on flags and command.

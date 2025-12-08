@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -26,6 +26,9 @@ use crate::registry::PtyControl;
 pub struct TerminalChannel {
     inner: Arc<TerminalChannelInner>,
 }
+
+/// Minimum interval between state updates (allows throttling when connection is fast).
+const STATE_UPDATE_MIN_INTERVAL: Duration = Duration::from_millis(20);
 
 struct TerminalChannelInner {
     /// Channel ID.
@@ -56,6 +59,8 @@ struct TerminalChannelInner {
     relay_task: Mutex<Option<JoinHandle<()>>>,
     /// Shutdown signal.
     shutdown_tx: Mutex<Option<mpsc::Sender<()>>>,
+    /// Last time a state update was sent (for throttling).
+    last_state_update: Mutex<Option<Instant>>,
 }
 
 /// Real PTY control implementation.
@@ -153,6 +158,7 @@ impl TerminalChannel {
             disconnected: AtomicBool::new(false),
             relay_task: Mutex::new(None),
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
+            last_state_update: Mutex::new(None),
         });
 
         // Spawn output relay task
@@ -450,35 +456,53 @@ impl TerminalChannelInner {
                 return Ok(());
             }
 
-            // Then send state update for reconnection/prediction support
-            let new_state = {
-                let parser = self.parser.lock().await;
-                parser.state().clone()
-            };
-
-            let diff = {
-                let mut last = self.last_sent_state.lock().await;
-                let diff = if let Some(ref last_state) = *last {
-                    last_state.diff_to(&new_state)
-                } else {
-                    StateDiff::Full(new_state.clone())
+            // Throttle state updates - raw output is always sent immediately,
+            // but state updates (for prediction validation) can be rate-limited.
+            // When connection is fast, predictions aren't needed, so we can throttle.
+            let should_send_state = {
+                let mut last_update = self.last_state_update.lock().await;
+                let now = Instant::now();
+                let send = match *last_update {
+                    None => true, // First update, always send
+                    Some(last) => now.duration_since(last) >= STATE_UPDATE_MIN_INTERVAL,
                 };
-                *last = Some(new_state);
-                diff
+                if send {
+                    *last_update = Some(now);
+                }
+                send
             };
 
-            let update = Message::ChannelDataMsg(ChannelData {
-                channel_id,
-                payload: ChannelPayload::StateUpdate(StateUpdateData {
-                    diff,
-                    confirmed_input_seq: confirmed_seq,
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_micros() as u64,
-                }),
-            });
-            let _ = stream.send(&update).await; // Best effort for state update
+            if should_send_state {
+                // Send state update for reconnection/prediction support
+                let new_state = {
+                    let parser = self.parser.lock().await;
+                    parser.state().clone()
+                };
+
+                let diff = {
+                    let mut last = self.last_sent_state.lock().await;
+                    let diff = if let Some(ref last_state) = *last {
+                        last_state.diff_to(&new_state)
+                    } else {
+                        StateDiff::Full(new_state.clone())
+                    };
+                    *last = Some(new_state);
+                    diff
+                };
+
+                let update = Message::ChannelDataMsg(ChannelData {
+                    channel_id,
+                    payload: ChannelPayload::StateUpdate(StateUpdateData {
+                        diff,
+                        confirmed_input_seq: confirmed_seq,
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_micros() as u64,
+                    }),
+                });
+                let _ = stream.send(&update).await; // Best effort for state update
+            }
         }
 
         Ok(())
