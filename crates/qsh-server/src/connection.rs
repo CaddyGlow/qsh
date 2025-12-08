@@ -172,7 +172,7 @@ impl ConnectionHandler {
 
     /// Get the current RTT estimate.
     pub async fn rtt(&self) -> Duration {
-        self.quic.read().await.rtt()
+        self.quic.read().await.rtt().await
     }
 
     /// Update last activity timestamp.

@@ -894,10 +894,8 @@ impl Connection for QuicheConnection {
         !self.inner.is_closed()
     }
 
-    fn rtt(&self) -> Duration {
-        // Return cached value or default
-        // Note: This is sync, so we can't await. For accurate RTT, use async method.
-        Duration::from_millis(50) // Default fallback
+    async fn rtt(&self) -> Duration {
+        self.inner.rtt().await
     }
 }
 

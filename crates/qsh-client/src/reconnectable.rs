@@ -293,8 +293,11 @@ impl ReconnectableConnection {
     }
 
     /// Get the current RTT (if connected).
-    pub fn rtt(&self) -> Option<Duration> {
-        read_lock(&self.inner).as_ref().map(|c| c.rtt())
+    pub async fn rtt(&self) -> Option<Duration> {
+        match read_lock(&self.inner).as_ref() {
+            Some(c) => Some(c.rtt().await),
+            None => None,
+        }
     }
 
     /// Manually trigger disconnection (for testing or user-initiated disconnect).

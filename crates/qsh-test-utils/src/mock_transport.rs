@@ -227,8 +227,8 @@ impl Connection for MockConnection {
         self.is_connected()
     }
 
-    fn rtt(&self) -> Duration {
-        self.rtt()
+    async fn rtt(&self) -> Duration {
+        self.rtt
     }
 }
 

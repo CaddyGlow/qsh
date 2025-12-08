@@ -140,7 +140,7 @@ pub trait Connection: Send + Sync {
     fn is_connected(&self) -> bool;
 
     /// Get the current RTT estimate.
-    fn rtt(&self) -> Duration;
+    fn rtt(&self) -> impl Future<Output = Duration> + Send;
 }
 
 // =============================================================================

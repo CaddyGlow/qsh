@@ -38,6 +38,17 @@ pub enum OverlayPosition {
     None,
 }
 
+/// Notification bar display style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum NotificationStyle {
+    /// Mosh-compatible minimal display.
+    /// Only shows on timeout/errors with "Last contact Xs ago" format.
+    #[default]
+    Minimal,
+    /// Enhanced display with RTT and metrics when visible.
+    Enhanced,
+}
+
 /// SSH bootstrap implementation to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SshBootstrapMode {
@@ -243,6 +254,10 @@ pub struct Cli {
     /// Use "none" to disable escape sequences.
     #[arg(long = "escape-key", default_value = "ctrl+^", value_name = "KEY")]
     pub escape_key: String,
+
+    /// Notification bar display style (mosh-style auto-showing bar).
+    #[arg(long = "notification-style", value_enum, default_value = "minimal")]
+    pub notification_style: NotificationStyle,
 
     /// QUIC keep-alive interval in milliseconds (0 disables).
     #[arg(
@@ -873,6 +888,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_notification_style() {
+        let cli =
+            Cli::try_parse_from(["qsh", "--notification-style", "enhanced", "example.com"]).unwrap();
+        assert_eq!(cli.notification_style, NotificationStyle::Enhanced);
+
+        let cli =
+            Cli::try_parse_from(["qsh", "--notification-style", "minimal", "example.com"]).unwrap();
+        assert_eq!(cli.notification_style, NotificationStyle::Minimal);
+    }
+
+    #[test]
     fn default_values() {
         let cli = Cli::try_parse_from(["qsh", "example.com"]).unwrap();
         assert_eq!(cli.port, 22);
@@ -887,6 +913,7 @@ mod tests {
         assert_eq!(cli.overlay_position, OverlayPosition::Top);
         assert_eq!(cli.overlay_key, "ctrl+shift+o");
         assert_eq!(cli.escape_key, "ctrl+^");
+        assert_eq!(cli.notification_style, NotificationStyle::Minimal);
         assert!(!cli.no_overlay);
         assert!(!cli.force_pty);
         assert!(!cli.disable_pty);

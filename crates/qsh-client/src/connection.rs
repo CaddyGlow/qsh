@@ -617,8 +617,8 @@ impl ChannelConnection {
     }
 
     /// Get the current RTT.
-    pub fn rtt(&self) -> Duration {
-        self.quic.rtt()
+    pub async fn rtt(&self) -> Duration {
+        self.quic.rtt().await
     }
 
     /// Check if there are any restored channels from session resumption.

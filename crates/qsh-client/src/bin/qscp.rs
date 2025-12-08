@@ -1120,7 +1120,7 @@ async fn connect(
 
     // Complete qsh handshake using channel model
     let conn = ChannelConnection::from_quic(quic_conn, config).await?;
-    info!(rtt = ?conn.rtt(), session_id = ?conn.session_id(), "Connected");
+    info!(rtt = ?conn.rtt().await, session_id = ?conn.session_id(), "Connected");
 
     Ok(conn)
 }
@@ -1184,7 +1184,7 @@ async fn connect(
 
     // Connect using the channel model
     let conn = ChannelConnection::connect(config).await?;
-    info!(rtt = ?conn.rtt(), session_id = ?conn.session_id(), "Connected");
+    info!(rtt = ?conn.rtt().await, session_id = ?conn.session_id(), "Connected");
 
     // Drop bootstrap handle after connection
     drop(handle);
