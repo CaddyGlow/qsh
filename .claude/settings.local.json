@@ -22,7 +22,8 @@
       "Bash(curl:*)",
       "WebFetch(domain:docs.quic.tech)",
       "Bash(cargo doc:*)",
-      "Bash(nix develop -c cargo check:*)"
+      "Bash(nix develop -c cargo check:*)",
+      "Bash(nix develop:*)"
     ],
     "deny": [],
     "ask": []

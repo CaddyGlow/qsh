@@ -11,13 +11,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use qsh_core::constants::FORWARD_BUFFER_SIZE;
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{ChannelCloseReason, DirectTcpIpParams};
 
 use crate::connection::ChannelConnection;
-
-/// Buffer size for forwarding.
-const FORWARD_BUFFER_SIZE: usize = 32 * 1024;
 
 /// Local port forwarder (-L).
 ///

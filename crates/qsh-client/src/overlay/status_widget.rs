@@ -5,17 +5,8 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-/// Position of the status overlay.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum OverlayPosition {
-    /// Top of terminal.
-    Top,
-    /// Bottom of terminal.
-    #[default]
-    Bottom,
-    /// Top-right corner.
-    TopRight,
-}
+// Re-export from cli for overlay users
+pub use crate::cli::OverlayPosition;
 
 /// Connection status indicator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -479,6 +470,7 @@ impl StatusOverlay {
             OverlayPosition::Top => 1,
             OverlayPosition::Bottom => 1, // Would need terminal height
             OverlayPosition::TopRight => 1,
+            OverlayPosition::None => return String::new(), // No overlay
         };
 
         // Save cursor, move to position, style, print, reset, restore

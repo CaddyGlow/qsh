@@ -29,7 +29,7 @@ pub fn random_local_port() -> u16 {
     rand::thread_rng().gen_range(LOCAL_PORT_RANGE_LOW..=LOCAL_PORT_RANGE_HIGH)
 }
 
-use qsh_core::constants::DEFAULT_MAX_FORWARDS;
+use qsh_core::constants::{DEFAULT_MAX_FORWARDS, FORWARD_BUFFER_SIZE};
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
     Capabilities, HelloPayload, Message, ResizePayload, SessionId, ShutdownPayload, ShutdownReason,
@@ -178,8 +178,8 @@ pub struct HeartbeatTracker {
     rttvar: f64,
     /// Whether we've received at least one RTT sample.
     hit: bool,
-    /// Pending heartbeat: (sequence, sent_at)
-    pending: Option<(u16, Instant)>,
+    /// Pending heartbeats: (timestamp, sent_at). Supports multiple in-flight.
+    pending: Vec<(u16, Instant)>,
     /// Last received timestamp from peer.
     last_peer_timestamp: Option<u16>,
     /// When we received the last peer timestamp.
@@ -199,6 +199,10 @@ impl HeartbeatTracker {
     pub const MIN_RTO: f64 = 50.0;
     /// Maximum RTO in ms.
     pub const MAX_RTO: f64 = 1000.0;
+    /// Minimum send interval (ms) - same as mosh.
+    const SEND_INTERVAL_MIN: f64 = 20.0;
+    /// Maximum send interval (ms) - same as mosh.
+    const SEND_INTERVAL_MAX: f64 = 250.0;
 
     /// Create a new heartbeat tracker.
     pub fn new() -> Self {
@@ -206,7 +210,7 @@ impl HeartbeatTracker {
             srtt: Self::INITIAL_SRTT,
             rttvar: Self::INITIAL_RTTVAR,
             hit: false,
-            pending: None,
+            pending: Vec::new(),
             last_peer_timestamp: None,
             last_peer_received_at: None,
         }
@@ -227,9 +231,16 @@ impl HeartbeatTracker {
     }
 
     /// Record sending a heartbeat. Returns the heartbeat to send.
+    ///
+    /// Supports multiple in-flight heartbeats for accurate RTT measurement
+    /// even with adaptive send intervals.
     pub fn send_heartbeat(&mut self) -> qsh_core::protocol::HeartbeatPayload {
         let timestamp = Self::timestamp16();
-        self.pending = Some((timestamp, Instant::now()));
+        let now = Instant::now();
+
+        // Add to pending list (prune old entries > 5s to prevent unbounded growth)
+        self.pending.retain(|(_, sent_at)| sent_at.elapsed().as_secs() < 5);
+        self.pending.push((timestamp, now));
 
         // Include reply if we have a recent peer timestamp
         let timestamp_reply = if let (Some(peer_ts), Some(received_at)) =
@@ -257,21 +268,20 @@ impl HeartbeatTracker {
         self.last_peer_timestamp = Some(payload.timestamp);
         self.last_peer_received_at = Some(Instant::now());
 
-        // If we have a pending heartbeat and this is a reply, calculate RTT
+        // If this is a reply, find matching pending heartbeat and calculate RTT
         if payload.has_reply() {
-            if let Some((sent_ts, sent_at)) = self.pending.take() {
-                // Check if this reply is for our pending heartbeat
-                // (timestamp_reply should be close to sent_ts)
-                let diff = Self::timestamp_diff(payload.timestamp_reply, sent_ts).abs();
-                if diff < 5000 {
-                    // Use local timing for accuracy
-                    let rtt_ms = sent_at.elapsed().as_secs_f64() * 1000.0;
+            // Find the pending heartbeat that matches this reply
+            let reply_ts = payload.timestamp_reply;
+            if let Some(idx) = self.pending.iter().position(|(sent_ts, _)| {
+                Self::timestamp_diff(reply_ts, *sent_ts).abs() < 5000
+            }) {
+                let (_, sent_at) = self.pending.remove(idx);
+                let rtt_ms = sent_at.elapsed().as_secs_f64() * 1000.0;
 
-                    // Ignore large values (> 5 seconds) - likely stale
-                    if rtt_ms < 5000.0 {
-                        self.update_srtt(rtt_ms);
-                        return Some(Duration::from_secs_f64(rtt_ms / 1000.0));
-                    }
+                // Ignore large values (> 5 seconds) - likely stale
+                if rtt_ms < 5000.0 {
+                    self.update_srtt(rtt_ms);
+                    return Some(Duration::from_secs_f64(rtt_ms / 1000.0));
                 }
             }
         }
@@ -316,6 +326,15 @@ impl HeartbeatTracker {
     /// Check if we have measured RTT at least once.
     pub fn has_measurement(&self) -> bool {
         self.hit
+    }
+
+    /// Get the adaptive send interval (SRTT / 2, clamped to 20-250ms).
+    ///
+    /// Same algorithm as mosh: faster heartbeats for low latency,
+    /// slower for high latency connections.
+    pub fn send_interval(&self) -> Duration {
+        let interval_ms = (self.srtt / 2.0).clamp(Self::SEND_INTERVAL_MIN, Self::SEND_INTERVAL_MAX);
+        Duration::from_secs_f64(interval_ms / 1000.0)
     }
 }
 
@@ -986,6 +1005,38 @@ impl ChannelConnection {
         Ok(channel)
     }
 
+    /// Send a global request and wait for the reply.
+    ///
+    /// Handles request ID allocation, sending, and waiting for the matching response.
+    async fn send_global_request(&self, request: GlobalRequest) -> Result<GlobalReplyResult> {
+        let request_id = self
+            .next_global_request_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let payload = GlobalRequestPayload { request_id, request };
+
+        let mut control = self.control.lock().await;
+        control.send(&Message::GlobalRequest(payload)).await?;
+
+        // Read until we get our GlobalReply
+        loop {
+            match control.recv().await? {
+                Message::GlobalReply(reply) if reply.request_id == request_id => {
+                    return Ok(reply.result);
+                }
+                Message::GlobalReply(reply) => {
+                    debug!(
+                        request_id = reply.request_id,
+                        "Received GlobalReply for different request"
+                    );
+                }
+                other => {
+                    debug!(?other, "Ignoring message while waiting for GlobalReply");
+                }
+            }
+        }
+    }
+
     /// Request a remote port forward (-R).
     ///
     /// - `bind_host`, `bind_port`: Address to bind on the server
@@ -999,115 +1050,51 @@ impl ChannelConnection {
         target_host: &str,
         target_port: u16,
     ) -> Result<u16> {
-        let request_id = self
-            .next_global_request_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-        let request = GlobalRequestPayload {
-            request_id,
-            request: GlobalRequest::TcpIpForward {
+        let result = self
+            .send_global_request(GlobalRequest::TcpIpForward {
                 bind_host: bind_host.to_string(),
                 bind_port,
+            })
+            .await?;
+
+        // Extract the actual bound port from the result
+        let actual_port = match &result {
+            GlobalReplyResult::Success(GlobalReplyData::TcpIpForward { bound_port }) => *bound_port,
+            GlobalReplyResult::Success(_) => bind_port, // Fallback to requested port
+            GlobalReplyResult::Failure { message } => {
+                return Err(Error::Forward {
+                    message: message.clone(),
+                });
+            }
+        };
+
+        // Store the target info so we can connect when the server notifies us
+        self.remote_forwards.write().await.insert(
+            (bind_host.to_string(), actual_port),
+            RemoteForwardTarget {
+                target_host: target_host.to_string(),
+                target_port,
             },
-        };
-
-        // Send request and wait for reply within the same lock scope
-        let result = {
-            let mut control = self.control.lock().await;
-            control.send(&Message::GlobalRequest(request)).await?;
-
-            // Read until we get our GlobalReply
-            loop {
-                match control.recv().await? {
-                    Message::GlobalReply(reply) if reply.request_id == request_id => {
-                        break reply.result;
-                    }
-                    Message::GlobalReply(reply) => {
-                        debug!(
-                            request_id = reply.request_id,
-                            "Received GlobalReply for different request"
-                        );
-                    }
-                    other => {
-                        debug!(?other, "Ignoring message while waiting for GlobalReply");
-                    }
-                }
-            }
-        };
-
-        match result {
-            GlobalReplyResult::Success(GlobalReplyData::TcpIpForward { bound_port: bp }) => {
-                // Store the target info so we can connect when the server notifies us
-                self.remote_forwards.write().await.insert(
-                    (bind_host.to_string(), bp),
-                    RemoteForwardTarget {
-                        target_host: target_host.to_string(),
-                        target_port,
-                    },
-                );
-                info!(
-                    bind_host,
-                    bind_port,
-                    bound_port = bp,
-                    target_host,
-                    target_port,
-                    "Remote forward established"
-                );
-                Ok(bp)
-            }
-            GlobalReplyResult::Success(_) => {
-                // Unexpected reply data type, but treat as success
-                // Still store the target
-                self.remote_forwards.write().await.insert(
-                    (bind_host.to_string(), bind_port),
-                    RemoteForwardTarget {
-                        target_host: target_host.to_string(),
-                        target_port,
-                    },
-                );
-                Ok(bind_port)
-            }
-            GlobalReplyResult::Failure { message } => Err(Error::Forward { message }),
-        }
+        );
+        info!(
+            bind_host,
+            bind_port,
+            actual_port,
+            target_host,
+            target_port,
+            "Remote forward established"
+        );
+        Ok(actual_port)
     }
 
     /// Cancel a remote port forward.
     pub async fn cancel_remote_forward(&self, bind_host: &str, bind_port: u16) -> Result<()> {
-        let request_id = self
-            .next_global_request_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-        let request = GlobalRequestPayload {
-            request_id,
-            request: GlobalRequest::CancelTcpIpForward {
+        let result = self
+            .send_global_request(GlobalRequest::CancelTcpIpForward {
                 bind_host: bind_host.to_string(),
                 bind_port,
-            },
-        };
-
-        // Send request and wait for reply within the same lock scope
-        let result = {
-            let mut control = self.control.lock().await;
-            control.send(&Message::GlobalRequest(request)).await?;
-
-            // Read until we get our GlobalReply
-            loop {
-                match control.recv().await? {
-                    Message::GlobalReply(reply) if reply.request_id == request_id => {
-                        break reply.result;
-                    }
-                    Message::GlobalReply(reply) => {
-                        debug!(
-                            request_id = reply.request_id,
-                            "Received GlobalReply for different request"
-                        );
-                    }
-                    other => {
-                        debug!(?other, "Ignoring message while waiting for GlobalReply");
-                    }
-                }
-            }
-        };
+            })
+            .await?;
 
         match result {
             GlobalReplyResult::Success(_) => {
@@ -1249,8 +1236,7 @@ impl ChannelConnection {
 
         // Task: TCP -> QUIC
         tokio::spawn(async move {
-            const BUFFER_SIZE: usize = 32 * 1024;
-            let mut buf = vec![0u8; BUFFER_SIZE];
+            let mut buf = vec![0u8; FORWARD_BUFFER_SIZE];
             loop {
                 match tcp_read.read(&mut buf).await {
                     Ok(0) => {
@@ -1277,8 +1263,7 @@ impl ChannelConnection {
 
         // Task: QUIC -> TCP
         tokio::spawn(async move {
-            const BUFFER_SIZE: usize = 32 * 1024;
-            let mut buf = vec![0u8; BUFFER_SIZE];
+            let mut buf = vec![0u8; FORWARD_BUFFER_SIZE];
             loop {
                 match quic_stream.recv_raw(&mut buf).await {
                     Ok(0) => {

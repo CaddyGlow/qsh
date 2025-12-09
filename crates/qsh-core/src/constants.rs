@@ -70,7 +70,7 @@ pub const MAX_PENDING_PREDICTIONS: usize = 1000;
 pub const MAX_FORWARDS_PER_SESSION: usize = 100;
 
 /// Buffer size for forwarded data.
-pub const FORWARD_BUFFER_SIZE: usize = 64 * 1024;
+pub const FORWARD_BUFFER_SIZE: usize = 32 * 1024;
 
 /// Maximum forward data chunk size.
 pub const MAX_FORWARD_CHUNK: usize = 64 * 1024;

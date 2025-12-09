@@ -11,14 +11,12 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use qsh_core::constants::FORWARD_BUFFER_SIZE;
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
     ChannelId, DirectTcpIpParams, DynamicForwardParams, ForwardedTcpIpParams,
 };
 use qsh_core::transport::{Connection, QuicConnection, QuicStream, StreamType};
-
-/// Buffer size for forwarding.
-const FORWARD_BUFFER_SIZE: usize = 32 * 1024;
 
 /// Type of port forward.
 #[derive(Debug, Clone)]

@@ -9,10 +9,7 @@ use clap::Parser;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
 
-use qsh_client::cli::{
-    NotificationStyle as CliNotificationStyle, OverlayPosition as CliOverlayPosition,
-    SshBootstrapMode,
-};
+use qsh_client::cli::{NotificationStyle as CliNotificationStyle, SshBootstrapMode};
 use qsh_client::overlay::{
     ConnectionStatus, NotificationEngine, NotificationStyle, OverlayPosition, PredictionOverlay,
     StatusOverlay,
@@ -84,6 +81,33 @@ fn main() {
         eprintln!("qsh: {}", e);
         std::process::exit(1);
     }
+}
+
+/// Spawn a control message handler task for server-initiated channels.
+///
+/// Returns a JoinHandle that processes ForwardedTcpIp and shutdown requests.
+fn spawn_control_handler(
+    conn: std::sync::Arc<ChannelConnection>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        info!("Control message handler started");
+        loop {
+            debug!("Waiting for control message...");
+            match conn.recv_control().await {
+                Ok(msg) => {
+                    info!(?msg, "Received control message");
+                    if let Err(e) = handle_control_message(&conn, msg).await {
+                        warn!(error = %e, "Error handling control message");
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "Control stream ended");
+                    break;
+                }
+            }
+        }
+    })
 }
 
 /// Handle control messages in forwarding-only mode.
@@ -202,26 +226,7 @@ async fn run_client_direct(cli: &Cli, host: &str, user: Option<&str>) -> qsh_cor
         let _forward_handles = start_forwards(cli, &conn).await?;
 
         // Spawn control message handler for server-initiated channels (remote forwards)
-        let conn_clone = std::sync::Arc::clone(&conn);
-        let control_task = tokio::spawn(async move {
-            info!("Control message handler started");
-            loop {
-                debug!("Waiting for control message...");
-                match conn_clone.recv_control().await {
-                    Ok(msg) => {
-                        info!(?msg, "Received control message");
-                        if let Err(e) = handle_control_message(&conn_clone, msg).await {
-                            warn!(error = %e, "Error handling control message");
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Control stream ended");
-                        break;
-                    }
-                }
-            }
-        });
+        let control_task = spawn_control_handler(std::sync::Arc::clone(&conn));
 
         // Wait for Ctrl+C
         info!("Press Ctrl+C to exit");
@@ -339,26 +344,7 @@ async fn run_client_channel_model(
         let _forward_handles = start_forwards(cli, &conn).await?;
 
         // Spawn control message handler for server-initiated channels (remote forwards)
-        let conn_clone = std::sync::Arc::clone(&conn);
-        let control_task = tokio::spawn(async move {
-            info!("Control message handler started");
-            loop {
-                debug!("Waiting for control message...");
-                match conn_clone.recv_control().await {
-                    Ok(msg) => {
-                        info!(?msg, "Received control message");
-                        if let Err(e) = handle_control_message(&conn_clone, msg).await {
-                            warn!(error = %e, "Error handling control message");
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Control stream ended");
-                        break;
-                    }
-                }
-            }
-        });
+        let control_task = spawn_control_handler(std::sync::Arc::clone(&conn));
 
         // Wait for Ctrl+C
         info!("Press Ctrl+C to exit");
@@ -465,16 +451,6 @@ fn format_user_host(user: Option<&str>, host: &str) -> String {
     match user {
         Some(u) => format!("{}@{}", u, host),
         None => host.to_string(),
-    }
-}
-
-/// Convert CLI overlay position to overlay module position.
-fn map_overlay_position(cli_pos: CliOverlayPosition) -> Option<OverlayPosition> {
-    match cli_pos {
-        CliOverlayPosition::Top => Some(OverlayPosition::Top),
-        CliOverlayPosition::Bottom => Some(OverlayPosition::Bottom),
-        CliOverlayPosition::TopRight => Some(OverlayPosition::TopRight),
-        CliOverlayPosition::None => None,
     }
 }
 
@@ -627,13 +603,11 @@ fn create_status_overlay(cli: &Cli, user_host: Option<String>) -> StatusOverlay 
     let mut overlay = StatusOverlay::new();
 
     // Set position
-    if let Some(pos) = map_overlay_position(cli.overlay_position) {
-        overlay.set_position(pos);
-    }
+    overlay.set_position(cli.overlay_position);
 
     // Set initial visibility (--status enables, --no-overlay disables)
     let visible =
-        cli.show_status && !cli.no_overlay && cli.overlay_position != CliOverlayPosition::None;
+        cli.show_status && !cli.no_overlay && cli.overlay_position != OverlayPosition::None;
     overlay.set_visible(visible);
 
     // Set user@host if available
@@ -866,10 +840,10 @@ async fn run_reconnectable_session(
         let mut frame_count: u64 = 0;
         let frame_rate_start = std::time::Instant::now();
 
-        // Heartbeat tracking for RTT measurement (mosh-style but faster)
+        // Heartbeat tracking for RTT measurement (mosh-style adaptive interval)
         let mut heartbeat_tracker = HeartbeatTracker::new();
-        let mut heartbeat_timer = tokio::time::interval(Duration::from_millis(500));
-        heartbeat_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // Next heartbeat time (adaptive: SRTT/2 clamped to 20-250ms)
+        let mut next_heartbeat = tokio::time::Instant::now() + heartbeat_tracker.send_interval();
 
         // Initialize prediction engine with current RTT and cursor
         if prediction_enabled {
@@ -916,14 +890,16 @@ async fn run_reconnectable_session(
                     }
                 }
 
-                // Send heartbeat for RTT measurement
-                _ = heartbeat_timer.tick() => {
+                // Send heartbeat for RTT measurement (adaptive interval)
+                _ = tokio::time::sleep_until(next_heartbeat) => {
                     if let Some(conn) = reconnectable.connection() {
                         let hb = heartbeat_tracker.send_heartbeat();
                         if let Err(e) = conn.send_control(&Message::Heartbeat(hb)).await {
                             debug!(error = %e, "Failed to send heartbeat");
                         }
                     }
+                    // Schedule next heartbeat using adaptive interval (SRTT/2)
+                    next_heartbeat = tokio::time::Instant::now() + heartbeat_tracker.send_interval();
                 }
 
                 // Handle control messages (including heartbeat replies)
