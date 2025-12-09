@@ -824,8 +824,13 @@ async fn run_reconnectable_session(
                 _ = tokio::time::sleep_until(next_heartbeat) => {
                     if let Some(conn) = reconnectable.connection() {
                         let hb = heartbeat_tracker.send_heartbeat();
+                        tracing::trace!(seq = hb.seq, interval_ms = heartbeat_tracker.send_interval().as_millis(), "Sending heartbeat");
                         if let Err(e) = conn.send_control(&Message::Heartbeat(hb)).await {
                             debug!(error = %e, "Failed to send heartbeat");
+                            // Trigger reconnection on transient errors (network drop detection)
+                            if e.is_transient() {
+                                break Err(e);
+                            }
                         }
                     }
                     // Schedule next heartbeat using adaptive interval (SRTT/2)
@@ -1075,12 +1080,14 @@ async fn run_reconnectable_session(
                             // Render notification bar (mosh-style)
                             render_notification(&notification, &mut stdout).await;
                         }
-                        Err(qsh_core::Error::ConnectionClosed) => {
-                            info!("Channel closed");
-                            break Ok(());
-                        }
                         Err(e) => {
-                            warn!(error = %e, "recv_event error");
+                            // ConnectionClosed is transient - trigger reconnection
+                            // Other errors may be fatal or transient (handled by outer loop)
+                            if matches!(e, qsh_core::Error::ConnectionClosed) {
+                                info!("Channel closed, will attempt reconnect");
+                            } else {
+                                warn!(error = %e, "recv_event error");
+                            }
                             break Err(e);
                         }
                     }

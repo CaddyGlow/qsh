@@ -198,6 +198,7 @@ async fn run_bootstrap(cli: &Cli) -> qsh_core::Result<()> {
         key_pem: bootstrap.key_pem().to_vec(),
         session_config,
         conn_config,
+        bootstrap_mode: true,
     };
 
     // Create listener
@@ -269,6 +270,7 @@ async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
         key_pem,
         session_config,
         conn_config,
+        bootstrap_mode: false,
     };
 
     // Create and run listener

@@ -2,6 +2,22 @@
 //!
 //! This module provides concrete implementations of the Connection and StreamPair traits
 //! using AWS s2n-quic as an alternative to quiche.
+//!
+//! # Session Resumption / 0-RTT
+//!
+//! **Note:** s2n-quic (as of v1.51) does not expose a public API for session ticket
+//! export/import. The TLS 1.3 session tickets are handled internally by s2n-quic's
+//! integration with s2n-tls, but the session data is not accessible to applications.
+//!
+//! This means QUIC-level 0-RTT session resumption is NOT available with s2n-quic.
+//! Reconnection will always perform a full 1-RTT handshake.
+//!
+//! **Application-level session resumption** (mosh-style: PTY stays alive, channels
+//! restore on reconnect) works correctly and is the primary reconnection mechanism
+//! for qsh.
+//!
+//! For 0-RTT session resumption support, consider using the quiche backend which
+//! exposes session ticket APIs via `session()` and `set_session()`.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -12,7 +28,7 @@ use std::time::Duration;
 use bytes::{Buf, BytesMut};
 use s2n_quic::stream::{BidirectionalStream, ReceiveStream, SendStream};
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::error::{Error, Result};
 use crate::protocol::{ChannelId, Codec, Message};
@@ -224,11 +240,11 @@ enum StreamDirection {
 
 /// Inner state for S2nStream, wrapped in Arc for cloneable sender handles.
 struct S2nStreamInner {
-    /// The underlying s2n-quic bidirectional stream (if bidi).
-    bidi: Option<Mutex<BidirectionalStream>>,
-    /// Send stream (for unidirectional send).
+    /// Send stream (for both bidi and unidirectional send).
+    /// For bidirectional streams, this is the send half from split().
     send: Option<Mutex<SendStream>>,
-    /// Receive stream (for unidirectional recv).
+    /// Receive stream (for both bidi and unidirectional recv).
+    /// For bidirectional streams, this is the recv half from split().
     recv: Option<Mutex<ReceiveStream>>,
     /// Receive buffer for message framing.
     recv_buf: Mutex<BytesMut>,
@@ -245,12 +261,15 @@ pub struct S2nStream {
 
 impl S2nStream {
     /// Create a new bidirectional stream.
+    ///
+    /// The stream is split into separate send/recv halves to avoid lock contention
+    /// between send and recv operations.
     pub fn new_bidi(stream: BidirectionalStream) -> Self {
+        let (recv, send) = stream.split();
         Self {
             inner: Arc::new(S2nStreamInner {
-                bidi: Some(Mutex::new(stream)),
-                send: None,
-                recv: None,
+                send: Some(Mutex::new(send)),
+                recv: Some(Mutex::new(recv)),
                 recv_buf: Mutex::new(BytesMut::with_capacity(8192)),
                 direction: StreamDirection::Bidirectional,
                 closed: AtomicBool::new(false),
@@ -262,7 +281,6 @@ impl S2nStream {
     pub fn send_only(stream: SendStream) -> Self {
         Self {
             inner: Arc::new(S2nStreamInner {
-                bidi: None,
                 send: Some(Mutex::new(stream)),
                 recv: None,
                 recv_buf: Mutex::new(BytesMut::new()),
@@ -276,7 +294,6 @@ impl S2nStream {
     pub fn recv_only(stream: ReceiveStream) -> Self {
         Self {
             inner: Arc::new(S2nStreamInner {
-                bidi: None,
                 send: None,
                 recv: Some(Mutex::new(stream)),
                 recv_buf: Mutex::new(BytesMut::with_capacity(8192)),
@@ -289,11 +306,11 @@ impl S2nStream {
     /// Create a bidirectional stream with pre-populated buffer.
     pub fn with_buffer(stream: BidirectionalStream, initial_data: Option<BytesMut>) -> Self {
         let recv_buf = initial_data.unwrap_or_else(|| BytesMut::with_capacity(8192));
+        let (recv, send) = stream.split();
         Self {
             inner: Arc::new(S2nStreamInner {
-                bidi: Some(Mutex::new(stream)),
-                send: None,
-                recv: None,
+                send: Some(Mutex::new(send)),
+                recv: Some(Mutex::new(recv)),
                 recv_buf: Mutex::new(recv_buf),
                 direction: StreamDirection::Bidirectional,
                 closed: AtomicBool::new(false),
@@ -317,34 +334,20 @@ impl S2nStream {
     pub async fn send_raw(&self, data: &[u8]) -> Result<()> {
         use tokio::io::AsyncWriteExt;
 
-        match self.inner.direction {
-            StreamDirection::RecvOnly => {
-                return Err(Error::Transport {
-                    message: "stream is receive-only".to_string(),
-                });
-            }
-            StreamDirection::Bidirectional => {
-                if let Some(ref bidi) = self.inner.bidi {
-                    let mut stream = bidi.lock().await;
-                    stream.write_all(data).await.map_err(|e| Error::Transport {
-                        message: format!("stream send failed: {}", e),
-                    })?;
-                    stream.flush().await.map_err(|e| Error::Transport {
-                        message: format!("stream flush failed: {}", e),
-                    })?;
-                }
-            }
-            StreamDirection::SendOnly => {
-                if let Some(ref send) = self.inner.send {
-                    let mut stream = send.lock().await;
-                    stream.write_all(data).await.map_err(|e| Error::Transport {
-                        message: format!("stream send failed: {}", e),
-                    })?;
-                    stream.flush().await.map_err(|e| Error::Transport {
-                        message: format!("stream flush failed: {}", e),
-                    })?;
-                }
-            }
+        if matches!(self.inner.direction, StreamDirection::RecvOnly) {
+            return Err(Error::Transport {
+                message: "stream is receive-only".to_string(),
+            });
+        }
+
+        if let Some(ref send) = self.inner.send {
+            let mut stream = send.lock().await;
+            stream.write_all(data).await.map_err(|e| Error::Transport {
+                message: format!("stream send failed: {}", e),
+            })?;
+            stream.flush().await.map_err(|e| Error::Transport {
+                message: format!("stream flush failed: {}", e),
+            })?;
         }
         Ok(())
     }
@@ -353,36 +356,21 @@ impl S2nStream {
     pub async fn recv_raw(&self, buf: &mut [u8]) -> Result<usize> {
         use tokio::io::AsyncReadExt;
 
-        match self.inner.direction {
-            StreamDirection::SendOnly => {
-                return Err(Error::Transport {
-                    message: "stream is send-only".to_string(),
-                });
-            }
-            StreamDirection::Bidirectional => {
-                if let Some(ref bidi) = self.inner.bidi {
-                    let mut stream = bidi.lock().await;
-                    stream.read(buf).await.map_err(|e| Error::Transport {
-                        message: format!("stream recv failed: {}", e),
-                    })
-                } else {
-                    Err(Error::Transport {
-                        message: "no stream available".to_string(),
-                    })
-                }
-            }
-            StreamDirection::RecvOnly => {
-                if let Some(ref recv) = self.inner.recv {
-                    let mut stream = recv.lock().await;
-                    stream.read(buf).await.map_err(|e| Error::Transport {
-                        message: format!("stream recv failed: {}", e),
-                    })
-                } else {
-                    Err(Error::Transport {
-                        message: "no stream available".to_string(),
-                    })
-                }
-            }
+        if matches!(self.inner.direction, StreamDirection::SendOnly) {
+            return Err(Error::Transport {
+                message: "stream is send-only".to_string(),
+            });
+        }
+
+        if let Some(ref recv) = self.inner.recv {
+            let mut stream = recv.lock().await;
+            stream.read(buf).await.map_err(|e| Error::Transport {
+                message: format!("stream recv failed: {}", e),
+            })
+        } else {
+            Err(Error::Transport {
+                message: "no stream available".to_string(),
+            })
         }
     }
 
@@ -390,27 +378,17 @@ impl S2nStream {
     pub async fn finish(&self) -> Result<()> {
         use tokio::io::AsyncWriteExt;
 
-        match self.inner.direction {
-            StreamDirection::RecvOnly => Ok(()),
-            StreamDirection::Bidirectional => {
-                if let Some(ref bidi) = self.inner.bidi {
-                    let mut stream = bidi.lock().await;
-                    stream.shutdown().await.map_err(|e| Error::Transport {
-                        message: format!("stream shutdown failed: {}", e),
-                    })?;
-                }
-                Ok(())
-            }
-            StreamDirection::SendOnly => {
-                if let Some(ref send) = self.inner.send {
-                    let mut stream = send.lock().await;
-                    stream.shutdown().await.map_err(|e| Error::Transport {
-                        message: format!("stream shutdown failed: {}", e),
-                    })?;
-                }
-                Ok(())
-            }
+        if matches!(self.inner.direction, StreamDirection::RecvOnly) {
+            return Ok(());
         }
+
+        if let Some(ref send) = self.inner.send {
+            let mut stream = send.lock().await;
+            stream.shutdown().await.map_err(|e| Error::Transport {
+                message: format!("stream shutdown failed: {}", e),
+            })?;
+        }
+        Ok(())
     }
 
     /// Split the stream into separate reader and writer halves.
@@ -423,16 +401,15 @@ impl S2nStream {
                 // Try to unwrap the Arc - this will fail if there are other references
                 match Arc::try_unwrap(self.inner) {
                     Ok(inner) => {
-                        if let Some(bidi) = inner.bidi {
-                            let stream = bidi.into_inner();
-                            let (recv, send) = stream.split();
-                            let recv_buf = inner.recv_buf.into_inner();
-                            Ok((S2nStreamWriter::new(send), S2nStreamReader::new(recv, Some(recv_buf))))
-                        } else {
-                            Err(Error::Transport {
-                                message: "no bidirectional stream to split".to_string(),
-                            })
-                        }
+                        // For bidirectional streams, we already have split halves
+                        let send = inner.send.ok_or_else(|| Error::Transport {
+                            message: "no send stream available".to_string(),
+                        })?.into_inner();
+                        let recv = inner.recv.ok_or_else(|| Error::Transport {
+                            message: "no recv stream available".to_string(),
+                        })?.into_inner();
+                        let recv_buf = inner.recv_buf.into_inner();
+                        Ok((S2nStreamWriter::new(send), S2nStreamReader::new(recv, Some(recv_buf))))
                     }
                     Err(_) => Err(Error::Transport {
                         message: "cannot split stream while sender handles exist".to_string(),
@@ -454,36 +431,21 @@ impl StreamPair for S2nStream {
         async move {
             use tokio::io::AsyncWriteExt;
 
-            match inner.direction {
-                StreamDirection::RecvOnly => {
-                    return Err(Error::Transport {
-                        message: "stream is receive-only".to_string(),
-                    });
-                }
-                StreamDirection::Bidirectional => {
-                    let data = data?;
-                    if let Some(ref bidi) = inner.bidi {
-                        let mut stream = bidi.lock().await;
-                        stream.write_all(&data).await.map_err(|e| Error::Transport {
-                            message: format!("stream send failed: {}", e),
-                        })?;
-                        stream.flush().await.map_err(|e| Error::Transport {
-                            message: format!("stream flush failed: {}", e),
-                        })?;
-                    }
-                }
-                StreamDirection::SendOnly => {
-                    let data = data?;
-                    if let Some(ref send) = inner.send {
-                        let mut stream = send.lock().await;
-                        stream.write_all(&data).await.map_err(|e| Error::Transport {
-                            message: format!("stream send failed: {}", e),
-                        })?;
-                        stream.flush().await.map_err(|e| Error::Transport {
-                            message: format!("stream flush failed: {}", e),
-                        })?;
-                    }
-                }
+            if matches!(inner.direction, StreamDirection::RecvOnly) {
+                return Err(Error::Transport {
+                    message: "stream is receive-only".to_string(),
+                });
+            }
+
+            let data = data?;
+            if let Some(ref send) = inner.send {
+                let mut stream = send.lock().await;
+                stream.write_all(&data).await.map_err(|e| Error::Transport {
+                    message: format!("stream send failed: {}", e),
+                })?;
+                stream.flush().await.map_err(|e| Error::Transport {
+                    message: format!("stream flush failed: {}", e),
+                })?;
             }
             Ok(())
         }
@@ -509,28 +471,13 @@ impl StreamPair for S2nStream {
                 }
 
                 let mut chunk = [0u8; 4096];
-                let n = match inner.direction {
-                    StreamDirection::Bidirectional => {
-                        if let Some(ref bidi) = inner.bidi {
-                            let mut stream = bidi.lock().await;
-                            stream.read(&mut chunk).await.map_err(|e| Error::Transport {
-                                message: format!("stream recv failed: {}", e),
-                            })?
-                        } else {
-                            return Err(Error::ConnectionClosed);
-                        }
-                    }
-                    StreamDirection::RecvOnly => {
-                        if let Some(ref recv) = inner.recv {
-                            let mut stream = recv.lock().await;
-                            stream.read(&mut chunk).await.map_err(|e| Error::Transport {
-                                message: format!("stream recv failed: {}", e),
-                            })?
-                        } else {
-                            return Err(Error::ConnectionClosed);
-                        }
-                    }
-                    StreamDirection::SendOnly => unreachable!(),
+                let n = if let Some(ref recv) = inner.recv {
+                    let mut stream = recv.lock().await;
+                    stream.read(&mut chunk).await.map_err(|e| Error::Transport {
+                        message: format!("stream recv failed: {}", e),
+                    })?
+                } else {
+                    return Err(Error::ConnectionClosed);
                 };
 
                 if n > 0 {
@@ -649,34 +596,20 @@ impl S2nSender {
     pub async fn send_raw(&self, data: &[u8]) -> Result<()> {
         use tokio::io::AsyncWriteExt;
 
-        match self.inner.direction {
-            StreamDirection::RecvOnly => {
-                return Err(Error::Transport {
-                    message: "stream is receive-only".to_string(),
-                });
-            }
-            StreamDirection::Bidirectional => {
-                if let Some(ref bidi) = self.inner.bidi {
-                    let mut stream = bidi.lock().await;
-                    stream.write_all(data).await.map_err(|e| Error::Transport {
-                        message: format!("stream send failed: {}", e),
-                    })?;
-                    stream.flush().await.map_err(|e| Error::Transport {
-                        message: format!("stream flush failed: {}", e),
-                    })?;
-                }
-            }
-            StreamDirection::SendOnly => {
-                if let Some(ref send) = self.inner.send {
-                    let mut stream = send.lock().await;
-                    stream.write_all(data).await.map_err(|e| Error::Transport {
-                        message: format!("stream send failed: {}", e),
-                    })?;
-                    stream.flush().await.map_err(|e| Error::Transport {
-                        message: format!("stream flush failed: {}", e),
-                    })?;
-                }
-            }
+        if matches!(self.inner.direction, StreamDirection::RecvOnly) {
+            return Err(Error::Transport {
+                message: "stream is receive-only".to_string(),
+            });
+        }
+
+        if let Some(ref send) = self.inner.send {
+            let mut stream = send.lock().await;
+            stream.write_all(data).await.map_err(|e| Error::Transport {
+                message: format!("stream send failed: {}", e),
+            })?;
+            stream.flush().await.map_err(|e| Error::Transport {
+                message: format!("stream flush failed: {}", e),
+            })?;
         }
         Ok(())
     }
@@ -685,27 +618,17 @@ impl S2nSender {
     pub async fn finish(&self) -> Result<()> {
         use tokio::io::AsyncWriteExt;
 
-        match self.inner.direction {
-            StreamDirection::RecvOnly => Ok(()),
-            StreamDirection::Bidirectional => {
-                if let Some(ref bidi) = self.inner.bidi {
-                    let mut stream = bidi.lock().await;
-                    stream.shutdown().await.map_err(|e| Error::Transport {
-                        message: format!("stream shutdown failed: {}", e),
-                    })?;
-                }
-                Ok(())
-            }
-            StreamDirection::SendOnly => {
-                if let Some(ref send) = self.inner.send {
-                    let mut stream = send.lock().await;
-                    stream.shutdown().await.map_err(|e| Error::Transport {
-                        message: format!("stream shutdown failed: {}", e),
-                    })?;
-                }
-                Ok(())
-            }
+        if matches!(self.inner.direction, StreamDirection::RecvOnly) {
+            return Ok(());
         }
+
+        if let Some(ref send) = self.inner.send {
+            let mut stream = send.lock().await;
+            stream.shutdown().await.map_err(|e| Error::Transport {
+                message: format!("stream shutdown failed: {}", e),
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -792,22 +715,24 @@ impl S2nConnection {
 
     /// Get session data for 0-RTT resumption on reconnect.
     ///
-    /// Note: s2n-quic handles session resumption differently than quiche.
-    /// This is a placeholder that returns None.
+    /// **Note:** Always returns `None` for s2n-quic. Session resumption APIs
+    /// are not exposed by s2n-quic. Use the quiche backend for 0-RTT support.
     pub async fn session_data(&self) -> Option<Vec<u8>> {
-        // s2n-quic manages session tickets internally
         None
     }
 
     /// Check if the connection has early data available (0-RTT phase).
+    ///
+    /// **Note:** Always returns `false` for s2n-quic.
     pub async fn is_in_early_data(&self) -> bool {
-        // s2n-quic doesn't expose this directly in the same way
         false
     }
 
     /// Check if the connection was resumed from a previous session (0-RTT).
+    ///
+    /// **Note:** Always returns `false` for s2n-quic. Session resumption APIs
+    /// are not exposed by s2n-quic.
     pub async fn is_resumed(&self) -> bool {
-        // s2n-quic doesn't expose this directly
         false
     }
 
@@ -1325,29 +1250,29 @@ pub fn build_server_config(
 
 use super::{ConnectConfig, ConnectResult, ListenerConfig};
 use std::time::Instant;
-use tracing::info;
 
 /// Establish a QUIC client connection using s2n-quic.
 ///
 /// This performs the full QUIC/TLS handshake and returns a connected
-/// `S2nConnection`. Currently, s2n-quic handles 0-RTT internally, so
-/// session data management is limited compared to quiche.
+/// `S2nConnection`.
 ///
 /// # Arguments
 /// * `config` - Connection configuration including server address, timeouts, and optional session data
 ///
 /// # Returns
-/// * `Ok(ConnectResult)` - Contains the connection, resume status, and new session data
+/// * `Ok(ConnectResult)` - Contains the connection, resume status (always false for s2n-quic), and session data (always None)
 /// * `Err(Error)` - On connection failure (timeout, handshake failure, certificate mismatch)
 ///
-/// # Note
-/// s2n-quic has a higher-level API than quiche. Some features like explicit
-/// session ticket management and certificate hash verification require
-/// additional configuration via custom providers.
+/// # 0-RTT Session Resumption
+/// **NOT SUPPORTED** with s2n-quic. The `session_data` field in `ConnectConfig` is ignored,
+/// and `ConnectResult.session_data` will always be `None`. Reconnection will always use
+/// a full 1-RTT handshake.
+///
+/// For 0-RTT support, use the quiche backend instead.
 ///
 /// # Certificate Verification
-/// - If `cert_hash` is None: X.509 verification is disabled (for bootstrap mode)
-/// - If `cert_hash` is Some: Verification is disabled, but the cert hash is checked after handshake
+/// - X.509 verification is disabled for bootstrap mode (self-signed certificates)
+/// - Certificate hash verification should be done at the application layer
 pub async fn connect_quic(config: &ConnectConfig) -> Result<ConnectResult<S2nConnection>> {
     use s2n_quic::Client;
     use s2n_quic::client::Connect;
@@ -1368,9 +1293,15 @@ pub async fn connect_quic(config: &ConnectConfig) -> Result<ConnectResult<S2nCon
         format!("[::]:{}", config.local_port.unwrap_or(0))
     };
 
+    // Note: session_data is ignored - s2n-quic does not expose session resumption APIs
+    // See module-level documentation for details
+    if config.session_data.is_some() {
+        debug!("session_data provided but s2n-quic does not support 0-RTT session resumption");
+    }
+
     // Configure TLS
-    // For bootstrap mode (no cert_hash or cert_hash provided), we disable X.509 verification
-    // since we're using self-signed certificates with hash-based pinning
+    // For bootstrap mode, we disable X.509 verification since we're using
+    // self-signed certificates with hash-based pinning
     let mut tls_builder = s2n_tls::Client::builder();
 
     // Disable X.509 verification for self-signed certificates
@@ -1439,26 +1370,20 @@ pub async fn connect_quic(config: &ConnectConfig) -> Result<ConnectResult<S2nCon
     );
 
     // Wrap in S2nConnection with shared stats
-    let s2n_conn = S2nConnection::from_client_connection(connection, local_addr, stats).await?;
+    let s2n_conn = S2nConnection::from_client_connection(
+        connection,
+        local_addr,
+        stats,
+    ).await?;
 
-    // TODO: Verify cert_hash if provided
-    // For now, we rely on the hash check in the application layer (qsh-client)
-    // Future: Extract peer cert and verify hash here
+    // Note: Certificate hash verification should be done at the application layer
+    // s2n-quic doesn't expose the peer certificate chain directly
 
-    // Note: s2n-quic handles session resumption internally
-    // We return None for session_data since we can't extract it easily
-    // Future: implement custom session ticket provider for full parity
-    let resumed = s2n_conn.is_resumed().await;
-    let session_data = s2n_conn.session_data().await;
-
-    if resumed {
-        info!(addr = %config.server_addr, "0-RTT session resumed");
-    }
-
+    // 0-RTT is not supported - always return resumed=false and session_data=None
     Ok(ConnectResult {
         connection: s2n_conn,
-        resumed,
-        session_data,
+        resumed: false,
+        session_data: None,
     })
 }
 
@@ -1481,6 +1406,7 @@ impl S2nAcceptor {
     /// Create a new QUIC acceptor bound to the specified address.
     pub async fn bind(addr: std::net::SocketAddr, config: ListenerConfig) -> Result<Self> {
         use s2n_quic::Server;
+        use s2n_quic::provider::tls::s2n_tls;
 
         let cert_pem_str = std::str::from_utf8(&config.cert_pem).map_err(|e| Error::CertificateError {
             message: format!("invalid certificate PEM encoding: {}", e),
@@ -1497,8 +1423,22 @@ impl S2nAcceptor {
                 message: format!("failed to configure idle timeout: {}", e),
             })?;
 
+        // Build TLS config
+        // Note: Session ticket configuration is ignored since s2n-quic doesn't expose
+        // session resumption APIs to applications. The ticket_key in ListenerConfig
+        // is ignored for the s2n-quic backend.
+        let tls = s2n_tls::Server::builder()
+            .with_certificate(cert_pem_str, key_pem_str)
+            .map_err(|e| Error::CertificateError {
+                message: format!("failed to configure TLS certificate: {}", e),
+            })?
+            .build()
+            .map_err(|e| Error::Transport {
+                message: format!("failed to build TLS config: {}", e),
+            })?;
+
         let server = Server::builder()
-            .with_tls((cert_pem_str, key_pem_str))
+            .with_tls(tls)
             .map_err(|e| Error::CertificateError {
                 message: format!("failed to configure TLS: {}", e),
             })?

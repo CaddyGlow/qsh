@@ -250,9 +250,9 @@ impl ReconnectableConnection {
                 (context.reconnect_config(), context.session_id())
             };
 
-            // Inject cached session data for 0-RTT resumption
+            // Inject cached session data for 0-RTT resumption (quiche backend only)
+            // Note: s2n-quic does not support session resumption, so this will be ignored
             config.session_data = read_lock(&self.session_data).clone();
-            let had_session_data = config.session_data.is_some();
 
             // Apply port hopping if needed (Mosh-style)
             config.local_port = current_local_port;
@@ -267,7 +267,9 @@ impl ReconnectableConnection {
 
             match result {
                 Ok(conn) => {
-                    // Check if 0-RTT was used
+                    // Log reconnection success
+                    // Note: 0-RTT (resumed=true) is only available with quiche backend.
+                    // s2n-quic does not expose session resumption APIs, so is_resumed() always returns false.
                     let is_resumed = conn.quic().is_resumed().await;
                     if is_resumed {
                         info!(
@@ -276,21 +278,13 @@ impl ReconnectableConnection {
                             local_port = ?current_local_port,
                             "Reconnection successful (0-RTT)"
                         );
-                    } else if had_session_data {
-                        // We had session data but didn't get 0-RTT - something's wrong
-                        warn!(
-                            attempt,
-                            session_id = ?conn.session_id(),
-                            local_port = ?current_local_port,
-                            "Reconnection successful but 0-RTT failed (had session data)"
-                        );
                     } else {
-                        // No session data - expected 1-RTT
+                        // 1-RTT reconnection (normal for s2n-quic backend)
                         info!(
                             attempt,
                             session_id = ?conn.session_id(),
                             local_port = ?current_local_port,
-                            "Reconnection successful (1-RTT, no session data cached)"
+                            "Reconnection successful"
                         );
                     }
 

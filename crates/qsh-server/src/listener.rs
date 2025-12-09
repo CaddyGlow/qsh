@@ -47,6 +47,8 @@ pub struct ServerConfig {
     pub session_config: SessionConfig,
     /// Connection configuration.
     pub conn_config: ConnectionConfig,
+    /// Bootstrap mode (uses shorter idle timeout for faster reconnection).
+    pub bootstrap_mode: bool,
 }
 
 // =============================================================================
@@ -78,10 +80,17 @@ impl QshListener {
     /// This binds a UDP socket and configures it for optimal QUIC handling,
     /// including IP_RECVERR on Linux for fast disconnect detection.
     pub async fn bind(config: ServerConfig) -> Result<Self> {
+        // Use shorter idle timeout for bootstrap mode (faster reconnection)
+        let idle_timeout = if config.bootstrap_mode {
+            Duration::from_millis(BOOTSTRAP_IDLE_TIMEOUT_MS)
+        } else {
+            IDLE_TIMEOUT
+        };
+
         let listener_config = ListenerConfig {
             cert_pem: config.cert_pem.clone(),
             key_pem: config.key_pem.clone(),
-            idle_timeout: IDLE_TIMEOUT,
+            idle_timeout,
             ticket_key: None,
         };
 
@@ -107,10 +116,17 @@ impl QshListener {
         socket: Arc<tokio::net::UdpSocket>,
         config: ServerConfig,
     ) -> Result<Self> {
+        // Use shorter idle timeout for bootstrap mode (faster reconnection)
+        let idle_timeout = if config.bootstrap_mode {
+            Duration::from_millis(BOOTSTRAP_IDLE_TIMEOUT_MS)
+        } else {
+            IDLE_TIMEOUT
+        };
+
         let listener_config = ListenerConfig {
             cert_pem: config.cert_pem.clone(),
             key_pem: config.key_pem.clone(),
-            idle_timeout: IDLE_TIMEOUT,
+            idle_timeout,
             ticket_key: None,
         };
 
@@ -147,20 +163,24 @@ impl QshListener {
     ///
     /// If `single_session` is true, the server will exit after all sessions
     /// from the first connection have ended (used for bootstrap mode).
-    pub async fn run(mut self, single_session: bool) -> Result<()> {
-        // Adjust idle timeout for bootstrap mode
+    pub async fn run(self, single_session: bool) -> Result<()> {
+        // Log the idle timeout (configured at bind time via ServerConfig.bootstrap_mode)
+        let idle_timeout_ms = if self.config.bootstrap_mode {
+            BOOTSTRAP_IDLE_TIMEOUT_MS
+        } else {
+            IDLE_TIMEOUT.as_millis() as u64
+        };
+
         if single_session {
-            self.acceptor.set_idle_timeout(Duration::from_millis(BOOTSTRAP_IDLE_TIMEOUT_MS));
             info!(
                 addr = %self.local_addr,
-                idle_timeout_ms = BOOTSTRAP_IDLE_TIMEOUT_MS,
+                idle_timeout_ms,
                 "Bootstrap mode server starting"
             );
         } else {
-            self.acceptor.set_idle_timeout(IDLE_TIMEOUT);
             info!(
                 addr = %self.local_addr,
-                idle_timeout_ms = IDLE_TIMEOUT.as_millis(),
+                idle_timeout_ms,
                 "Server starting"
             );
         }
@@ -490,9 +510,11 @@ mod tests {
             key_pem: vec![],
             session_config: SessionConfig::default(),
             conn_config: ConnectionConfig::default(),
+            bootstrap_mode: false,
         };
 
         assert_eq!(config.bind_addr.ip().to_string(), "127.0.0.1");
+        assert!(!config.bootstrap_mode);
     }
 
     #[test]
