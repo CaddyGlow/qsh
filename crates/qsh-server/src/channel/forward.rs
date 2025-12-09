@@ -310,7 +310,7 @@ impl ForwardChannel {
         let (mut target_read, mut target_write) = target_stream.into_split();
 
         // Task: target -> QUIC (returns the sender so we can finish it)
-        let quic_sender = quic_stream.sender();
+        let quic_sender = quic_stream.sender().expect("forward stream must support sending");
         let quic_sender_for_finish = quic_sender.clone();
         let target_to_quic = {
             let channel_id = channel_id;

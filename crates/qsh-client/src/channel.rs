@@ -81,7 +81,7 @@ impl TerminalChannel {
         initial_state: TerminalState,
     ) -> Self {
         let term_size = initial_state.size();
-        let input_sender = input_stream.sender();
+        let input_sender = input_stream.sender().expect("input stream must support sending");
 
         // Create input sender task
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Message>();

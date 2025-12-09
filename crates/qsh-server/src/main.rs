@@ -200,8 +200,16 @@ async fn run_bootstrap(cli: &Cli) -> qsh_core::Result<()> {
         conn_config,
     };
 
-    // Create listener with the bootstrap socket
+    // Create listener
+    // For quiche backend, we share the socket that bootstrap already bound
+    // For s2n backend, we let the listener bind its own socket
+    #[cfg(feature = "quiche-backend")]
     let listener = QshListener::with_socket(bootstrap.socket(), server_config)
+        .await?
+        .with_authorizer(authorizer);
+
+    #[cfg(not(feature = "quiche-backend"))]
+    let listener = QshListener::bind(server_config)
         .await?
         .with_authorizer(authorizer);
 

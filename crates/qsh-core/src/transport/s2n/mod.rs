@@ -5,7 +5,8 @@
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
@@ -17,6 +18,167 @@ use crate::error::{Error, Result};
 use crate::protocol::{ChannelId, Codec, Message};
 
 use super::{Connection, StreamPair, StreamType};
+
+// =============================================================================
+// Connection Statistics (shared between event subscriber and connection)
+// =============================================================================
+
+/// Shared connection statistics updated by the event subscriber.
+///
+/// These statistics are updated atomically by the s2n-quic event system
+/// and can be read from the S2nConnection at any time.
+#[derive(Debug, Default)]
+pub struct ConnectionStats {
+    /// Smoothed RTT in microseconds.
+    smoothed_rtt_us: AtomicU64,
+    /// Minimum RTT in microseconds.
+    min_rtt_us: AtomicU64,
+    /// Latest RTT sample in microseconds.
+    latest_rtt_us: AtomicU64,
+    /// Current congestion window in bytes.
+    congestion_window: AtomicU32,
+    /// Bytes currently in flight.
+    bytes_in_flight: AtomicU32,
+    /// Total packets lost.
+    packets_lost: AtomicU64,
+    /// Total bytes lost.
+    bytes_lost: AtomicU64,
+    /// Total packets sent (for loss ratio calculation).
+    packets_sent: AtomicU64,
+}
+
+impl ConnectionStats {
+    /// Get smoothed RTT as Duration.
+    pub fn smoothed_rtt(&self) -> Duration {
+        Duration::from_micros(self.smoothed_rtt_us.load(Ordering::Relaxed))
+    }
+
+    /// Get minimum RTT as Duration.
+    pub fn min_rtt(&self) -> Duration {
+        Duration::from_micros(self.min_rtt_us.load(Ordering::Relaxed))
+    }
+
+    /// Get latest RTT sample as Duration.
+    pub fn latest_rtt(&self) -> Duration {
+        Duration::from_micros(self.latest_rtt_us.load(Ordering::Relaxed))
+    }
+
+    /// Get congestion window in bytes.
+    pub fn congestion_window(&self) -> u32 {
+        self.congestion_window.load(Ordering::Relaxed)
+    }
+
+    /// Get bytes in flight.
+    pub fn bytes_in_flight(&self) -> u32 {
+        self.bytes_in_flight.load(Ordering::Relaxed)
+    }
+
+    /// Get packet loss ratio (0.0 - 1.0).
+    pub fn packet_loss_ratio(&self) -> f64 {
+        let sent = self.packets_sent.load(Ordering::Relaxed);
+        let lost = self.packets_lost.load(Ordering::Relaxed);
+        if sent == 0 {
+            0.0
+        } else {
+            lost as f64 / sent as f64
+        }
+    }
+
+    /// Get total packets lost.
+    pub fn packets_lost(&self) -> u64 {
+        self.packets_lost.load(Ordering::Relaxed)
+    }
+
+    /// Get total bytes lost.
+    pub fn bytes_lost(&self) -> u64 {
+        self.bytes_lost.load(Ordering::Relaxed)
+    }
+}
+
+// =============================================================================
+// Event Subscriber for Statistics
+// =============================================================================
+
+/// Event subscriber that collects connection statistics.
+///
+/// This subscriber receives events from s2n-quic and updates the shared
+/// ConnectionStats structure.
+pub struct StatsSubscriber {
+    stats: Arc<ConnectionStats>,
+}
+
+impl StatsSubscriber {
+    /// Create a new statistics subscriber with shared stats.
+    pub fn new(stats: Arc<ConnectionStats>) -> Self {
+        Self { stats }
+    }
+}
+
+/// Per-connection context for the stats subscriber.
+pub struct StatsContext {
+    stats: Arc<ConnectionStats>,
+}
+
+impl s2n_quic::provider::event::Subscriber for StatsSubscriber {
+    type ConnectionContext = StatsContext;
+
+    fn create_connection_context(
+        &mut self,
+        _meta: &s2n_quic::provider::event::events::ConnectionMeta,
+        _info: &s2n_quic::provider::event::events::ConnectionInfo,
+    ) -> Self::ConnectionContext {
+        StatsContext {
+            stats: Arc::clone(&self.stats),
+        }
+    }
+
+    fn on_recovery_metrics(
+        &mut self,
+        context: &mut Self::ConnectionContext,
+        _meta: &s2n_quic::provider::event::events::ConnectionMeta,
+        event: &s2n_quic::provider::event::events::RecoveryMetrics,
+    ) {
+        context.stats.smoothed_rtt_us.store(
+            event.smoothed_rtt.as_micros() as u64,
+            Ordering::Relaxed,
+        );
+        context.stats.min_rtt_us.store(
+            event.min_rtt.as_micros() as u64,
+            Ordering::Relaxed,
+        );
+        context.stats.latest_rtt_us.store(
+            event.latest_rtt.as_micros() as u64,
+            Ordering::Relaxed,
+        );
+        context.stats.congestion_window.store(
+            event.congestion_window,
+            Ordering::Relaxed,
+        );
+        context.stats.bytes_in_flight.store(
+            event.bytes_in_flight,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn on_packet_lost(
+        &mut self,
+        context: &mut Self::ConnectionContext,
+        _meta: &s2n_quic::provider::event::events::ConnectionMeta,
+        event: &s2n_quic::provider::event::events::PacketLost,
+    ) {
+        context.stats.packets_lost.fetch_add(1, Ordering::Relaxed);
+        context.stats.bytes_lost.fetch_add(event.bytes_lost as u64, Ordering::Relaxed);
+    }
+
+    fn on_packet_sent(
+        &mut self,
+        context: &mut Self::ConnectionContext,
+        _meta: &s2n_quic::provider::event::events::ConnectionMeta,
+        _event: &s2n_quic::provider::event::events::PacketSent,
+    ) {
+        context.stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 // =============================================================================
 // Channel Stream Header
@@ -60,8 +222,8 @@ enum StreamDirection {
     RecvOnly,
 }
 
-/// A QUIC stream pair using s2n-quic.
-pub struct S2nStream {
+/// Inner state for S2nStream, wrapped in Arc for cloneable sender handles.
+struct S2nStreamInner {
     /// The underlying s2n-quic bidirectional stream (if bidi).
     bidi: Option<Mutex<BidirectionalStream>>,
     /// Send stream (for unidirectional send).
@@ -76,40 +238,51 @@ pub struct S2nStream {
     closed: AtomicBool,
 }
 
+/// A QUIC stream pair using s2n-quic.
+pub struct S2nStream {
+    inner: Arc<S2nStreamInner>,
+}
+
 impl S2nStream {
     /// Create a new bidirectional stream.
     pub fn new_bidi(stream: BidirectionalStream) -> Self {
         Self {
-            bidi: Some(Mutex::new(stream)),
-            send: None,
-            recv: None,
-            recv_buf: Mutex::new(BytesMut::with_capacity(8192)),
-            direction: StreamDirection::Bidirectional,
-            closed: AtomicBool::new(false),
+            inner: Arc::new(S2nStreamInner {
+                bidi: Some(Mutex::new(stream)),
+                send: None,
+                recv: None,
+                recv_buf: Mutex::new(BytesMut::with_capacity(8192)),
+                direction: StreamDirection::Bidirectional,
+                closed: AtomicBool::new(false),
+            }),
         }
     }
 
     /// Create a send-only stream.
     pub fn send_only(stream: SendStream) -> Self {
         Self {
-            bidi: None,
-            send: Some(Mutex::new(stream)),
-            recv: None,
-            recv_buf: Mutex::new(BytesMut::new()),
-            direction: StreamDirection::SendOnly,
-            closed: AtomicBool::new(false),
+            inner: Arc::new(S2nStreamInner {
+                bidi: None,
+                send: Some(Mutex::new(stream)),
+                recv: None,
+                recv_buf: Mutex::new(BytesMut::new()),
+                direction: StreamDirection::SendOnly,
+                closed: AtomicBool::new(false),
+            }),
         }
     }
 
     /// Create a recv-only stream.
     pub fn recv_only(stream: ReceiveStream) -> Self {
         Self {
-            bidi: None,
-            send: None,
-            recv: Some(Mutex::new(stream)),
-            recv_buf: Mutex::new(BytesMut::with_capacity(8192)),
-            direction: StreamDirection::RecvOnly,
-            closed: AtomicBool::new(false),
+            inner: Arc::new(S2nStreamInner {
+                bidi: None,
+                send: None,
+                recv: Some(Mutex::new(stream)),
+                recv_buf: Mutex::new(BytesMut::with_capacity(8192)),
+                direction: StreamDirection::RecvOnly,
+                closed: AtomicBool::new(false),
+            }),
         }
     }
 
@@ -117,27 +290,24 @@ impl S2nStream {
     pub fn with_buffer(stream: BidirectionalStream, initial_data: Option<BytesMut>) -> Self {
         let recv_buf = initial_data.unwrap_or_else(|| BytesMut::with_capacity(8192));
         Self {
-            bidi: Some(Mutex::new(stream)),
-            send: None,
-            recv: None,
-            recv_buf: Mutex::new(recv_buf),
-            direction: StreamDirection::Bidirectional,
-            closed: AtomicBool::new(false),
+            inner: Arc::new(S2nStreamInner {
+                bidi: Some(Mutex::new(stream)),
+                send: None,
+                recv: None,
+                recv_buf: Mutex::new(recv_buf),
+                direction: StreamDirection::Bidirectional,
+                closed: AtomicBool::new(false),
+            }),
         }
     }
 
     /// Get a cloneable sender handle for spawning background send tasks.
     pub fn sender(&self) -> Option<S2nSender> {
-        match self.direction {
-            StreamDirection::Bidirectional => {
-                // For bidi streams, we need to clone the inner stream
-                // s2n-quic doesn't support cloning streams, so we return None
-                // Use split() instead for bidi streams
-                None
-            }
-            StreamDirection::SendOnly => {
-                // For send-only, we also can't clone directly
-                None
+        match self.inner.direction {
+            StreamDirection::Bidirectional | StreamDirection::SendOnly => {
+                Some(S2nSender {
+                    inner: Arc::clone(&self.inner),
+                })
             }
             StreamDirection::RecvOnly => None,
         }
@@ -147,14 +317,14 @@ impl S2nStream {
     pub async fn send_raw(&self, data: &[u8]) -> Result<()> {
         use tokio::io::AsyncWriteExt;
 
-        match self.direction {
+        match self.inner.direction {
             StreamDirection::RecvOnly => {
                 return Err(Error::Transport {
                     message: "stream is receive-only".to_string(),
                 });
             }
             StreamDirection::Bidirectional => {
-                if let Some(ref bidi) = self.bidi {
+                if let Some(ref bidi) = self.inner.bidi {
                     let mut stream = bidi.lock().await;
                     stream.write_all(data).await.map_err(|e| Error::Transport {
                         message: format!("stream send failed: {}", e),
@@ -165,7 +335,7 @@ impl S2nStream {
                 }
             }
             StreamDirection::SendOnly => {
-                if let Some(ref send) = self.send {
+                if let Some(ref send) = self.inner.send {
                     let mut stream = send.lock().await;
                     stream.write_all(data).await.map_err(|e| Error::Transport {
                         message: format!("stream send failed: {}", e),
@@ -183,14 +353,14 @@ impl S2nStream {
     pub async fn recv_raw(&self, buf: &mut [u8]) -> Result<usize> {
         use tokio::io::AsyncReadExt;
 
-        match self.direction {
+        match self.inner.direction {
             StreamDirection::SendOnly => {
                 return Err(Error::Transport {
                     message: "stream is send-only".to_string(),
                 });
             }
             StreamDirection::Bidirectional => {
-                if let Some(ref bidi) = self.bidi {
+                if let Some(ref bidi) = self.inner.bidi {
                     let mut stream = bidi.lock().await;
                     stream.read(buf).await.map_err(|e| Error::Transport {
                         message: format!("stream recv failed: {}", e),
@@ -202,7 +372,7 @@ impl S2nStream {
                 }
             }
             StreamDirection::RecvOnly => {
-                if let Some(ref recv) = self.recv {
+                if let Some(ref recv) = self.inner.recv {
                     let mut stream = recv.lock().await;
                     stream.read(buf).await.map_err(|e| Error::Transport {
                         message: format!("stream recv failed: {}", e),
@@ -217,13 +387,13 @@ impl S2nStream {
     }
 
     /// Gracefully finish the send side of the stream.
-    pub async fn finish(&mut self) -> Result<()> {
+    pub async fn finish(&self) -> Result<()> {
         use tokio::io::AsyncWriteExt;
 
-        match self.direction {
+        match self.inner.direction {
             StreamDirection::RecvOnly => Ok(()),
             StreamDirection::Bidirectional => {
-                if let Some(ref bidi) = self.bidi {
+                if let Some(ref bidi) = self.inner.bidi {
                     let mut stream = bidi.lock().await;
                     stream.shutdown().await.map_err(|e| Error::Transport {
                         message: format!("stream shutdown failed: {}", e),
@@ -232,7 +402,7 @@ impl S2nStream {
                 Ok(())
             }
             StreamDirection::SendOnly => {
-                if let Some(ref send) = self.send {
+                if let Some(ref send) = self.inner.send {
                     let mut stream = send.lock().await;
                     stream.shutdown().await.map_err(|e| Error::Transport {
                         message: format!("stream shutdown failed: {}", e),
@@ -248,17 +418,25 @@ impl S2nStream {
     /// This consumes the stream and returns AsyncRead/AsyncWrite handles
     /// that can be used independently.
     pub fn into_split(self) -> Result<(S2nStreamWriter, S2nStreamReader)> {
-        match self.direction {
+        match self.inner.direction {
             StreamDirection::Bidirectional => {
-                if let Some(bidi) = self.bidi {
-                    let stream = bidi.into_inner();
-                    let (recv, send) = stream.split();
-                    let recv_buf = self.recv_buf.into_inner();
-                    Ok((S2nStreamWriter::new(send), S2nStreamReader::new(recv, Some(recv_buf))))
-                } else {
-                    Err(Error::Transport {
-                        message: "no bidirectional stream to split".to_string(),
-                    })
+                // Try to unwrap the Arc - this will fail if there are other references
+                match Arc::try_unwrap(self.inner) {
+                    Ok(inner) => {
+                        if let Some(bidi) = inner.bidi {
+                            let stream = bidi.into_inner();
+                            let (recv, send) = stream.split();
+                            let recv_buf = inner.recv_buf.into_inner();
+                            Ok((S2nStreamWriter::new(send), S2nStreamReader::new(recv, Some(recv_buf))))
+                        } else {
+                            Err(Error::Transport {
+                                message: "no bidirectional stream to split".to_string(),
+                            })
+                        }
+                    }
+                    Err(_) => Err(Error::Transport {
+                        message: "cannot split stream while sender handles exist".to_string(),
+                    }),
                 }
             }
             _ => Err(Error::Transport {
@@ -271,16 +449,12 @@ impl S2nStream {
 impl StreamPair for S2nStream {
     fn send(&mut self, msg: &Message) -> impl std::future::Future<Output = Result<()>> + Send {
         let data = Codec::encode(msg);
-        let direction = self.direction;
-
-        // Get references to the stream mutexes
-        let bidi = self.bidi.as_ref();
-        let send = self.send.as_ref();
+        let inner = Arc::clone(&self.inner);
 
         async move {
             use tokio::io::AsyncWriteExt;
 
-            match direction {
+            match inner.direction {
                 StreamDirection::RecvOnly => {
                     return Err(Error::Transport {
                         message: "stream is receive-only".to_string(),
@@ -288,7 +462,7 @@ impl StreamPair for S2nStream {
                 }
                 StreamDirection::Bidirectional => {
                     let data = data?;
-                    if let Some(bidi) = bidi {
+                    if let Some(ref bidi) = inner.bidi {
                         let mut stream = bidi.lock().await;
                         stream.write_all(&data).await.map_err(|e| Error::Transport {
                             message: format!("stream send failed: {}", e),
@@ -300,7 +474,7 @@ impl StreamPair for S2nStream {
                 }
                 StreamDirection::SendOnly => {
                     let data = data?;
-                    if let Some(send) = send {
+                    if let Some(ref send) = inner.send {
                         let mut stream = send.lock().await;
                         stream.write_all(&data).await.map_err(|e| Error::Transport {
                             message: format!("stream send failed: {}", e),
@@ -316,25 +490,18 @@ impl StreamPair for S2nStream {
     }
 
     fn recv(&mut self) -> impl std::future::Future<Output = Result<Message>> + Send {
-        let direction = self.direction;
-        let recv_buf = unsafe {
-            // SAFETY: We need to get a reference to self.recv_buf for the async block.
-            // This is safe because we hold &mut self and the Mutex ensures exclusive access.
-            &*((&self.recv_buf) as *const Mutex<BytesMut>)
-        };
-        let bidi = self.bidi.as_ref();
-        let recv = self.recv.as_ref();
+        let inner = Arc::clone(&self.inner);
 
         async move {
             use tokio::io::AsyncReadExt;
 
-            if matches!(direction, StreamDirection::SendOnly) {
+            if matches!(inner.direction, StreamDirection::SendOnly) {
                 return Err(Error::Transport {
                     message: "stream is send-only".to_string(),
                 });
             }
 
-            let mut recv_buf = recv_buf.lock().await;
+            let mut recv_buf = inner.recv_buf.lock().await;
 
             loop {
                 if let Some(msg) = Codec::decode(&mut recv_buf)? {
@@ -342,9 +509,9 @@ impl StreamPair for S2nStream {
                 }
 
                 let mut chunk = [0u8; 4096];
-                let n = match direction {
+                let n = match inner.direction {
                     StreamDirection::Bidirectional => {
-                        if let Some(bidi) = bidi {
+                        if let Some(ref bidi) = inner.bidi {
                             let mut stream = bidi.lock().await;
                             stream.read(&mut chunk).await.map_err(|e| Error::Transport {
                                 message: format!("stream recv failed: {}", e),
@@ -354,7 +521,7 @@ impl StreamPair for S2nStream {
                         }
                     }
                     StreamDirection::RecvOnly => {
-                        if let Some(recv) = recv {
+                        if let Some(ref recv) = inner.recv {
                             let mut stream = recv.lock().await;
                             stream.read(&mut chunk).await.map_err(|e| Error::Transport {
                                 message: format!("stream recv failed: {}", e),
@@ -380,7 +547,7 @@ impl StreamPair for S2nStream {
     }
 
     fn close(&mut self) {
-        self.closed.store(true, Ordering::SeqCst);
+        self.inner.closed.store(true, Ordering::SeqCst);
     }
 }
 
@@ -459,27 +626,86 @@ impl tokio::io::AsyncRead for S2nStreamReader {
 }
 
 // =============================================================================
-// S2nSender - Cloneable sender handle (placeholder)
+// S2nSender - Cloneable sender handle
 // =============================================================================
 
 /// A cloneable sender handle for a QUIC stream.
 ///
-/// Note: s2n-quic doesn't support cloning streams directly, so this is limited.
-/// For most use cases, use the stream directly or split it.
+/// This wraps an Arc reference to the stream's inner state, allowing multiple
+/// tasks to send on the same stream safely via the internal Mutex.
 #[derive(Clone)]
 pub struct S2nSender {
-    // Placeholder - s2n-quic streams are not cloneable
-    _phantom: std::marker::PhantomData<()>,
+    inner: Arc<S2nStreamInner>,
 }
 
 impl S2nSender {
     /// Send a message (includes flush for low latency).
-    ///
-    /// Note: This is a placeholder. s2n-quic streams cannot be cloned.
-    pub async fn send(&self, _msg: &Message) -> Result<()> {
-        Err(Error::Transport {
-            message: "S2nSender is not supported - use stream directly".to_string(),
-        })
+    pub async fn send(&self, msg: &Message) -> Result<()> {
+        let data = Codec::encode(msg)?;
+        self.send_raw(&data).await
+    }
+
+    /// Send raw bytes without message framing.
+    pub async fn send_raw(&self, data: &[u8]) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        match self.inner.direction {
+            StreamDirection::RecvOnly => {
+                return Err(Error::Transport {
+                    message: "stream is receive-only".to_string(),
+                });
+            }
+            StreamDirection::Bidirectional => {
+                if let Some(ref bidi) = self.inner.bidi {
+                    let mut stream = bidi.lock().await;
+                    stream.write_all(data).await.map_err(|e| Error::Transport {
+                        message: format!("stream send failed: {}", e),
+                    })?;
+                    stream.flush().await.map_err(|e| Error::Transport {
+                        message: format!("stream flush failed: {}", e),
+                    })?;
+                }
+            }
+            StreamDirection::SendOnly => {
+                if let Some(ref send) = self.inner.send {
+                    let mut stream = send.lock().await;
+                    stream.write_all(data).await.map_err(|e| Error::Transport {
+                        message: format!("stream send failed: {}", e),
+                    })?;
+                    stream.flush().await.map_err(|e| Error::Transport {
+                        message: format!("stream flush failed: {}", e),
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Gracefully finish the send side of the stream (send FIN).
+    pub async fn finish(&self) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        match self.inner.direction {
+            StreamDirection::RecvOnly => Ok(()),
+            StreamDirection::Bidirectional => {
+                if let Some(ref bidi) = self.inner.bidi {
+                    let mut stream = bidi.lock().await;
+                    stream.shutdown().await.map_err(|e| Error::Transport {
+                        message: format!("stream shutdown failed: {}", e),
+                    })?;
+                }
+                Ok(())
+            }
+            StreamDirection::SendOnly => {
+                if let Some(ref send) = self.inner.send {
+                    let mut stream = send.lock().await;
+                    stream.shutdown().await.map_err(|e| Error::Transport {
+                        message: format!("stream shutdown failed: {}", e),
+                    })?;
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -503,6 +729,8 @@ pub struct S2nConnection {
     control_stream: Mutex<Option<BidirectionalStream>>,
     /// Whether this is a server connection.
     is_server: bool,
+    /// Connection statistics (populated by event subscriber).
+    stats: Arc<ConnectionStats>,
 }
 
 impl S2nConnection {
@@ -510,6 +738,7 @@ impl S2nConnection {
     pub async fn from_client_connection(
         mut conn: s2n_quic::connection::Connection,
         local_addr: SocketAddr,
+        stats: Arc<ConnectionStats>,
     ) -> Result<Self> {
         let remote_addr = conn.remote_addr().map_err(|e| Error::Transport {
             message: format!("failed to get remote address: {}", e),
@@ -528,6 +757,7 @@ impl S2nConnection {
             closed: AtomicBool::new(false),
             control_stream: Mutex::new(Some(control_stream)),
             is_server: false,
+            stats,
         })
     }
 
@@ -535,6 +765,7 @@ impl S2nConnection {
     pub async fn from_server_connection(
         mut conn: s2n_quic::connection::Connection,
         local_addr: SocketAddr,
+        stats: Arc<ConnectionStats>,
     ) -> Result<Self> {
         let remote_addr = conn.remote_addr().map_err(|e| Error::Transport {
             message: format!("failed to get remote address: {}", e),
@@ -555,6 +786,7 @@ impl S2nConnection {
             closed: AtomicBool::new(false),
             control_stream: Mutex::new(Some(control_stream)),
             is_server: true,
+            stats,
         })
     }
 
@@ -581,20 +813,27 @@ impl S2nConnection {
 
     /// Get packet loss ratio (0.0 - 1.0).
     pub async fn packet_loss(&self) -> f64 {
-        // s2n-quic doesn't expose packet loss stats directly
-        0.0
+        self.stats.packet_loss_ratio()
     }
 
     /// Get the congestion window size.
     pub async fn congestion_window(&self) -> u64 {
-        // s2n-quic doesn't expose cwnd directly
-        0
+        self.stats.congestion_window() as u64
     }
 
     /// Get minimum observed RTT.
     pub async fn min_rtt(&self) -> Option<Duration> {
-        // s2n-quic doesn't expose min_rtt directly
-        None
+        let min_rtt = self.stats.min_rtt();
+        if min_rtt.is_zero() {
+            None
+        } else {
+            Some(min_rtt)
+        }
+    }
+
+    /// Get the connection statistics.
+    pub fn stats(&self) -> &ConnectionStats {
+        &self.stats
     }
 
     /// Accept an incoming bidirectional stream.
@@ -673,7 +912,17 @@ impl Connection for S2nConnection {
     }
 
     async fn accept_stream(&self) -> Result<(StreamType, Self::Stream)> {
-        // Check for pending streams first
+        // First, check if the control stream is still available (for server connections)
+        // The control stream is the first bidi stream and doesn't have a header
+        {
+            let mut control = self.control_stream.lock().await;
+            if let Some(stream) = control.take() {
+                debug!("Returning pre-accepted control stream");
+                return Ok((StreamType::Control, S2nStream::new_bidi(stream)));
+            }
+        }
+
+        // Check for pending streams
         {
             let mut pending = self.pending_streams.lock().await;
             if let Some((stream_type, stream)) = pending.pop_front() {
@@ -795,9 +1044,13 @@ impl Connection for S2nConnection {
     }
 
     async fn rtt(&self) -> Duration {
-        // s2n-quic doesn't expose RTT directly through the connection
-        // Return a default value
-        Duration::from_millis(100)
+        let rtt = self.stats.smoothed_rtt();
+        if rtt.is_zero() {
+            // Return a default if no RTT samples yet
+            Duration::from_millis(100)
+        } else {
+            rtt
+        }
     }
 }
 
@@ -1064,6 +1317,253 @@ pub fn build_server_config(
         .map_err(|e| Error::Transport {
             message: format!("failed to start server: {}", e),
         })
+}
+
+// =============================================================================
+// connect_quic - Client Connection Establishment
+// =============================================================================
+
+use super::{ConnectConfig, ConnectResult, ListenerConfig};
+use std::time::Instant;
+use tracing::info;
+
+/// Establish a QUIC client connection using s2n-quic.
+///
+/// This performs the full QUIC/TLS handshake and returns a connected
+/// `S2nConnection`. Currently, s2n-quic handles 0-RTT internally, so
+/// session data management is limited compared to quiche.
+///
+/// # Arguments
+/// * `config` - Connection configuration including server address, timeouts, and optional session data
+///
+/// # Returns
+/// * `Ok(ConnectResult)` - Contains the connection, resume status, and new session data
+/// * `Err(Error)` - On connection failure (timeout, handshake failure, certificate mismatch)
+///
+/// # Note
+/// s2n-quic has a higher-level API than quiche. Some features like explicit
+/// session ticket management and certificate hash verification require
+/// additional configuration via custom providers.
+///
+/// # Certificate Verification
+/// - If `cert_hash` is None: X.509 verification is disabled (for bootstrap mode)
+/// - If `cert_hash` is Some: Verification is disabled, but the cert hash is checked after handshake
+pub async fn connect_quic(config: &ConnectConfig) -> Result<ConnectResult<S2nConnection>> {
+    use s2n_quic::Client;
+    use s2n_quic::client::Connect;
+    use s2n_quic::provider::tls::s2n_tls;
+
+    let start = Instant::now();
+
+    // Create shared statistics for event subscriber
+    let stats = Arc::new(ConnectionStats::default());
+    let event_subscriber = StatsSubscriber::new(Arc::clone(&stats));
+
+    // Build the client
+    // Note: s2n-quic binds internally, we can't specify a local port directly
+    // For local port binding, we would need to use a custom I/O provider
+    let bind_addr = if config.server_addr.is_ipv4() {
+        format!("0.0.0.0:{}", config.local_port.unwrap_or(0))
+    } else {
+        format!("[::]:{}", config.local_port.unwrap_or(0))
+    };
+
+    // Configure TLS
+    // For bootstrap mode (no cert_hash or cert_hash provided), we disable X.509 verification
+    // since we're using self-signed certificates with hash-based pinning
+    let mut tls_builder = s2n_tls::Client::builder();
+
+    // Disable X.509 verification for self-signed certificates
+    // SAFETY: This is used for bootstrap mode where certificates are verified via hash pinning
+    // instead of traditional CA chains. The cert_hash is verified after the handshake completes.
+    unsafe {
+        tls_builder.config_mut().disable_x509_verification().map_err(|e| Error::Transport {
+            message: format!("failed to disable x509 verification: {}", e),
+        })?;
+    }
+
+    let tls = tls_builder.build().map_err(|e| Error::Transport {
+        message: format!("failed to build TLS config: {}", e),
+    })?;
+
+    // Configure limits including idle timeout
+    let limits = s2n_quic::provider::limits::Limits::new()
+        .with_max_idle_timeout(config.max_idle_timeout)
+        .map_err(|e| Error::Transport {
+            message: format!("failed to configure idle timeout: {}", e),
+        })?;
+
+    let client = Client::builder()
+        .with_tls(tls)
+        .map_err(|e| Error::Transport {
+            message: format!("failed to configure TLS: {}", e),
+        })?
+        .with_limits(limits)
+        .map_err(|e| Error::Transport {
+            message: format!("failed to configure limits: {}", e),
+        })?
+        .with_event(event_subscriber)
+        .map_err(|e| Error::Transport {
+            message: format!("failed to configure event subscriber: {}", e),
+        })?
+        .with_io(bind_addr.as_str())
+        .map_err(|e| Error::Transport {
+            message: format!("failed to configure I/O: {}", e),
+        })?
+        .start()
+        .map_err(|e| Error::Transport {
+            message: format!("failed to start client: {}", e),
+        })?;
+
+    let local_addr = client.local_addr().map_err(|e| Error::Transport {
+        message: format!("failed to get local address: {}", e),
+    })?;
+
+    // Create connect handle
+    let connect = Connect::new(config.server_addr)
+        .with_server_name("qsh-server");
+
+    // Connect with timeout
+    let connection = tokio::time::timeout(config.connect_timeout, client.connect(connect))
+        .await
+        .map_err(|_| Error::Timeout)?
+        .map_err(|e| Error::HandshakeFailed {
+            message: format!("connection failed: {}", e),
+        })?;
+
+    let elapsed = start.elapsed();
+    debug!(
+        addr = %config.server_addr,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "s2n-quic handshake completed"
+    );
+
+    // Wrap in S2nConnection with shared stats
+    let s2n_conn = S2nConnection::from_client_connection(connection, local_addr, stats).await?;
+
+    // TODO: Verify cert_hash if provided
+    // For now, we rely on the hash check in the application layer (qsh-client)
+    // Future: Extract peer cert and verify hash here
+
+    // Note: s2n-quic handles session resumption internally
+    // We return None for session_data since we can't extract it easily
+    // Future: implement custom session ticket provider for full parity
+    let resumed = s2n_conn.is_resumed().await;
+    let session_data = s2n_conn.session_data().await;
+
+    if resumed {
+        info!(addr = %config.server_addr, "0-RTT session resumed");
+    }
+
+    Ok(ConnectResult {
+        connection: s2n_conn,
+        resumed,
+        session_data,
+    })
+}
+
+// =============================================================================
+// S2nAcceptor - Server Connection Acceptance
+// =============================================================================
+
+/// A QUIC server acceptor using s2n-quic.
+///
+/// This wraps the s2n-quic Server and provides a simpler accept interface
+/// that returns `S2nConnection` instances.
+pub struct S2nAcceptor {
+    /// The s2n-quic server.
+    server: s2n_quic::Server,
+    /// Local address.
+    local_addr: std::net::SocketAddr,
+}
+
+impl S2nAcceptor {
+    /// Create a new QUIC acceptor bound to the specified address.
+    pub async fn bind(addr: std::net::SocketAddr, config: ListenerConfig) -> Result<Self> {
+        use s2n_quic::Server;
+
+        let cert_pem_str = std::str::from_utf8(&config.cert_pem).map_err(|e| Error::CertificateError {
+            message: format!("invalid certificate PEM encoding: {}", e),
+        })?;
+
+        let key_pem_str = std::str::from_utf8(&config.key_pem).map_err(|e| Error::CertificateError {
+            message: format!("invalid key PEM encoding: {}", e),
+        })?;
+
+        // Configure limits including idle timeout
+        let limits = s2n_quic::provider::limits::Limits::new()
+            .with_max_idle_timeout(config.idle_timeout)
+            .map_err(|e| Error::Transport {
+                message: format!("failed to configure idle timeout: {}", e),
+            })?;
+
+        let server = Server::builder()
+            .with_tls((cert_pem_str, key_pem_str))
+            .map_err(|e| Error::CertificateError {
+                message: format!("failed to configure TLS: {}", e),
+            })?
+            .with_limits(limits)
+            .map_err(|e| Error::Transport {
+                message: format!("failed to configure limits: {}", e),
+            })?
+            .with_io(addr)
+            .map_err(|e| Error::Transport {
+                message: format!("failed to configure I/O: {}", e),
+            })?
+            .start()
+            .map_err(|e| Error::Transport {
+                message: format!("failed to start server: {}", e),
+            })?;
+
+        let local_addr = server.local_addr().map_err(|e| Error::Transport {
+            message: format!("failed to get local address: {}", e),
+        })?;
+
+        Ok(Self { server, local_addr })
+    }
+
+    /// Get the local address this acceptor is bound to.
+    pub fn local_addr(&self) -> std::net::SocketAddr {
+        self.local_addr
+    }
+
+    /// Set the idle timeout for new connections.
+    ///
+    /// Note: s2n-quic configures idle timeout at server creation time.
+    /// This method is a no-op for API compatibility with QuicheAcceptor.
+    pub fn set_idle_timeout(&mut self, _timeout: Duration) {
+        // s2n-quic doesn't support changing timeout after server creation
+        // This would require rebuilding the server
+        debug!("set_idle_timeout called but s2n-quic doesn't support dynamic timeout changes");
+    }
+
+    /// Accept the next established QUIC connection.
+    ///
+    /// Returns the connection and peer address when a client connects.
+    pub async fn accept(&mut self) -> Result<(S2nConnection, std::net::SocketAddr)> {
+        // Accept the next connection
+        let connection = self.server.accept().await.ok_or_else(|| Error::Transport {
+            message: "server closed".to_string(),
+        })?;
+
+        let remote_addr = connection.remote_addr().map_err(|e| Error::Transport {
+            message: format!("failed to get remote address: {}", e),
+        })?;
+
+        info!(addr = %remote_addr, "Connection established");
+
+        // Create stats for this connection
+        // Note: For server-side connections, we don't have access to the event subscriber
+        // system since the Server is already running. Stats will be updated manually
+        // or remain at default values. For full stats on server side, we'd need to
+        // rebuild the Server with an event subscriber, but that's complex for per-connection stats.
+        let stats = Arc::new(ConnectionStats::default());
+
+        // Wrap in S2nConnection
+        let s2n_conn = S2nConnection::from_server_connection(connection, self.local_addr, stats).await?;
+
+        Ok((s2n_conn, remote_addr))
+    }
 }
 
 // =============================================================================

@@ -83,6 +83,82 @@ use crate::error::Result;
 use crate::protocol::Message;
 
 // =============================================================================
+// Connection Configuration Types
+// =============================================================================
+
+/// Configuration for establishing a QUIC client connection.
+///
+/// This is backend-agnostic configuration that gets translated to
+/// quiche::Config or s2n-quic providers internally.
+#[derive(Debug, Clone)]
+pub struct ConnectConfig {
+    /// Server address to connect to.
+    pub server_addr: SocketAddr,
+    /// Optional local port to bind to (None = OS-assigned).
+    pub local_port: Option<u16>,
+    /// Maximum idle timeout for the connection.
+    pub max_idle_timeout: Duration,
+    /// Timeout for the initial connection handshake.
+    pub connect_timeout: Duration,
+    /// Expected certificate hash for pinning (None = no pinning, skip verification).
+    pub cert_hash: Option<Vec<u8>>,
+    /// Cached session data for 0-RTT resumption.
+    pub session_data: Option<Vec<u8>>,
+}
+
+impl Default for ConnectConfig {
+    fn default() -> Self {
+        Self {
+            server_addr: "127.0.0.1:4242".parse().unwrap(),
+            local_port: None,
+            max_idle_timeout: Duration::from_secs(30),
+            connect_timeout: Duration::from_secs(10),
+            cert_hash: None,
+            session_data: None,
+        }
+    }
+}
+
+/// Result of a successful QUIC connection establishment.
+///
+/// Contains the connection and metadata about the handshake.
+pub struct ConnectResult<C> {
+    /// The established connection.
+    pub connection: C,
+    /// Whether the connection was resumed via 0-RTT.
+    pub resumed: bool,
+    /// Session data that can be cached for future 0-RTT resumption.
+    pub session_data: Option<Vec<u8>>,
+}
+
+/// Configuration for a QUIC server listener.
+#[derive(Debug, Clone)]
+pub struct ListenerConfig {
+    /// TLS certificate in PEM format.
+    pub cert_pem: Vec<u8>,
+    /// TLS private key in PEM format.
+    pub key_pem: Vec<u8>,
+    /// Maximum idle timeout for connections.
+    pub idle_timeout: Duration,
+    /// Optional session ticket key for 0-RTT (None = auto-generated).
+    pub ticket_key: Option<Vec<u8>>,
+}
+
+// Feature-gated connect function exports
+#[cfg(feature = "quiche-backend")]
+pub use quiche::connect_quic;
+
+#[cfg(feature = "s2n-quic-backend")]
+pub use s2n::connect_quic;
+
+// Feature-gated acceptor exports
+#[cfg(feature = "quiche-backend")]
+pub use quiche::QuicheAcceptor as QuicAcceptor;
+
+#[cfg(feature = "s2n-quic-backend")]
+pub use s2n::S2nAcceptor as QuicAcceptor;
+
+// =============================================================================
 // Stream Types
 // =============================================================================
 

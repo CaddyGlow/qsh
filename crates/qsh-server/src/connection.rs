@@ -129,7 +129,8 @@ impl ConnectionHandler {
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
         // Extract sender before wrapping stream - allows concurrent send/recv
-        let control_sender = control.sender();
+        // The control stream is always bidirectional, so sender() should return Some
+        let control_sender = control.sender().expect("control stream must support sending");
 
         let handler = Arc::new(Self {
             quic: RwLock::new(Arc::new(quic)),
@@ -197,7 +198,7 @@ impl ConnectionHandler {
         new_shutdown_tx: mpsc::Sender<()>,
     ) {
         let new_quic = Arc::new(new_quic);
-        let new_control_sender = new_control.sender();
+        let new_control_sender = new_control.sender().expect("control stream must support sending");
 
         info!(
             session_id = ?self.session_id,

@@ -34,7 +34,7 @@ pub use channel::{FileChannel, ForwardChannel, TerminalChannel, TerminalEvent};
 pub use cli::{Cli, CpCli, FilePath};
 pub use connection::{
     ChannelConnection, ChannelHandle, ConnectionConfig, HeartbeatTracker, LatencyStats,
-    LatencyTracker, connect_quic, random_local_port,
+    LatencyTracker, establish_quic_connection, random_local_port,
 };
 pub use escape::{EscapeCommand, EscapeHandler, EscapeResult, parse_escape_key};
 pub use file::TransferResult;

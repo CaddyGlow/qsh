@@ -30,7 +30,7 @@ use qsh_core::protocol::{
 #[cfg(feature = "standalone")]
 use qsh_client::standalone::authenticate as standalone_authenticate;
 #[cfg(feature = "standalone")]
-use qsh_client::{DirectAuthenticator, DirectConfig, connect_quic};
+use qsh_client::{DirectAuthenticator, DirectConfig, establish_quic_connection};
 
 /// Chunk size for file data (32KB).
 const FILE_CHUNK_SIZE: usize = 32 * 1024;
@@ -1106,7 +1106,7 @@ async fn connect(
     info!(addr = %config.server_addr, "Connecting to server");
 
     // Connect and authenticate
-    let quic_conn = connect_quic(&config).await?;
+    let quic_conn = establish_quic_connection(&config).await?;
 
     // Authenticate
     let (mut send, mut recv) = quic_conn

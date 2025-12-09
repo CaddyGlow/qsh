@@ -28,7 +28,7 @@ use qsh_core::transport::Connection;
 #[cfg(feature = "standalone")]
 use qsh_client::standalone::authenticate as standalone_authenticate;
 #[cfg(feature = "standalone")]
-use qsh_client::{DirectAuthenticator, DirectConfig, connect_quic};
+use qsh_client::{DirectAuthenticator, DirectConfig, establish_quic_connection};
 
 use qsh_core::protocol::TermSize;
 
@@ -192,7 +192,7 @@ async fn run_client_direct(cli: &Cli, host: &str, user: Option<&str>) -> qsh_cor
     };
 
     info!(addr = %conn_config.server_addr, local_port = ?conn_config.local_port, "Connecting directly to server");
-    let quic_conn = connect_quic(&conn_config).await?;
+    let quic_conn = establish_quic_connection(&conn_config).await?;
 
     // Perform standalone authentication on a dedicated server-initiated stream.
     // Server opens the stream and sends AuthChallenge; client accepts and responds.

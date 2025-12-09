@@ -28,7 +28,7 @@ use nix::unistd::mkfifo;
 use qsh_core::bootstrap::{BootstrapResponse, ServerInfo};
 use qsh_core::constants::SESSION_KEY_LEN;
 use qsh_core::error::{Error, Result};
-use qsh_core::transport::{server_config, generate_self_signed_cert, cert_hash};
+use qsh_core::transport::{generate_self_signed_cert, cert_hash};
 
 /// Bootstrap server that handles single-connection bootstrap mode.
 pub struct BootstrapServer {
@@ -42,10 +42,9 @@ pub struct BootstrapServer {
     key_pem: Vec<u8>,
     /// Bound address.
     bind_addr: SocketAddr,
-    /// UDP socket.
+    /// UDP socket (only used with quiche backend for socket sharing).
+    #[cfg(feature = "quiche-backend")]
     socket: Arc<UdpSocket>,
-    /// quiche config.
-    quiche_config: quiche::Config,
 }
 
 impl BootstrapServer {
@@ -67,35 +66,54 @@ impl BootstrapServer {
         let cert_hash_bytes = cert_hash(&cert_der);
         debug!(hash_len = cert_hash_bytes.len(), "Computed certificate hash");
 
-        // Create quiche config
-        let quiche_config = server_config(&cert_pem, &key_pem)?;
-
         // Find an available port and create socket
-        let socket = if port == 0 {
-            // Auto-select from port range
-            find_available_socket(bind_ip, port_range).await?
-        } else {
-            // Use specified port
-            let addr = SocketAddr::new(bind_ip, port);
-            UdpSocket::bind(addr).await.map_err(|e| Error::Transport {
-                message: format!("failed to bind to {}: {}", addr, e),
-            })?
+        // For quiche backend, we pre-bind the socket for sharing with QshListener
+        #[cfg(feature = "quiche-backend")]
+        let (bind_addr, socket) = {
+            let socket = if port == 0 {
+                find_available_socket(bind_ip, port_range).await?
+            } else {
+                let addr = SocketAddr::new(bind_ip, port);
+                UdpSocket::bind(addr).await.map_err(|e| Error::Transport {
+                    message: format!("failed to bind to {}: {}", addr, e),
+                })?
+            };
+            let addr = socket.local_addr().map_err(|e| Error::Transport {
+                message: format!("failed to get local address: {}", e),
+            })?;
+            (addr, Arc::new(socket))
         };
 
-        let actual_addr = socket.local_addr().map_err(|e| Error::Transport {
-            message: format!("failed to get local address: {}", e),
-        })?;
+        // For s2n-quic backend, we just determine the bind address
+        // The socket will be managed by the acceptor
+        #[cfg(not(feature = "quiche-backend"))]
+        let bind_addr = {
+            // Find an available port by briefly binding and releasing
+            let socket = if port == 0 {
+                find_available_socket(bind_ip, port_range).await?
+            } else {
+                let addr = SocketAddr::new(bind_ip, port);
+                UdpSocket::bind(addr).await.map_err(|e| Error::Transport {
+                    message: format!("failed to bind to {}: {}", addr, e),
+                })?
+            };
+            let addr = socket.local_addr().map_err(|e| Error::Transport {
+                message: format!("failed to get local address: {}", e),
+            })?;
+            drop(socket); // Release for the acceptor to bind
+            addr
+        };
 
-        info!(addr = %actual_addr, "Bootstrap server bound");
+        info!(addr = %bind_addr, "Bootstrap server bound");
 
         Ok(Self {
             session_key,
             cert_pem,
             cert_hash_bytes,
             key_pem,
-            bind_addr: actual_addr,
-            socket: Arc::new(socket),
-            quiche_config,
+            bind_addr,
+            #[cfg(feature = "quiche-backend")]
+            socket,
         })
     }
 
@@ -130,13 +148,10 @@ impl BootstrapServer {
     }
 
     /// Clone the socket (keeps the listener alive while self is held).
+    /// Only available with the quiche backend.
+    #[cfg(feature = "quiche-backend")]
     pub fn socket(&self) -> Arc<UdpSocket> {
         Arc::clone(&self.socket)
-    }
-
-    /// Get the quiche config.
-    pub fn quiche_config(&self) -> &quiche::Config {
-        &self.quiche_config
     }
 
     /// Generate the bootstrap response JSON.
