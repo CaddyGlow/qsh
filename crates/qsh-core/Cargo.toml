@@ -7,10 +7,14 @@ license.workspace = true
 description = "Core library for qsh - protocol, types, terminal state"
 
 [features]
-default = ["compression"]
+default = ["quiche-backend", "compression"]
 tunnel = ["tun"]
 standalone = ["dep:ssh-key", "dep:rpassword", "dep:ring", "dep:ssh-agent-client-rs"]
 compression = ["dep:zstd"]
+
+# QUIC backend selection (enable exactly one)
+quiche-backend = ["dep:quiche", "dep:tokio-quiche"]
+s2n-quic-backend = ["dep:s2n-quic"]
 
 [dependencies]
 tokio = { workspace = true }
@@ -26,8 +30,10 @@ vte = { workspace = true }
 unicode-width = { workspace = true }
 ipnet = { workspace = true }
 tun = { workspace = true, optional = true }
-tokio-quiche = { workspace = true }
-quiche = { workspace = true }
+# QUIC backends (optional - select via feature)
+tokio-quiche = { workspace = true, optional = true }
+quiche = { workspace = true, optional = true }
+s2n-quic = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true }
 rcgen = { workspace = true }
 libc = { workspace = true }

@@ -18,13 +18,15 @@ name = "qscp"
 path = "src/bin/qscp.rs"
 
 [features]
-default = ["compression"]
+default = ["quiche-backend", "compression"]
+quiche-backend = ["qsh-core/quiche-backend"]
+s2n-quic-backend = ["qsh-core/s2n-quic-backend"]
 tunnel = ["qsh-core/tunnel"]
 standalone = ["qsh-core/standalone", "dep:ssh-key", "dep:rpassword"]
 compression = ["qsh-core/compression"]
 
 [dependencies]
-qsh-core = { workspace = true }
+qsh-core = { workspace = true, features = ["quiche-backend"] }
 tokio = { workspace = true }
 tokio-quiche = { workspace = true }
 quiche = { workspace = true }

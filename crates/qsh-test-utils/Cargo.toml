@@ -7,11 +7,13 @@ license.workspace = true
 description = "Test utilities for qsh - mocks, fakes, and test helpers"
 
 [features]
-default = []
+default = ["quiche-backend"]
+quiche-backend = ["qsh-core/quiche-backend"]
+s2n-quic-backend = ["qsh-core/s2n-quic-backend"]
 tunnel = ["qsh-core/tunnel"]
 
 [dependencies]
-qsh-core = { workspace = true }
+qsh-core = { workspace = true, features = ["quiche-backend"] }
 tokio = { workspace = true }
 bytes = { workspace = true }
 rcgen = { workspace = true }

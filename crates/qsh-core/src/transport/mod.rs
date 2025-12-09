@@ -1,7 +1,7 @@
 //! Transport abstractions for qsh.
 //!
 //! This module provides traits for abstracting over different transport layers:
-//! - Real QUIC (tokio-quiche)
+//! - Real QUIC via quiche (default) or s2n-quic
 //! - Mock transport for testing
 //!
 //! Stream types (SSH-style channel model):
@@ -9,20 +9,48 @@
 //! - ChannelIn(id): unidirectional client->server (terminal input, file data)
 //! - ChannelOut(id): unidirectional server->client (terminal output, file data)
 //! - ChannelBidi(id): bidirectional (port forwards, tunnel)
+//!
+//! # Backend Selection
+//!
+//! The QUIC backend is selected via Cargo features:
+//! - `quiche-backend` (default): Cloudflare's quiche/tokio-quiche
+//! - `s2n-quic-backend`: AWS s2n-quic
+//!
+//! Only one backend should be enabled at a time.
 
+pub mod config;
+
+#[cfg(feature = "quiche-backend")]
 mod quiche;
 
+// Re-export config types
+pub use config::{EndpointRole, TlsCredentials, TransportConfigBuilder};
+
+// =============================================================================
+// Feature-gated Backend Exports
+// =============================================================================
+
+#[cfg(feature = "quiche-backend")]
 pub use quiche::{
     QuicheConnection, QuicheSender, QuicheStream,
+    QuicheStreamReader, QuicheStreamWriter,
     classify_io_error, enable_error_queue,
     client_config, server_config, server_config_with_ticket_key, generate_self_signed_cert,
     load_certs_from_pem, load_key_from_pem, cert_hash,
+    build_config,
 };
 
-// Re-export as Quinn-compatible names for easier migration
+// Re-export with generic names for backend-agnostic code
+#[cfg(feature = "quiche-backend")]
 pub use quiche::QuicheConnection as QuicConnection;
+#[cfg(feature = "quiche-backend")]
 pub use quiche::QuicheSender as QuicSender;
+#[cfg(feature = "quiche-backend")]
 pub use quiche::QuicheStream as QuicStream;
+
+// s2n-quic backend (placeholder for Phase 6)
+#[cfg(feature = "s2n-quic-backend")]
+compile_error!("s2n-quic-backend is not yet implemented. Use quiche-backend for now.");
 
 use std::future::Future;
 use std::net::SocketAddr;

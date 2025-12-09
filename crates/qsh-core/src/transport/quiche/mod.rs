@@ -169,6 +169,17 @@ impl QuicheStream {
     pub fn close(&mut self) {
         self.closed.store(true, Ordering::SeqCst);
     }
+
+    /// Split the stream into separate reader and writer halves.
+    ///
+    /// This consumes the stream and returns AsyncRead/AsyncWrite handles
+    /// that can be used independently.
+    pub fn into_split(self) -> (QuicheStreamWriter, QuicheStreamReader) {
+        let recv_buf = self.recv_buf.into_inner();
+        let writer = QuicheStreamWriter::new(Arc::clone(&self.conn), self.stream_id);
+        let reader = QuicheStreamReader::new(self.conn, self.stream_id, Some(recv_buf));
+        (writer, reader)
+    }
 }
 
 impl StreamPair for QuicheStream {
@@ -233,6 +244,141 @@ impl StreamPair for QuicheStream {
 
     fn close(&mut self) {
         self.closed.store(true, Ordering::SeqCst);
+    }
+}
+
+// =============================================================================
+// QuicheStreamReader / QuicheStreamWriter - AsyncRead/AsyncWrite wrappers
+// =============================================================================
+
+/// Write half of a QUIC stream implementing AsyncWrite.
+pub struct QuicheStreamWriter {
+    conn: Arc<QuicheConnectionInner>,
+    stream_id: u64,
+}
+
+impl QuicheStreamWriter {
+    /// Create a new stream writer.
+    fn new(conn: Arc<QuicheConnectionInner>, stream_id: u64) -> Self {
+        Self { conn, stream_id }
+    }
+}
+
+impl tokio::io::AsyncWrite for QuicheStreamWriter {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let conn = Arc::clone(&this.conn);
+        let stream_id = this.stream_id;
+        let data = buf.to_vec();
+
+        // Create a future for the write operation
+        let fut = async move {
+            conn.stream_send(stream_id, &data, false)
+                .await
+                .map(|()| data.len())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        };
+
+        // Pin the future and poll it
+        tokio::pin!(fut);
+        fut.poll(cx)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let conn = Arc::clone(&this.conn);
+
+        let fut = async move {
+            conn.flush_send()
+                .await
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        };
+
+        tokio::pin!(fut);
+        fut.poll(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let conn = Arc::clone(&this.conn);
+        let stream_id = this.stream_id;
+
+        let fut = async move {
+            conn.stream_send(stream_id, &[], true)
+                .await
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        };
+
+        tokio::pin!(fut);
+        fut.poll(cx)
+    }
+}
+
+/// Read half of a QUIC stream implementing AsyncRead.
+pub struct QuicheStreamReader {
+    conn: Arc<QuicheConnectionInner>,
+    stream_id: u64,
+    buffer: BytesMut,
+}
+
+impl QuicheStreamReader {
+    /// Create a new stream reader.
+    fn new(conn: Arc<QuicheConnectionInner>, stream_id: u64, initial_buffer: Option<BytesMut>) -> Self {
+        Self {
+            conn,
+            stream_id,
+            buffer: initial_buffer.unwrap_or_default(),
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for QuicheStreamReader {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+
+        // Return from buffer first if we have data
+        if !this.buffer.is_empty() {
+            let to_copy = std::cmp::min(this.buffer.len(), buf.remaining());
+            buf.put_slice(&this.buffer[..to_copy]);
+            this.buffer.advance(to_copy);
+            return std::task::Poll::Ready(Ok(()));
+        }
+
+        let conn = Arc::clone(&this.conn);
+        let stream_id = this.stream_id;
+        let capacity = buf.remaining();
+
+        let fut = async move {
+            let mut temp_buf = vec![0u8; capacity];
+            match conn.stream_recv(stream_id, &mut temp_buf).await {
+                Ok(n) => Ok((temp_buf, n)),
+                Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
+            }
+        };
+
+        tokio::pin!(fut);
+        match fut.poll(cx) {
+            std::task::Poll::Ready(Ok((data, n))) => {
+                buf.put_slice(&data[..n]);
+                std::task::Poll::Ready(Ok(()))
+            }
+            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
     }
 }
 
@@ -931,6 +1077,52 @@ impl QuicheConnection {
     pub async fn min_rtt(&self) -> Option<Duration> {
         self.inner.min_rtt().await
     }
+
+    /// Accept an incoming bidirectional stream.
+    ///
+    /// This waits for a new server-initiated bidirectional stream and returns
+    /// wrapped reader/writer handles that implement AsyncRead/AsyncWrite.
+    ///
+    /// This is primarily used for standalone authentication where the server
+    /// initiates an auth stream.
+    pub async fn accept_bi(&self) -> Result<(QuicheStreamWriter, QuicheStreamReader)> {
+        loop {
+            // Check for pending streams
+            {
+                let mut pending = self.inner.pending_streams.lock().await;
+                if let Some((stream_type, stream_id)) = pending.pop_front() {
+                    // Only accept bidirectional streams
+                    if stream_type.is_bidirectional() {
+                        // Get any leftover buffered data
+                        let leftover = {
+                            let mut bufs = self.inner.stream_bufs.write().await;
+                            bufs.remove(&stream_id)
+                        };
+
+                        let stream = QuicheStream::with_buffer(
+                            Arc::clone(&self.inner),
+                            stream_id,
+                            leftover,
+                            false,
+                            false,
+                        );
+
+                        // Split into reader/writer
+                        return Ok(stream.into_split());
+                    }
+                    // Put non-bidi streams back (or handle them)
+                    pending.push_front((stream_type, stream_id));
+                }
+            }
+
+            // Drive I/O and wait for new streams
+            self.inner.drive_io().await?;
+
+            if self.inner.is_closed() {
+                return Err(Error::ConnectionClosed);
+            }
+        }
+    }
 }
 
 impl Connection for QuicheConnection {
@@ -1305,6 +1497,114 @@ pub fn generate_self_signed_cert() -> Result<(Vec<u8>, Vec<u8>)> {
     let key_pem = cert.key_pair.serialize_pem().into_bytes();
 
     Ok((cert_pem, key_pem))
+}
+
+/// Build a quiche::Config from a TransportConfigBuilder.
+///
+/// This converts the library-agnostic configuration to a quiche-specific config.
+pub fn build_config(builder: &super::config::TransportConfigBuilder) -> Result<quiche::Config> {
+    use super::config::EndpointRole;
+    use std::io::Write;
+
+    let mut config =
+        quiche::Config::new(quiche::PROTOCOL_VERSION).map_err(|e| Error::Transport {
+            message: format!("failed to create quiche config: {}", e),
+        })?;
+
+    // Set ALPN protocols
+    let alpn_refs: Vec<&[u8]> = builder.alpn().iter().map(|a| a.as_slice()).collect();
+    config
+        .set_application_protos(&alpn_refs)
+        .map_err(|e| Error::Transport {
+            message: format!("failed to set application protos: {}", e),
+        })?;
+
+    // Handle TLS credentials for server
+    if builder.role() == EndpointRole::Server {
+        let creds = builder.credentials().ok_or_else(|| Error::Transport {
+            message: "server config requires TLS credentials".to_string(),
+        })?;
+
+        // Write cert/key to temp files (quiche requires file paths)
+        let temp_dir = std::env::temp_dir();
+        let unique_id = format!(
+            "{}-{:?}-{}",
+            std::process::id(),
+            std::thread::current().id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let cert_path = temp_dir.join(format!("qsh-cert-{}.pem", unique_id));
+        let key_path = temp_dir.join(format!("qsh-key-{}.pem", unique_id));
+
+        let mut cert_file =
+            std::fs::File::create(&cert_path).map_err(|e| Error::CertificateError {
+                message: format!("failed to create temp cert file: {}", e),
+            })?;
+        cert_file
+            .write_all(&creds.cert_pem)
+            .map_err(|e| Error::CertificateError {
+                message: format!("failed to write cert file: {}", e),
+            })?;
+
+        let mut key_file =
+            std::fs::File::create(&key_path).map_err(|e| Error::CertificateError {
+                message: format!("failed to create temp key file: {}", e),
+            })?;
+        key_file
+            .write_all(&creds.key_pem)
+            .map_err(|e| Error::CertificateError {
+                message: format!("failed to write key file: {}", e),
+            })?;
+
+        config
+            .load_cert_chain_from_pem_file(cert_path.to_str().unwrap())
+            .map_err(|e| Error::CertificateError {
+                message: format!("failed to load certificate: {}", e),
+            })?;
+
+        config
+            .load_priv_key_from_pem_file(key_path.to_str().unwrap())
+            .map_err(|e| Error::CertificateError {
+                message: format!("failed to load private key: {}", e),
+            })?;
+
+        // Clean up temp files
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+
+        // Set custom ticket key if provided
+        if let Some(key) = &creds.ticket_key {
+            config.set_ticket_key(key).map_err(|e| Error::Transport {
+                message: format!("failed to set ticket key: {}", e),
+            })?;
+        }
+    }
+
+    // Enable 0-RTT early data if requested
+    if builder.early_data_enabled() {
+        config.enable_early_data();
+    }
+
+    // Set peer verification for client
+    if builder.role() == EndpointRole::Client && !builder.should_verify_peer() {
+        config.verify_peer(false);
+    }
+
+    // Apply transport parameters
+    config.set_max_idle_timeout(builder.idle_timeout().as_millis() as u64);
+    config.set_max_recv_udp_payload_size(builder.max_recv_udp_payload_size() as usize);
+    config.set_max_send_udp_payload_size(builder.max_send_udp_payload_size() as usize);
+    config.set_initial_max_data(builder.max_data());
+    config.set_initial_max_stream_data_bidi_local(builder.max_stream_data_bidi_local());
+    config.set_initial_max_stream_data_bidi_remote(builder.max_stream_data_bidi_remote());
+    config.set_initial_max_stream_data_uni(builder.max_stream_data_uni());
+    config.set_initial_max_streams_bidi(builder.max_streams_bidi());
+    config.set_initial_max_streams_uni(builder.max_streams_uni());
+
+    Ok(config)
 }
 
 // =============================================================================
