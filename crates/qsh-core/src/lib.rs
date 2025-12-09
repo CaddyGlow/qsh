@@ -17,11 +17,9 @@ pub mod error;
 pub mod file;
 pub mod forward;
 pub mod logging;
-pub mod metrics;
 pub mod protocol;
 pub mod session;
 pub mod terminal;
-pub mod timing;
 pub mod transport;
 
 #[cfg(feature = "tunnel")]
@@ -32,4 +30,3 @@ pub mod auth;
 
 pub use error::{Error, Result};
 pub use logging::{LogFormat, init_logging};
-pub use metrics::ConnectionMetrics;

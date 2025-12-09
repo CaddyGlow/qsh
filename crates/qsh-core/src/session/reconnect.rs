@@ -4,14 +4,10 @@
 //! - Reconnection state machine
 //! - Mosh-style constant retry (RTT/2 delay, no exponential backoff)
 //! - State recovery negotiation
-//! - Input replay
 
 use std::time::{Duration, Instant};
 
 use crate::constants::SESSION_KEY_LEN;
-use crate::error::{Error, Result};
-
-use super::state::{InputTracker, SessionState, SessionStatus};
 
 /// Reconnection attempt result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,54 +160,6 @@ impl ReconnectionHandler {
     /// Check if we can use 0-RTT reconnection.
     pub fn can_use_0rtt(&self) -> bool {
         self.has_session_ticket
-    }
-
-    /// Process reconnection result and update session state.
-    pub fn process_result(
-        &self,
-        result: &ReconnectResult,
-        session: &mut SessionState,
-        input_tracker: &mut InputTracker,
-    ) -> Result<()> {
-        match result {
-            ReconnectResult::Success {
-                server_input_seq,
-                server_generation,
-                needs_full_sync,
-            } => {
-                // Update session state
-                session.confirm_generation(*server_generation);
-                session.confirm_input_seq(*server_input_seq);
-                session.record_reconnect();
-
-                // Confirm inputs that server has processed
-                input_tracker.confirm(*server_input_seq);
-
-                if *needs_full_sync {
-                    // Clear pending inputs - server will resend full state
-                    input_tracker.clear();
-                }
-
-                Ok(())
-            }
-
-            ReconnectResult::SessionExpired => {
-                session.set_status(SessionStatus::Expired);
-                Err(Error::SessionExpired)
-            }
-
-            ReconnectResult::AuthenticationFailed => {
-                session.set_status(SessionStatus::Closed);
-                Err(Error::AuthenticationFailed)
-            }
-
-            ReconnectResult::Rejected { reason } => {
-                session.set_status(SessionStatus::Closed);
-                Err(Error::Protocol {
-                    message: format!("Reconnection rejected: {}", reason),
-                })
-            }
-        }
     }
 
     /// Reset the handler for a new reconnection cycle.
@@ -374,84 +322,6 @@ mod tests {
 
         handler.reset();
         assert_eq!(handler.attempt(), 0);
-    }
-
-    #[test]
-    fn process_success_result() {
-        let handler = ReconnectionHandler::new();
-        let mut session = SessionState::new([0xAB; 32]);
-        let mut input_tracker = InputTracker::new();
-
-        session.set_status(SessionStatus::Reconnecting);
-
-        let result = ReconnectResult::Success {
-            server_input_seq: 10,
-            server_generation: 5,
-            needs_full_sync: false,
-        };
-
-        handler
-            .process_result(&result, &mut session, &mut input_tracker)
-            .unwrap();
-
-        assert_eq!(session.status(), SessionStatus::Connected);
-        assert_eq!(session.last_confirmed_generation(), 5);
-        assert_eq!(session.last_confirmed_input_seq(), 10);
-        assert_eq!(session.reconnect_count(), 1);
-    }
-
-    #[test]
-    fn process_success_with_full_sync() {
-        let handler = ReconnectionHandler::new();
-        let mut session = SessionState::new([0xAB; 32]);
-        let mut input_tracker = InputTracker::new();
-
-        // Add some pending inputs
-        input_tracker.push(vec![1, 2, 3], true);
-        input_tracker.push(vec![4, 5, 6], true);
-
-        let result = ReconnectResult::Success {
-            server_input_seq: 0,
-            server_generation: 0,
-            needs_full_sync: true,
-        };
-
-        handler
-            .process_result(&result, &mut session, &mut input_tracker)
-            .unwrap();
-
-        // Pending inputs should be cleared for full sync
-        assert!(!input_tracker.has_pending());
-    }
-
-    #[test]
-    fn process_session_expired() {
-        let handler = ReconnectionHandler::new();
-        let mut session = SessionState::new([0xAB; 32]);
-        let mut input_tracker = InputTracker::new();
-
-        let result = ReconnectResult::SessionExpired;
-        let err = handler
-            .process_result(&result, &mut session, &mut input_tracker)
-            .unwrap_err();
-
-        assert!(matches!(err, Error::SessionExpired));
-        assert_eq!(session.status(), SessionStatus::Expired);
-    }
-
-    #[test]
-    fn process_authentication_failed() {
-        let handler = ReconnectionHandler::new();
-        let mut session = SessionState::new([0xAB; 32]);
-        let mut input_tracker = InputTracker::new();
-
-        let result = ReconnectResult::AuthenticationFailed;
-        let err = handler
-            .process_result(&result, &mut session, &mut input_tracker)
-            .unwrap_err();
-
-        assert!(matches!(err, Error::AuthenticationFailed));
-        assert_eq!(session.status(), SessionStatus::Closed);
     }
 
     #[test]

@@ -72,15 +72,11 @@ prop_compose! {
         sequence in any::<u64>(),
         data in prop::collection::vec(any::<u8>(), 0..1024),
         predictable in any::<bool>(),
-        timestamp in any::<u16>(),
-        timestamp_reply in any::<u16>(),
     ) -> TerminalInputData {
         TerminalInputData {
             sequence,
             data,
             predictable,
-            timestamp,
-            timestamp_reply,
         }
     }
 }
@@ -271,8 +267,6 @@ proptest! {
                 sequence: seq,
                 data,
                 predictable,
-                timestamp: 0,
-                timestamp_reply: u16::MAX,
             }),
         });
 

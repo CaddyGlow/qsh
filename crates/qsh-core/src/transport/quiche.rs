@@ -7,12 +7,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
 use tokio::sync::{Mutex, RwLock};
+use tracing::debug;
 
 use crate::error::{Error, Result};
 use crate::protocol::{ChannelId, Codec, Message};
@@ -465,7 +466,12 @@ impl QuicheConnectionInner {
         // Compute RTT-adaptive keepalive interval (Mosh-style: RTT/2)
         let keepalive_interval = {
             let conn = self.conn.lock().await;
-            let rtt = conn.path_stats().next().map(|p| p.rtt);
+            // Prefer the active path's RTT if available.
+            let rtt = conn
+                .path_stats()
+                .find(|p| p.active)
+                .map(|p| p.rtt)
+                .or_else(|| conn.path_stats().next().map(|p| p.rtt));
             match rtt {
                 Some(rtt) => {
                     // Mosh-style: RTT/2, clamped to [50ms, 500ms]
@@ -492,17 +498,27 @@ impl QuicheConnectionInner {
             *last_keepalive = std::time::Instant::now();
         }
 
-        // Determine wait time based on quiche's timeout
-        let wait_duration = {
+        // Determine quiche's requested timeout (if any).
+        // This represents how long we should wait before calling `on_timeout()`.
+        let quiche_timeout = {
             let conn = self.conn.lock().await;
-            conn.timeout().unwrap_or(Duration::from_millis(100))
+            let t = conn.timeout();
+            debug!(
+                quiche_timeout_ms = t.map(|d| d.as_millis() as u64),
+                "quiche timeout poll"
+            );
+            t
         };
 
-        // Use the minimum of our poll interval and quiche's requested timeout
-        let recv_timeout = wait_duration.min(Duration::from_millis(100));
-
-        // Try to receive a packet with timeout
-        let recv_result = tokio::time::timeout(recv_timeout, self.socket.recv_from(&mut buf)).await;
+        // Try to receive a packet, honoring quiche's timeout semantics:
+        // - If quiche requests a timeout, use that as the recv timeout and
+        //   call `on_timeout()` only when that timer actually fires.
+        // - If quiche has no pending timeout, block until a packet arrives.
+        let recv_result = if let Some(t) = quiche_timeout {
+            tokio::time::timeout(t, self.socket.recv_from(&mut buf)).await
+        } else {
+            Ok(self.socket.recv_from(&mut buf).await)
+        };
 
         match recv_result {
             Ok(Ok((len, from))) => {
@@ -540,7 +556,8 @@ impl QuicheConnectionInner {
                 return Err(classify_io_error(e));
             }
             Err(_) => {
-                // Socket recv timed out - process quiche's internal timeout
+                // quiche's timeout elapsed without a packet - drive its timers
+                debug!("quiche timeout elapsed; calling on_timeout()");
                 let mut conn = self.conn.lock().await;
                 conn.on_timeout();
             }
@@ -648,17 +665,85 @@ impl QuicheConnectionInner {
         self.closed.load(Ordering::SeqCst)
     }
 
-    /// Get smoothed RTT estimate.
+    /// Get RTT of last path for application use.
     ///
-    /// Note: Under packet loss, SRTT can grow very large due to retransmissions.
-    /// Use `min_rtt()` for a cleaner measurement.
+    /// This is derived from quiche's smoothed RTT (SRTT) but is
+    /// clamped to avoid pathological values after heavy loss or long
+    /// recovery. For low-latency links this will generally reflect the
+    /// true RTT; for highly congested links it is capped.
     pub async fn rtt(&self) -> Duration {
         let conn = self.conn.lock().await;
-        // Use path_stats for RTT in newer quiche
-        if let Some(path) = conn.path_stats().next() {
-            path.rtt
+
+        // Snapshot connection-level stats.
+        let stats = conn.stats();
+
+        // Collect all path stats so we can both log them and select the active one.
+        let paths: Vec<_> = conn.path_stats().collect();
+
+        // Log detailed stats for each known path.
+        for (idx, path) in paths.iter().enumerate() {
+            debug!(
+                path_index = idx,
+                local_addr = %path.local_addr,
+                peer_addr = %path.peer_addr,
+                active = path.active,
+                recv = path.recv,
+                sent = path.sent,
+                lost = path.lost,
+                retrans = path.retrans,
+                total_pto_count = path.total_pto_count,
+                rtt_ms = path.rtt.as_millis() as u64,
+                min_rtt_ms = path.min_rtt.map(|d| d.as_millis() as u64),
+                max_rtt_ms = path.max_rtt.map(|d| d.as_millis() as u64),
+                rttvar_ms = path.rttvar.as_millis() as u64,
+                cwnd = path.cwnd,
+                sent_bytes = path.sent_bytes,
+                recv_bytes = path.recv_bytes,
+                lost_bytes = path.lost_bytes,
+                stream_retrans_bytes = path.stream_retrans_bytes,
+                delivery_rate = path.delivery_rate,
+                "quiche path_stats_detail"
+            );
+        }
+
+        // Log aggregate connection stats.
+        debug!(
+            conn_sent = stats.sent,
+            conn_lost = stats.lost,
+            conn_retrans = stats.retrans,
+            conn_sent_bytes = stats.sent_bytes,
+            conn_recv_bytes = stats.recv_bytes,
+            conn_lost_bytes = stats.lost_bytes,
+            conn_paths_count = stats.paths_count,
+            "quiche connection_stats"
+        );
+
+        // Prefer the active path when computing RTT, fall back to the first path.
+        let selected = paths
+            .iter()
+            .find(|p| p.active)
+            .or_else(|| paths.first());
+
+        // Clamp SRTT so application-level RTT does not grow without bound.
+        const RTT_CLAMP_MS: u64 = 1_000;
+
+        if let Some(path) = selected {
+            let raw_rtt = path.rtt;
+            let clamped_rtt = raw_rtt.min(Duration::from_millis(RTT_CLAMP_MS));
+
+            debug!(
+                rtt_ms = raw_rtt.as_millis() as u64,
+                min_rtt_ms = path.min_rtt.map(|d| d.as_millis() as u64),
+                rttvar_ms = path.rttvar.as_millis() as u64,
+                cwnd = path.cwnd,
+                delivery_rate = path.delivery_rate,
+                active = path.active,
+                clamped_rtt_ms = clamped_rtt.as_millis() as u64,
+                "quiche path_stats_selected"
+            );
+            clamped_rtt
         } else {
-            Duration::from_millis(50) // Default fallback
+            Duration::from_millis(0) // Default fallback
         }
     }
 
@@ -668,7 +753,10 @@ impl QuicheConnectionInner {
     /// Preferred for display as it shows the true network latency.
     pub async fn min_rtt(&self) -> Option<Duration> {
         let conn = self.conn.lock().await;
-        conn.path_stats().next().and_then(|p| p.min_rtt)
+        conn.path_stats()
+            .find(|p| p.active)
+            .or_else(|| conn.path_stats().next())
+            .and_then(|p| p.min_rtt)
     }
 
     /// Get packet loss ratio.
@@ -773,7 +861,11 @@ impl QuicheConnection {
     pub async fn congestion_window(&self) -> u64 {
         let conn = self.inner.conn.lock().await;
         // Get cwnd from path stats
-        if let Some(path) = conn.path_stats().next() {
+        if let Some(path) = conn
+            .path_stats()
+            .find(|p| p.active)
+            .or_else(|| conn.path_stats().next())
+        {
             path.cwnd as u64
         } else {
             0
@@ -1063,13 +1155,16 @@ pub fn cert_hash(cert_der: &[u8]) -> Vec<u8> {
 
 /// Create a quiche client configuration.
 pub fn client_config(verify_peer: bool) -> Result<quiche::Config> {
-    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).map_err(|e| Error::Transport {
-        message: format!("failed to create quiche config: {}", e),
-    })?;
+    let mut config =
+        quiche::Config::new(quiche::PROTOCOL_VERSION).map_err(|e| Error::Transport {
+            message: format!("failed to create quiche config: {}", e),
+        })?;
 
-    config.set_application_protos(&[crate::constants::ALPN]).map_err(|e| Error::Transport {
-        message: format!("failed to set application protos: {}", e),
-    })?;
+    config
+        .set_application_protos(&[crate::constants::ALPN])
+        .map_err(|e| Error::Transport {
+            message: format!("failed to set application protos: {}", e),
+        })?;
 
     // Enable 0-RTT early data for faster reconnection
     config.enable_early_data();
@@ -1113,13 +1208,16 @@ pub fn server_config_with_ticket_key(
 ) -> Result<quiche::Config> {
     use std::io::Write;
 
-    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).map_err(|e| Error::Transport {
-        message: format!("failed to create quiche config: {}", e),
-    })?;
+    let mut config =
+        quiche::Config::new(quiche::PROTOCOL_VERSION).map_err(|e| Error::Transport {
+            message: format!("failed to create quiche config: {}", e),
+        })?;
 
-    config.set_application_protos(&[crate::constants::ALPN]).map_err(|e| Error::Transport {
-        message: format!("failed to set application protos: {}", e),
-    })?;
+    config
+        .set_application_protos(&[crate::constants::ALPN])
+        .map_err(|e| Error::Transport {
+            message: format!("failed to set application protos: {}", e),
+        })?;
 
     // Write cert/key to temp files (quiche requires file paths)
     // Use process ID + thread ID + timestamp for uniqueness in parallel tests
@@ -1139,16 +1237,20 @@ pub fn server_config_with_ticket_key(
     let mut cert_file = std::fs::File::create(&cert_path).map_err(|e| Error::CertificateError {
         message: format!("failed to create temp cert file: {}", e),
     })?;
-    cert_file.write_all(cert_pem).map_err(|e| Error::CertificateError {
-        message: format!("failed to write cert file: {}", e),
-    })?;
+    cert_file
+        .write_all(cert_pem)
+        .map_err(|e| Error::CertificateError {
+            message: format!("failed to write cert file: {}", e),
+        })?;
 
     let mut key_file = std::fs::File::create(&key_path).map_err(|e| Error::CertificateError {
         message: format!("failed to create temp key file: {}", e),
     })?;
-    key_file.write_all(key_pem).map_err(|e| Error::CertificateError {
-        message: format!("failed to write key file: {}", e),
-    })?;
+    key_file
+        .write_all(key_pem)
+        .map_err(|e| Error::CertificateError {
+            message: format!("failed to write key file: {}", e),
+        })?;
 
     // Load certificate and key from temp files
     config
@@ -1260,8 +1362,8 @@ mod tests {
     #[test]
     fn server_config_enables_early_data() {
         // Generate self-signed cert for testing
-        let (cert_pem, key_pem) = generate_self_signed_cert()
-            .expect("should generate self-signed cert");
+        let (cert_pem, key_pem) =
+            generate_self_signed_cert().expect("should generate self-signed cert");
 
         // Server config should successfully create and enable early data
         let config = server_config(&cert_pem, &key_pem);
@@ -1271,25 +1373,32 @@ mod tests {
     #[test]
     fn server_config_with_custom_ticket_key() {
         // Generate self-signed cert for testing
-        let (cert_pem, key_pem) = generate_self_signed_cert()
-            .expect("should generate self-signed cert");
+        let (cert_pem, key_pem) =
+            generate_self_signed_cert().expect("should generate self-signed cert");
 
         // 48 bytes for AES-256-GCM ticket key
         let ticket_key = [0x42u8; 48];
 
         // Server config with custom ticket key should succeed
         let config = server_config_with_ticket_key(&cert_pem, &key_pem, Some(&ticket_key));
-        assert!(config.is_ok(), "server_config_with_ticket_key should succeed");
+        assert!(
+            config.is_ok(),
+            "server_config_with_ticket_key should succeed"
+        );
     }
 
     #[test]
     fn server_config_without_ticket_key() {
         // Generate self-signed cert for testing
-        let (cert_pem, key_pem) = generate_self_signed_cert()
-            .expect("should generate self-signed cert");
+        let (cert_pem, key_pem) =
+            generate_self_signed_cert().expect("should generate self-signed cert");
 
         // Server config without ticket key should use auto-generated key
         let config = server_config_with_ticket_key(&cert_pem, &key_pem, None);
-        assert!(config.is_ok(), "server_config_with_ticket_key(None) should succeed: {:?}", config.err());
+        assert!(
+            config.is_ok(),
+            "server_config_with_ticket_key(None) should succeed: {:?}",
+            config.err()
+        );
     }
 }

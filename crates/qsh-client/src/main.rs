@@ -10,27 +10,25 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
 
 use qsh_client::cli::{NotificationStyle as CliNotificationStyle, SshBootstrapMode};
-use qsh_client::overlay::{
-    ConnectionStatus, NotificationEngine, NotificationStyle, OverlayPosition, PredictionOverlay,
-    StatusOverlay,
-};
+use qsh_client::overlay::{NotificationEngine, NotificationStyle, PredictionOverlay};
 use qsh_client::prediction::{DisplayPreference, Prediction};
 use qsh_client::render::StateRenderer;
-use qsh_core::terminal::TerminalParser;
 use qsh_client::{
-    BootstrapMode, ChannelConnection, Cli, ConnectionConfig, ConnectionState, EscapeCommand,
-    EscapeHandler, EscapeResult, ForwarderHandle, HeartbeatTracker, LocalForwarder, ProxyHandle,
-    RawModeGuard, ReconnectableConnection, RemoteForwarder, RemoteForwarderHandle, SessionContext,
-    Socks5Proxy, SshConfig, StdinReader, StdoutWriter, TerminalSessionState, bootstrap,
-    get_terminal_size, parse_dynamic_forward, parse_escape_key, parse_local_forward,
-    parse_remote_forward, random_local_port, restore_terminal,
+    BootstrapMode, ChannelConnection, Cli, ConnectionConfig, EscapeCommand, EscapeHandler,
+    EscapeResult, ForwarderHandle, HeartbeatTracker, LocalForwarder, ProxyHandle, RawModeGuard,
+    ReconnectableConnection, RemoteForwarder, RemoteForwarderHandle, SessionContext, Socks5Proxy,
+    SshConfig, StdinReader, StdoutWriter, TerminalSessionState, bootstrap, get_terminal_size,
+    parse_dynamic_forward, parse_escape_key, parse_local_forward, parse_remote_forward,
+    random_local_port, restore_terminal,
 };
 use qsh_core::protocol::Message;
+use qsh_core::terminal::TerminalParser;
+use qsh_core::transport::Connection;
 
 #[cfg(feature = "standalone")]
 use qsh_client::standalone::authenticate as standalone_authenticate;
 #[cfg(feature = "standalone")]
-use qsh_client::{connect_quic, DirectAuthenticator, DirectConfig};
+use qsh_client::{DirectAuthenticator, DirectConfig, connect_quic};
 
 use qsh_core::protocol::TermSize;
 
@@ -86,9 +84,7 @@ fn main() {
 /// Spawn a control message handler task for server-initiated channels.
 ///
 /// Returns a JoinHandle that processes ForwardedTcpIp and shutdown requests.
-fn spawn_control_handler(
-    conn: std::sync::Arc<ChannelConnection>,
-) -> tokio::task::JoinHandle<()> {
+fn spawn_control_handler(conn: std::sync::Arc<ChannelConnection>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         info!("Control message handler started");
         loop {
@@ -230,9 +226,7 @@ async fn run_client_direct(cli: &Cli, host: &str, user: Option<&str>) -> qsh_cor
 
         // Wait for Ctrl+C
         info!("Press Ctrl+C to exit");
-        tokio::signal::ctrl_c()
-            .await
-            .map_err(qsh_core::Error::Io)?;
+        tokio::signal::ctrl_c().await.map_err(qsh_core::Error::Io)?;
 
         info!("Shutting down...");
         control_task.abort();
@@ -241,8 +235,8 @@ async fn run_client_direct(cli: &Cli, host: &str, user: Option<&str>) -> qsh_cor
     }
 
     // Create session context for reconnection support (with authenticator for re-auth)
-    let context = SessionContext::new(conn_config, conn.session_id())
-        .with_authenticator(authenticator);
+    let context =
+        SessionContext::new(conn_config, conn.session_id()).with_authenticator(authenticator);
 
     // Create reconnectable connection wrapper
     let reconnectable = std::sync::Arc::new(ReconnectableConnection::new(conn, context));
@@ -348,9 +342,7 @@ async fn run_client_channel_model(
 
         // Wait for Ctrl+C
         info!("Press Ctrl+C to exit");
-        tokio::signal::ctrl_c()
-            .await
-            .map_err(qsh_core::Error::Io)?;
+        tokio::signal::ctrl_c().await.map_err(qsh_core::Error::Io)?;
 
         info!("Shutting down...");
         control_task.abort();
@@ -380,16 +372,6 @@ async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Resu
 
     // Use channel model (SSH-style multiplexing)
     run_client_channel_model(cli, host, user).await
-}
-
-
-async fn render_overlay_if_visible(overlay: &StatusOverlay, stdout: &mut StdoutWriter) {
-    // render() handles visibility logic including force-show during reconnection
-    let term_size = get_term_size();
-    let overlay_output = overlay.render(term_size.cols);
-    if !overlay_output.is_empty() {
-        let _ = stdout.write(overlay_output.as_bytes()).await;
-    }
 }
 
 /// Render the mosh-style notification bar.
@@ -459,22 +441,6 @@ fn map_notification_style(cli_style: CliNotificationStyle) -> NotificationStyle 
     match cli_style {
         CliNotificationStyle::Minimal => NotificationStyle::Minimal,
         CliNotificationStyle::Enhanced => NotificationStyle::Enhanced,
-    }
-}
-
-/// Parse toggle key specification (e.g., "ctrl+o", "ctrl+t").
-fn parse_toggle_key(spec: &str) -> Option<u8> {
-    let spec = spec.to_lowercase();
-    if spec.starts_with("ctrl+") {
-        let ch = spec.chars().last()?;
-        if ch.is_ascii_lowercase() {
-            // ctrl+a = 0x01, ctrl+b = 0x02, ..., ctrl+z = 0x1a
-            Some((ch as u8) - b'a' + 1)
-        } else {
-            None
-        }
-    } else {
-        None
     }
 }
 
@@ -598,26 +564,6 @@ async fn start_forwards(
     })
 }
 
-/// Create and configure status overlay from CLI options.
-fn create_status_overlay(cli: &Cli, user_host: Option<String>) -> StatusOverlay {
-    let mut overlay = StatusOverlay::new();
-
-    // Set position
-    overlay.set_position(cli.overlay_position);
-
-    // Set initial visibility (--status enables, --no-overlay disables)
-    let visible =
-        cli.show_status && !cli.no_overlay && cli.overlay_position != OverlayPosition::None;
-    overlay.set_visible(visible);
-
-    // Set user@host if available
-    if let Some(uh) = user_host {
-        overlay.set_user_host(uh);
-    }
-
-    overlay
-}
-
 /// Create and configure mosh-style notification engine from CLI options.
 fn create_notification_engine(cli: &Cli, user_host: Option<String>) -> NotificationEngine {
     let mut notification = NotificationEngine::new();
@@ -648,9 +594,6 @@ async fn run_reconnectable_session(
 ) -> qsh_core::Result<()> {
     // Track terminal state for recovery after reconnection
     let mut terminal_state = TerminalSessionState::new();
-
-    // Create status overlay (legacy, for --status flag)
-    let mut overlay = create_status_overlay(cli, user_host.clone());
 
     // Create mosh-style notification engine (auto-shows on connection issues)
     let mut notification = create_notification_engine(cli, user_host);
@@ -683,9 +626,6 @@ async fn run_reconnectable_session(
     let mut escape_info_refresh = tokio::time::interval(Duration::from_millis(250));
     escape_info_refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-    // Parse toggle key
-    let toggle_key = parse_toggle_key(&cli.overlay_key);
-
     // Parse escape key and create handler
     let escape_key = parse_escape_key(&cli.escape_key);
     let mut escape_handler = EscapeHandler::new(escape_key);
@@ -699,7 +639,8 @@ async fn run_reconnectable_session(
 
     // Prediction settings
     let prediction_mode = cli.effective_prediction_mode();
-    let prediction_enabled = prediction_mode != qsh_client::cli::PredictionMode::Off && is_interactive;
+    let prediction_enabled =
+        prediction_mode != qsh_client::cli::PredictionMode::Off && is_interactive;
 
     // Mosh-style state tracking
     // StateRenderer maintains local framebuffer for differential rendering
@@ -714,12 +655,6 @@ async fn run_reconnectable_session(
     // Reconnection loop
     loop {
         // Wait for connection to be available, with periodic refresh of notification bar
-        overlay.set_status(match reconnectable.state() {
-            ConnectionState::Connected => ConnectionStatus::Connected,
-            ConnectionState::Reconnecting => ConnectionStatus::Reconnecting,
-            ConnectionState::Disconnected => ConnectionStatus::Disconnected,
-        });
-        render_overlay_if_visible(&overlay, &mut stdout).await;
         render_notification(&notification, &mut stdout).await;
 
         // Use select to allow refreshing notification while waiting for reconnection
@@ -734,8 +669,6 @@ async fn run_reconnectable_session(
                         Ok(conn) => break conn,
                         Err(e) => {
                             error!(error = %e, "Connection permanently lost");
-                            overlay.set_status(ConnectionStatus::Disconnected);
-                            render_overlay_if_visible(&overlay, &mut stdout).await;
                             return Err(e);
                         }
                     }
@@ -815,11 +748,8 @@ async fn run_reconnectable_session(
 
         info!(channel_id = ?terminal.channel_id(), "Terminal channel ready");
 
-        // Update overlay for connected state
-        overlay.set_status(ConnectionStatus::Connected);
+        // Get initial RTT from QUIC connection
         let initial_rtt = conn.rtt().await;
-        overlay.metrics_mut().update_rtt(initial_rtt);
-        overlay.metrics_mut().record_heard();
 
         // Update notification engine for connected state
         notification.server_heard(std::time::Instant::now());
@@ -914,7 +844,7 @@ async fn run_reconnectable_session(
                         match msg {
                             Message::Heartbeat(hb) => {
                                 if let Some(rtt) = heartbeat_tracker.receive_heartbeat(&hb) {
-                                    debug!(rtt_ms = rtt.as_millis(), "Heartbeat RTT sample");
+                                    // debug!(rtt_ms = rtt.as_millis(), "Heartbeat RTT sample");
                                 }
                             }
                             other => {
@@ -934,16 +864,6 @@ async fn run_reconnectable_session(
                         }
                     };
 
-                    // Check toggle key (only if overlay is allowed)
-                    if let (Some(key), true) = (toggle_key, data.len() == 1) {
-                        if data[0] == key {
-                            let visible = overlay.is_visible();
-                            overlay.set_visible(!visible);
-                            render_overlay_if_visible(&overlay, &mut stdout).await;
-                            continue;
-                        }
-                    }
-
                     // Check escape sequence
                     match escape_handler.process(&data) {
                         EscapeResult::Command(EscapeCommand::Disconnect) => {
@@ -952,10 +872,8 @@ async fn run_reconnectable_session(
                             break Ok(());
                         }
                         EscapeResult::Command(EscapeCommand::ToggleOverlay) => {
-                            notification.clear_message(); // Clear info bar
-                            let visible = overlay.is_visible();
-                            overlay.set_visible(!visible);
-                            render_overlay_if_visible(&overlay, &mut stdout).await;
+                            // Overlay removed, command is now a no-op
+                            notification.clear_message();
                             continue;
                         }
                         EscapeResult::Command(EscapeCommand::SendEscapeKey) => {
@@ -1062,8 +980,6 @@ async fn run_reconnectable_session(
                 result = terminal.recv_event() => {
                     match result {
                         Ok(qsh_client::TerminalEvent::Output(output)) => {
-                            overlay.metrics_mut().record_heard();
-
                             // Update notification engine (mosh-style)
                             let now = std::time::Instant::now();
                             notification.server_heard(now);
@@ -1110,12 +1026,10 @@ async fn run_reconnectable_session(
                                 break Err(e.into());
                             }
 
-                            // Render status overlay (legacy) and notification bar (mosh-style)
-                            render_overlay_if_visible(&overlay, &mut stdout).await;
+                            // Render notification bar (mosh-style)
                             render_notification(&notification, &mut stdout).await;
                         }
                         Ok(qsh_client::TerminalEvent::StateSync(update)) => {
-                            overlay.metrics_mut().record_heard();
 
                             // Update notification engine (mosh-style)
                             let now = std::time::Instant::now();
@@ -1158,8 +1072,7 @@ async fn run_reconnectable_session(
                                 }
                             }
 
-                            // Render status overlay (legacy) and notification bar (mosh-style)
-                            render_overlay_if_visible(&overlay, &mut stdout).await;
+                            // Render notification bar (mosh-style)
                             render_notification(&notification, &mut stdout).await;
                         }
                         Err(qsh_core::Error::ConnectionClosed) => {
@@ -1173,12 +1086,11 @@ async fn run_reconnectable_session(
                     }
                 }
 
-                // Overlay refresh
+                // Periodic refresh for RTT/metrics updates
                 _ = overlay_refresh.tick() => {
                     // Use SRTT for everything (mosh-style)
                     if let Some(srtt) = heartbeat_tracker.srtt() {
                         notification.update_rtt(srtt);
-                        overlay.metrics_mut().update_rtt(srtt);
 
                         // Update prediction engine RTT for adaptive display
                         if prediction_enabled {
@@ -1188,16 +1100,16 @@ async fn run_reconnectable_session(
                         }
                     }
 
-                    // Update packet loss metric from QUIC stats (rolling 30s window)
+                    // Update quiche RTT (QUIC transport-level) with smoothing
                     if let Some(conn) = reconnectable.connection() {
-                        let sent = conn.quic().packets_sent().await;
-                        let lost = conn.quic().packets_lost().await;
-                        overlay.metrics_mut().update_packet_counts(sent, lost);
+                        let quiche_rtt = conn.quic().rtt().await;
+                        notification.update_quiche_rtt(quiche_rtt);
+                    }
 
-                        // Notification uses the rolling loss from overlay
-                        if let Some(loss) = overlay.metrics_mut().packet_loss {
-                            notification.update_packet_loss(loss);
-                        }
+                    // Update packet loss metric from QUIC stats
+                    if let Some(conn) = reconnectable.connection() {
+                        let loss = conn.quic().packet_loss().await;
+                        notification.update_packet_loss(loss);
                     }
 
                     // Update notification engine (expire messages, etc.)
@@ -1220,8 +1132,7 @@ async fn run_reconnectable_session(
                         notification.show_info(fps, true);
                     }
 
-                    // Render overlays
-                    render_overlay_if_visible(&overlay, &mut stdout).await;
+                    // Render notification bar
                     render_notification(&notification, &mut stdout).await;
                 }
 
@@ -1230,6 +1141,12 @@ async fn run_reconnectable_session(
                     // Update RTT from heartbeat tracker (SRTT like mosh)
                     if let Some(srtt) = heartbeat_tracker.srtt() {
                         notification.update_rtt(srtt);
+                    }
+
+                    // Update quiche RTT (QUIC transport-level) with smoothing
+                    if let Some(conn) = reconnectable.connection() {
+                        let quiche_rtt = conn.quic().rtt().await;
+                        notification.update_quiche_rtt(quiche_rtt);
                     }
 
                     // Refresh the info bar with current stats
@@ -1256,14 +1173,12 @@ async fn run_reconnectable_session(
             Err(e) if e.is_transient() => {
                 // Transient error - trigger reconnection and continue loop
                 warn!(error = %e, "Transient error, attempting reconnection");
-                overlay.set_status(ConnectionStatus::Reconnecting);
 
                 // Store error and set reconnecting notification with duration
                 let error_msg = format!("{}", e);
                 reconnect_error = Some(error_msg.clone());
                 notification.set_reconnecting(&error_msg);
 
-                render_overlay_if_visible(&overlay, &mut stdout).await;
                 render_notification(&notification, &mut stdout).await;
                 reconnectable.handle_error(&e).await;
                 // Continue outer loop - will wait for reconnection

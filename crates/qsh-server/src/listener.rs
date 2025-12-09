@@ -555,7 +555,7 @@ async fn run_session_loop(
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| (d.as_millis() % 65536) as u16)
                             .unwrap_or(0);
-                        let reply = Message::Heartbeat(HeartbeatPayload::reply(now_ms, payload.timestamp));
+                        let reply = Message::Heartbeat(HeartbeatPayload::reply(now_ms, payload.timestamp, payload.seq));
                         if let Err(e) = handler_clone.send_control(&reply).await {
                             warn!(error = %e, "Failed to send heartbeat reply");
                         }

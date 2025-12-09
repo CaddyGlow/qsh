@@ -74,8 +74,14 @@ pub struct NotificationEngine {
     style: NotificationStyle,
     /// User@host string for enhanced display.
     user_host: Option<String>,
-    /// Current RTT for enhanced display.
+    /// Current RTT for enhanced display (from heartbeat SRTT).
     rtt: Option<Duration>,
+    /// Smoothed RTT from quiche (QUIC layer).
+    quiche_srtt: Option<f64>,
+    /// RTTVAR for quiche smoothing.
+    quiche_rttvar: Option<f64>,
+    /// Whether we've received at least one quiche RTT sample.
+    quiche_hit: bool,
     /// Packet loss for enhanced display.
     packet_loss: Option<f64>,
 }
@@ -87,6 +93,11 @@ impl Default for NotificationEngine {
 }
 
 impl NotificationEngine {
+    /// Alpha for quiche SRTT smoothing (1/8, same as TCP/mosh).
+    const QUICHE_ALPHA: f64 = 0.125;
+    /// Beta for quiche RTTVAR smoothing (1/4).
+    const QUICHE_BETA: f64 = 0.25;
+
     /// Create a new notification engine.
     pub fn new() -> Self {
         let now = Instant::now();
@@ -102,6 +113,9 @@ impl NotificationEngine {
             style: NotificationStyle::default(),
             user_host: None,
             rtt: None,
+            quiche_srtt: None,
+            quiche_rttvar: None,
+            quiche_hit: false,
             packet_loss: None,
         }
     }
@@ -124,7 +138,7 @@ impl NotificationEngine {
         self.user_host = Some(user_host);
     }
 
-    /// Update RTT for enhanced display.
+    /// Update RTT for enhanced display (from heartbeat SRTT).
     ///
     /// This also marks the connection as alive, since RTT updates mean
     /// QUIC keepalives are working even if no application data is flowing.
@@ -132,6 +146,38 @@ impl NotificationEngine {
         self.rtt = Some(rtt);
         // RTT update means the connection is alive (QUIC level)
         self.last_connection_alive = Instant::now();
+    }
+
+    /// Update quiche RTT with Jacobson/Karels smoothing (same algorithm as mosh).
+    ///
+    /// This tracks the QUIC layer's RTT separately from the heartbeat SRTT,
+    /// allowing comparison between application-level and transport-level measurements.
+    pub fn update_quiche_rtt(&mut self, rtt: Duration) {
+        let rtt_ms = rtt.as_secs_f64() * 1000.0;
+
+        // Filter out bogus values - quiche SRTT grows unboundedly due to
+        // congestion control (includes RTO backoff). Real RTT is never > 500ms.
+        if rtt_ms > 500.0 {
+            return;
+        }
+
+        if !self.quiche_hit {
+            // First measurement: initialize SRTT and RTTVAR
+            self.quiche_srtt = Some(rtt_ms);
+            self.quiche_rttvar = Some(rtt_ms / 2.0);
+            self.quiche_hit = true;
+        } else if let (Some(srtt), Some(rttvar)) = (self.quiche_srtt, self.quiche_rttvar) {
+            // Subsequent measurements: Jacobson/Karels algorithm (RFC 6298)
+            let new_rttvar = (1.0 - Self::QUICHE_BETA) * rttvar + Self::QUICHE_BETA * (srtt - rtt_ms).abs();
+            let new_srtt = (1.0 - Self::QUICHE_ALPHA) * srtt + Self::QUICHE_ALPHA * rtt_ms;
+            self.quiche_srtt = Some(new_srtt);
+            self.quiche_rttvar = Some(new_rttvar);
+        }
+    }
+
+    /// Get the smoothed quiche RTT.
+    pub fn quiche_srtt(&self) -> Option<Duration> {
+        self.quiche_srtt.map(|ms| Duration::from_secs_f64(ms / 1000.0))
     }
 
     /// Update packet loss for enhanced display.
@@ -224,8 +270,15 @@ impl NotificationEngine {
     /// * `frame_rate` - Current frame rate (fps)
     /// * `permanent` - If true, stays visible until cleared; if false, expires after 1 second
     pub fn show_info(&mut self, frame_rate: Option<f64>, permanent: bool) {
-        let rtt_str = self
+        // Heartbeat SRTT (application-level)
+        let hb_rtt_str = self
             .rtt
+            .map(|d| format_rtt(d))
+            .unwrap_or_else(|| "-".to_string());
+
+        // Quiche SRTT (QUIC transport-level)
+        let quiche_rtt_str = self
+            .quiche_srtt()
             .map(|d| format_rtt(d))
             .unwrap_or_else(|| "-".to_string());
 
@@ -238,7 +291,8 @@ impl NotificationEngine {
             .map(|f| format!("{:.0}fps", f))
             .unwrap_or_else(|| "-".to_string());
 
-        let info = format!("RTT: {} | loss: {} | {}", rtt_str, loss_str, fps_str);
+        // Show both RTTs: heartbeat (app) and quiche (transport)
+        let info = format!("RTT: {} (quic: {}) | loss: {} | {}", hb_rtt_str, quiche_rtt_str, loss_str, fps_str);
         self.set_notification_string(&info, permanent, true);
     }
 
@@ -826,14 +880,16 @@ mod tests {
     fn test_show_info() {
         let mut engine = NotificationEngine::new();
         engine.update_rtt(Duration::from_millis(42));
+        engine.update_quiche_rtt(Duration::from_millis(38));
         engine.update_packet_loss(0.005);
 
         // Show info with frame rate (non-permanent)
         engine.show_info(Some(60.5), false);
 
         assert!(engine.has_info_message());
-        let output = engine.render(80);
+        let output = engine.render(120); // Wider to fit both RTTs
         assert!(output.contains("RTT: 42ms"));
+        assert!(output.contains("quic: 38ms")); // quiche SRTT
         assert!(output.contains("0.5%"));
         assert!(output.contains("60fps") || output.contains("61fps")); // ~60
     }
@@ -854,12 +910,13 @@ mod tests {
     fn test_show_info_no_fps() {
         let mut engine = NotificationEngine::new();
         engine.update_rtt(Duration::from_millis(100));
+        // No quiche RTT - will show "-" for quic
 
         engine.show_info(None, false);
 
-        let output = engine.render(80);
+        let output = engine.render(120); // Wider to fit both RTTs
         assert!(output.contains("RTT: 100ms"));
-        assert!(output.contains("-")); // fps placeholder
+        assert!(output.contains("(quic: -)")); // quiche SRTT placeholder
     }
 
     #[test]

@@ -178,10 +178,14 @@ pub struct HeartbeatTracker {
     rttvar: f64,
     /// Whether we've received at least one RTT sample.
     hit: bool,
-    /// Pending heartbeats: (timestamp, sent_at). Supports multiple in-flight.
+    /// Pending heartbeats: (seq, sent_at). Supports multiple in-flight.
     pending: Vec<(u16, Instant)>,
+    /// Next sequence number to use.
+    next_seq: u16,
     /// Last received timestamp from peer.
     last_peer_timestamp: Option<u16>,
+    /// Last received sequence from peer.
+    last_peer_seq: Option<u16>,
     /// When we received the last peer timestamp.
     last_peer_received_at: Option<Instant>,
 }
@@ -191,8 +195,8 @@ impl HeartbeatTracker {
     const INITIAL_SRTT: f64 = 1000.0;
     /// Initial RTTVAR before any measurements (ms).
     const INITIAL_RTTVAR: f64 = 500.0;
-    /// Alpha for SRTT smoothing (1/8, same as mosh).
-    const ALPHA: f64 = 0.125;
+    /// Alpha for SRTT smoothing (1/16, slower than mosh for less jitter).
+    const ALPHA: f64 = 0.0625;
     /// Beta for RTTVAR smoothing (1/4).
     const BETA: f64 = 0.25;
     /// Minimum RTO in ms.
@@ -211,7 +215,9 @@ impl HeartbeatTracker {
             rttvar: Self::INITIAL_RTTVAR,
             hit: false,
             pending: Vec::new(),
+            next_seq: 1, // Start at 1, 0 means no reply
             last_peer_timestamp: None,
+            last_peer_seq: None,
             last_peer_received_at: None,
         }
     }
@@ -224,38 +230,39 @@ impl HeartbeatTracker {
             .unwrap_or(0)
     }
 
-    /// Calculate difference between two 16-bit timestamps, handling wrap.
-    fn timestamp_diff(a: u16, b: u16) -> i32 {
-        let diff = a.wrapping_sub(b) as i16;
-        diff as i32
-    }
-
     /// Record sending a heartbeat. Returns the heartbeat to send.
     ///
     /// Supports multiple in-flight heartbeats for accurate RTT measurement
     /// even with adaptive send intervals.
     pub fn send_heartbeat(&mut self) -> qsh_core::protocol::HeartbeatPayload {
         let timestamp = Self::timestamp16();
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        if self.next_seq == 0 {
+            self.next_seq = 1; // Skip 0
+        }
         let now = Instant::now();
 
         // Add to pending list (prune old entries > 5s to prevent unbounded growth)
         self.pending.retain(|(_, sent_at)| sent_at.elapsed().as_secs() < 5);
-        self.pending.push((timestamp, now));
+        self.pending.push((seq, now));
 
         // Include reply if we have a recent peer timestamp
-        let timestamp_reply = if let (Some(peer_ts), Some(received_at)) =
-            (self.last_peer_timestamp, self.last_peer_received_at)
+        let (timestamp_reply, seq_reply) = if let (Some(peer_ts), Some(peer_seq), Some(received_at)) =
+            (self.last_peer_timestamp, self.last_peer_seq, self.last_peer_received_at)
         {
             // Correct for hold time (how long we held it before sending)
             let hold_ms = received_at.elapsed().as_millis() as u16;
-            peer_ts.wrapping_add(hold_ms)
+            (peer_ts.wrapping_add(hold_ms), peer_seq)
         } else {
-            u16::MAX // No reply yet
+            (u16::MAX, 0) // No reply yet
         };
 
         qsh_core::protocol::HeartbeatPayload {
             timestamp,
             timestamp_reply,
+            seq,
+            seq_reply,
         }
     }
 
@@ -264,22 +271,28 @@ impl HeartbeatTracker {
         &mut self,
         payload: &qsh_core::protocol::HeartbeatPayload,
     ) -> Option<Duration> {
-        // Store peer's timestamp for echoing back
+        // Store peer's timestamp and seq for echoing back
         self.last_peer_timestamp = Some(payload.timestamp);
+        self.last_peer_seq = Some(payload.seq);
         self.last_peer_received_at = Some(Instant::now());
 
-        // If this is a reply, find matching pending heartbeat and calculate RTT
-        if payload.has_reply() {
-            // Find the pending heartbeat that matches this reply
-            let reply_ts = payload.timestamp_reply;
-            if let Some(idx) = self.pending.iter().position(|(sent_ts, _)| {
-                Self::timestamp_diff(reply_ts, *sent_ts).abs() < 5000
-            }) {
-                let (_, sent_at) = self.pending.remove(idx);
+        // If this is a reply, find matching pending heartbeat by sequence number
+        if payload.has_reply() && payload.seq_reply != 0 {
+            // Find the pending heartbeat with matching sequence number
+            if let Some(idx) = self.pending.iter().position(|(seq, _)| *seq == payload.seq_reply) {
+                let (seq, sent_at) = self.pending.remove(idx);
                 let rtt_ms = sent_at.elapsed().as_secs_f64() * 1000.0;
 
                 // Ignore large values (> 5 seconds) - likely stale
                 if rtt_ms < 5000.0 {
+                    tracing::trace!(
+                        seq_reply = payload.seq_reply,
+                        seq,
+                        rtt_ms,
+                        srtt = self.srtt,
+                        pending_count = self.pending.len(),
+                        "Heartbeat RTT sample"
+                    );
                     self.update_srtt(rtt_ms);
                     return Some(Duration::from_secs_f64(rtt_ms / 1000.0));
                 }
@@ -556,7 +569,11 @@ pub async fn connect_quic(config: &ConnectionConfig) -> Result<QuicConnection> {
         }
     }
 
-    let rtt = conn.path_stats().next().map(|p| p.rtt);
+    let rtt = conn
+        .path_stats()
+        .find(|p| p.active)
+        .or_else(|| conn.path_stats().next())
+        .map(|p| p.rtt);
     let resumed = conn.is_resumed();
     debug!(
         addr = %config.server_addr,

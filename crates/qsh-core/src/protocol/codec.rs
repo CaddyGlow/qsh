@@ -160,8 +160,6 @@ mod tests {
                 sequence: 999,
                 data: vec![0x61, 0x62, 0x63], // "abc"
                 predictable: true,
-                timestamp: 1234,
-                timestamp_reply: crate::timing::TIMESTAMP_NONE,
             }),
         });
 

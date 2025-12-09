@@ -608,16 +608,6 @@ pub struct TerminalInputData {
     pub data: Vec<u8>,
     /// Hint: these bytes may be predicted locally.
     pub predictable: bool,
-    /// Sender's timestamp (ms mod 65536) for RTT measurement.
-    #[serde(default)]
-    pub timestamp: u16,
-    /// Echo of last received timestamp (0xFFFF = none).
-    #[serde(default = "default_timestamp_none")]
-    pub timestamp_reply: u16,
-}
-
-fn default_timestamp_none() -> u16 {
-    crate::timing::TIMESTAMP_NONE
 }
 
 /// Terminal output (server -> client).
@@ -912,32 +902,43 @@ pub enum ShutdownReason {
 ///
 /// Uses 16-bit timestamps (milliseconds mod 65536) like mosh for minimal overhead.
 /// Each side echoes the received timestamp back, adjusted for hold time.
+/// A sequence number is used for reliable matching of replies.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct HeartbeatPayload {
     /// Sender's current timestamp (ms mod 65536).
     pub timestamp: u16,
     /// Echo of last received timestamp + hold time, or u16::MAX if none.
     pub timestamp_reply: u16,
+    /// Sequence number for matching replies (wraps at u16::MAX).
+    #[serde(default)]
+    pub seq: u16,
+    /// Echo of sequence number from the heartbeat being replied to.
+    #[serde(default)]
+    pub seq_reply: u16,
 }
 
 impl HeartbeatPayload {
     /// Create a new heartbeat with current timestamp and no reply.
-    pub fn new(timestamp: u16) -> Self {
+    pub fn new(timestamp: u16, seq: u16) -> Self {
         Self {
             timestamp,
             timestamp_reply: u16::MAX,
+            seq,
+            seq_reply: 0,
         }
     }
 
-    /// Create a heartbeat reply echoing the given timestamp.
-    pub fn reply(timestamp: u16, echo: u16) -> Self {
+    /// Create a heartbeat reply echoing the given timestamp and sequence.
+    pub fn reply(timestamp: u16, echo_ts: u16, echo_seq: u16) -> Self {
         Self {
             timestamp,
-            timestamp_reply: echo,
+            timestamp_reply: echo_ts,
+            seq: 0, // Reply doesn't need its own seq
+            seq_reply: echo_seq,
         }
     }
 
-    /// Check if this heartbeat has a valid reply timestamp.
+    /// Check if this heartbeat has a valid reply.
     pub fn has_reply(&self) -> bool {
         self.timestamp_reply != u16::MAX
     }
@@ -1554,8 +1555,6 @@ mod tests {
                 sequence: 1,
                 data: vec![0x61],
                 predictable: true,
-                timestamp: 0,
-                timestamp_reply: u16::MAX,
             }),
         });
     }
