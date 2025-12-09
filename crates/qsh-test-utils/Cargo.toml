@@ -13,7 +13,7 @@ s2n-quic-backend = ["qsh-core/s2n-quic-backend"]
 tunnel = ["qsh-core/tunnel"]
 
 [dependencies]
-qsh-core = { workspace = true, features = ["quiche-backend"] }
+qsh-core = { workspace = true, default-features = false }
 tokio = { workspace = true }
 bytes = { workspace = true }
 rcgen = { workspace = true }

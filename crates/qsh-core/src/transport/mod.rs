@@ -18,10 +18,17 @@
 //!
 //! Only one backend should be enabled at a time.
 
+// Compile-time check: only one backend can be enabled
+#[cfg(all(feature = "quiche-backend", feature = "s2n-quic-backend"))]
+compile_error!("Only one QUIC backend can be enabled at a time. Enable either `quiche-backend` or `s2n-quic-backend`, not both.");
+
 pub mod config;
 
 #[cfg(feature = "quiche-backend")]
 mod quiche;
+
+#[cfg(feature = "s2n-quic-backend")]
+mod s2n;
 
 // Re-export config types
 pub use config::{EndpointRole, TlsCredentials, TransportConfigBuilder};
@@ -30,6 +37,7 @@ pub use config::{EndpointRole, TlsCredentials, TransportConfigBuilder};
 // Feature-gated Backend Exports
 // =============================================================================
 
+// quiche backend exports (default)
 #[cfg(feature = "quiche-backend")]
 pub use quiche::{
     QuicheConnection, QuicheSender, QuicheStream,
@@ -40,7 +48,7 @@ pub use quiche::{
     build_config,
 };
 
-// Re-export with generic names for backend-agnostic code
+// Re-export with generic names for backend-agnostic code (quiche)
 #[cfg(feature = "quiche-backend")]
 pub use quiche::QuicheConnection as QuicConnection;
 #[cfg(feature = "quiche-backend")]
@@ -48,9 +56,24 @@ pub use quiche::QuicheSender as QuicSender;
 #[cfg(feature = "quiche-backend")]
 pub use quiche::QuicheStream as QuicStream;
 
-// s2n-quic backend (placeholder for Phase 6)
+// s2n-quic backend exports (alternative)
 #[cfg(feature = "s2n-quic-backend")]
-compile_error!("s2n-quic-backend is not yet implemented. Use quiche-backend for now.");
+pub use s2n::{
+    S2nConnection, S2nSender, S2nStream,
+    S2nStreamReader, S2nStreamWriter,
+    classify_io_error, enable_error_queue,
+    client_config, server_config, server_config_with_ticket_key, generate_self_signed_cert,
+    load_certs_from_pem, load_key_from_pem, cert_hash,
+    build_client_config, build_server_config,
+};
+
+// Re-export with generic names for backend-agnostic code (s2n-quic)
+#[cfg(feature = "s2n-quic-backend")]
+pub use s2n::S2nConnection as QuicConnection;
+#[cfg(feature = "s2n-quic-backend")]
+pub use s2n::S2nSender as QuicSender;
+#[cfg(feature = "s2n-quic-backend")]
+pub use s2n::S2nStream as QuicStream;
 
 use std::future::Future;
 use std::net::SocketAddr;

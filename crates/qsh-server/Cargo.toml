@@ -15,17 +15,18 @@ path = "src/main.rs"
 
 [features]
 default = ["quiche-backend", "compression"]
-quiche-backend = ["qsh-core/quiche-backend"]
-s2n-quic-backend = ["qsh-core/s2n-quic-backend"]
+quiche-backend = ["qsh-core/quiche-backend", "dep:tokio-quiche", "dep:quiche"]
+s2n-quic-backend = ["qsh-core/s2n-quic-backend", "dep:s2n-quic"]
 tunnel = ["qsh-core/tunnel"]
 standalone = ["qsh-core/standalone", "dep:ssh-key"]
 compression = ["qsh-core/compression"]
 
 [dependencies]
-qsh-core = { workspace = true, features = ["quiche-backend"] }
+qsh-core = { workspace = true, default-features = false }
 tokio = { workspace = true }
-tokio-quiche = { workspace = true }
-quiche = { workspace = true }
+tokio-quiche = { workspace = true, optional = true }
+quiche = { workspace = true, optional = true }
+s2n-quic = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true }
 nix = { workspace = true }
 libc = { workspace = true }
@@ -50,7 +51,7 @@ tokio-test = { workspace = true }
 proptest = { workspace = true }
 test-case = { workspace = true }
 assert_matches = { workspace = true }
-qsh-test-utils = { workspace = true }
+qsh-test-utils = { path = "../qsh-test-utils", default-features = false }
 futures = { workspace = true }
-qsh-client = { workspace = true, features = ["standalone"] }
+qsh-client = { path = "../qsh-client", default-features = false, features = ["standalone"] }
 tempfile = { workspace = true }
