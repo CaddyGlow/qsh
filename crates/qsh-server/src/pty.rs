@@ -160,15 +160,31 @@ impl Pty {
                 }
 
                 // Duplicate slave to stdin/stdout/stderr
-                dup2(slave_fd, libc::STDIN_FILENO).map_err(|e| Error::Pty {
-                    message: format!("dup2 stdin failed: {}", e),
-                })?;
-                dup2(slave_fd, libc::STDOUT_FILENO).map_err(|e| Error::Pty {
-                    message: format!("dup2 stdout failed: {}", e),
-                })?;
-                dup2(slave_fd, libc::STDERR_FILENO).map_err(|e| Error::Pty {
-                    message: format!("dup2 stderr failed: {}", e),
-                })?;
+                // Using libc directly since we have raw fds after fork
+                if unsafe { libc::dup2(slave_fd, libc::STDIN_FILENO) } < 0 {
+                    return Err(Error::Pty {
+                        message: format!(
+                            "dup2 stdin failed: {}",
+                            std::io::Error::last_os_error()
+                        ),
+                    });
+                }
+                if unsafe { libc::dup2(slave_fd, libc::STDOUT_FILENO) } < 0 {
+                    return Err(Error::Pty {
+                        message: format!(
+                            "dup2 stdout failed: {}",
+                            std::io::Error::last_os_error()
+                        ),
+                    });
+                }
+                if unsafe { libc::dup2(slave_fd, libc::STDERR_FILENO) } < 0 {
+                    return Err(Error::Pty {
+                        message: format!(
+                            "dup2 stderr failed: {}",
+                            std::io::Error::last_os_error()
+                        ),
+                    });
+                }
 
                 // Close original fds
                 if slave_fd > libc::STDERR_FILENO {
@@ -361,14 +377,18 @@ impl Drop for Pty {
 /// Set a file descriptor to non-blocking mode.
 fn set_nonblocking(fd: RawFd) -> Result<()> {
     use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    use std::os::fd::BorrowedFd;
 
-    let flags = fcntl(fd, FcntlArg::F_GETFL).map_err(|e| Error::Pty {
+    // SAFETY: fd is valid and we're just borrowing it for the fcntl call
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+
+    let flags = fcntl(borrowed, FcntlArg::F_GETFL).map_err(|e| Error::Pty {
         message: format!("fcntl F_GETFL failed: {}", e),
     })?;
 
     let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
 
-    fcntl(fd, FcntlArg::F_SETFL(flags)).map_err(|e| Error::Pty {
+    fcntl(borrowed, FcntlArg::F_SETFL(flags)).map_err(|e| Error::Pty {
         message: format!("fcntl F_SETFL failed: {}", e),
     })?;
 

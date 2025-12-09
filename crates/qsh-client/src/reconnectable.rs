@@ -341,7 +341,7 @@ impl ReconnectableConnection {
                     // Mosh-style port hopping: try a new local port after repeated failures
                     if consecutive_failures >= PORT_HOP_AFTER_FAILURES {
                         let new_port =
-                            rand::thread_rng().gen_range(PORT_RANGE_LOW..=PORT_RANGE_HIGH);
+                            rand::rng().random_range(PORT_RANGE_LOW..=PORT_RANGE_HIGH);
                         info!(
                             new_port,
                             consecutive_failures,

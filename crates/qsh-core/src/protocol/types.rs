@@ -120,7 +120,7 @@ impl SessionId {
     /// Generate a new random session ID.
     pub fn new() -> Self {
         let mut bytes = [0u8; 16];
-        getrandom::getrandom(&mut bytes).expect("failed to generate random session ID");
+        getrandom::fill(&mut bytes).expect("failed to generate random session ID");
         Self(bytes)
     }
 

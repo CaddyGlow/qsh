@@ -37,9 +37,7 @@ impl TerminalParser {
             saved_cursor: &mut self.saved_cursor,
         };
 
-        for &byte in data {
-            self.parser.advance(&mut performer, byte);
-        }
+        self.parser.advance(&mut performer, data);
         self.state.generation += 1;
     }
 

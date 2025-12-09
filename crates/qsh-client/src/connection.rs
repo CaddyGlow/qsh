@@ -25,7 +25,7 @@ pub const LOCAL_PORT_RANGE_HIGH: u16 = 60999;
 
 /// Generate a random local port in the Mosh range.
 pub fn random_local_port() -> u16 {
-    rand::thread_rng().gen_range(LOCAL_PORT_RANGE_LOW..=LOCAL_PORT_RANGE_HIGH)
+    rand::rng().random_range(LOCAL_PORT_RANGE_LOW..=LOCAL_PORT_RANGE_HIGH)
 }
 
 use qsh_core::constants::{DEFAULT_MAX_FORWARDS, FORWARD_BUFFER_SIZE, IDLE_TIMEOUT};

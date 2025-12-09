@@ -1499,7 +1499,7 @@ pub fn generate_self_signed_cert() -> Result<(Vec<u8>, Vec<u8>)> {
     })?;
 
     let cert_pem = cert.cert.pem().into_bytes();
-    let key_pem = cert.key_pair.serialize_pem().into_bytes();
+    let key_pem = cert.signing_key.serialize_pem().into_bytes();
 
     Ok((cert_pem, key_pem))
 }
@@ -1668,7 +1668,7 @@ pub async fn connect_quic(config: &ConnectConfig) -> Result<ConnectResult<Quiche
 
     // Generate connection ID
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut scid);
+    rand::RngCore::fill_bytes(&mut rand::rng(), &mut scid);
     let scid = quiche::ConnectionId::from_ref(&scid);
 
     // Create quiche connection
@@ -1956,7 +1956,7 @@ impl QuicheAcceptor {
                     } else if hdr.ty == quiche::Type::Initial {
                         // New connection - generate scid and store
                         let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
-                        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut scid);
+                        rand::RngCore::fill_bytes(&mut rand::rng(), &mut scid);
                         let scid_vec = scid.to_vec();
                         let scid = quiche::ConnectionId::from_vec(scid_vec.clone());
 

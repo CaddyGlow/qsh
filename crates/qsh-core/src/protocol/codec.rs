@@ -24,9 +24,12 @@ impl Codec {
     ///
     /// Returns the encoded bytes including the 4-byte length header.
     pub fn encode(msg: &Message) -> Result<Bytes> {
-        let payload = bincode::serialize(msg).map_err(|e| Error::Codec {
-            message: format!("serialization failed: {}", e),
-        })?;
+        let payload =
+            bincode::serde::encode_to_vec(msg, bincode::config::standard()).map_err(|e| {
+                Error::Codec {
+                    message: format!("serialization failed: {}", e),
+                }
+            })?;
 
         if payload.len() > MAX_MESSAGE_SIZE {
             return Err(Error::Codec {
@@ -83,9 +86,12 @@ impl Codec {
 
         // Consume and decode the payload
         let payload = buf.split_to(len);
-        let msg = bincode::deserialize(&payload).map_err(|e| Error::Codec {
-            message: format!("deserialization failed: {}", e),
-        })?;
+        let (msg, _): (Message, _) =
+            bincode::serde::decode_from_slice(&payload, bincode::config::standard()).map_err(
+                |e| Error::Codec {
+                    message: format!("deserialization failed: {}", e),
+                },
+            )?;
 
         Ok(Some(msg))
     }

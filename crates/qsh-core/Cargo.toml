@@ -9,7 +9,12 @@ description = "Core library for qsh - protocol, types, terminal state"
 [features]
 default = ["quiche-backend", "compression"]
 tunnel = ["tun"]
-standalone = ["dep:ssh-key", "dep:rpassword", "dep:ring", "dep:ssh-agent-client-rs"]
+standalone = [
+  "dep:ssh-key",
+  "dep:rpassword",
+  "dep:ring",
+  "dep:ssh-agent-client-rs",
+]
 compression = ["dep:zstd"]
 
 # QUIC backend selection (enable exactly one)
@@ -39,7 +44,7 @@ rcgen = { workspace = true }
 libc = { workspace = true }
 sha2 = "0.10"
 rand = { workspace = true }
-getrandom = "0.2"
+getrandom = "0.3"
 
 # File transfer dependencies
 xxhash-rust = { version = "0.8", features = ["xxh64"] }

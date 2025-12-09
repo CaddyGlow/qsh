@@ -77,22 +77,24 @@ struct SshHandler {
     skip_host_key_check: bool,
 }
 
-#[async_trait::async_trait]
 impl client::Handler for SshHandler {
     type Error = russh::Error;
 
-    async fn check_server_key(
+    fn check_server_key(
         &mut self,
-        _server_public_key: &russh_keys::key::PublicKey,
-    ) -> std::result::Result<bool, Self::Error> {
-        if self.skip_host_key_check {
-            warn!("Skipping SSH host key verification (insecure)");
-            Ok(true)
-        } else {
-            // In a full implementation, we would check against known_hosts
-            // For now, accept all keys with a warning
-            warn!("Host key verification not implemented, accepting key");
-            Ok(true)
+        _server_public_key: &russh::keys::PublicKey,
+    ) -> impl std::future::Future<Output = std::result::Result<bool, Self::Error>> + Send {
+        let skip = self.skip_host_key_check;
+        async move {
+            if skip {
+                warn!("Skipping SSH host key verification (insecure)");
+                Ok(true)
+            } else {
+                // In a full implementation, we would check against known_hosts
+                // For now, accept all keys with a warning
+                warn!("Host key verification not implemented, accepting key");
+                Ok(true)
+            }
         }
     }
 }
@@ -443,19 +445,30 @@ async fn load_and_auth_key(
         message: format!("failed to read identity file: {}", e),
     })?;
 
-    let key_pair = russh_keys::decode_secret_key(&String::from_utf8_lossy(&key_data), None)
+    let key_pair = russh::keys::decode_secret_key(&String::from_utf8_lossy(&key_data), None)
         .map_err(|e| Error::Transport {
             message: format!("failed to decode private key: {}", e),
         })?;
 
+    // Get the best supported RSA hash algorithm from the session
+    let hash_alg = session
+        .best_supported_rsa_hash()
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+
+    // Wrap the key with the appropriate hash algorithm
+    let key_with_hash = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key_pair), hash_alg);
+
     let auth_result = session
-        .authenticate_publickey(username, Arc::new(key_pair))
+        .authenticate_publickey(username, key_with_hash)
         .await
         .map_err(|e| Error::Transport {
             message: format!("public key auth failed: {}", e),
         })?;
 
-    Ok(auth_result)
+    Ok(auth_result.success())
 }
 
 /// Try to authenticate using SSH agent.
