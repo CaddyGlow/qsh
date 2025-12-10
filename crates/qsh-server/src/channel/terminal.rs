@@ -4,18 +4,18 @@
 
 use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
     ChannelCloseReason, ChannelData, ChannelId, ChannelPayload, Message,
-    StateUpdateData, TerminalInputData, TerminalOutputData, TerminalParams,
+    TerminalInputData, TerminalOutputData, TerminalParams,
 };
-use qsh_core::terminal::{StateDiff, TerminalParser, TerminalState};
+use qsh_core::terminal::{TerminalParser, TerminalState};
 use qsh_core::transport::{Connection, QuicConnection, QuicStream, StreamPair, StreamType, TransportSender};
 
 use crate::pty::{Pty, PtyRelay};
@@ -26,9 +26,6 @@ use crate::registry::PtyControl;
 pub struct TerminalChannel {
     inner: Arc<TerminalChannelInner>,
 }
-
-/// Minimum interval between state updates (allows throttling when connection is fast).
-const STATE_UPDATE_MIN_INTERVAL: Duration = Duration::from_millis(20);
 
 struct TerminalChannelInner {
     /// Channel ID.
@@ -49,8 +46,6 @@ struct TerminalChannelInner {
     confirmed_input_seq: AtomicU64,
     /// Last state generation acknowledged by client.
     acked_generation: AtomicU64,
-    /// Last sent terminal state (for diff computation).
-    last_sent_state: Mutex<Option<TerminalState>>,
     /// Whether the channel is closed.
     closed: AtomicBool,
     /// Whether output stream is disconnected (skip sending until reconnect).
@@ -59,8 +54,6 @@ struct TerminalChannelInner {
     relay_task: Mutex<Option<JoinHandle<()>>>,
     /// Shutdown signal.
     shutdown_tx: Mutex<Option<mpsc::Sender<()>>>,
-    /// Last time a state update was sent (for throttling).
-    last_state_update: Mutex<Option<Instant>>,
     /// Weak reference to the connection handler for notifying PTY exit.
     handler: Weak<crate::connection::ConnectionHandler>,
 }
@@ -155,12 +148,10 @@ impl TerminalChannel {
             output_stream: Mutex::new(Some(output_stream)),
             confirmed_input_seq: AtomicU64::new(0),
             acked_generation: AtomicU64::new(0),
-            last_sent_state: Mutex::new(None),
             closed: AtomicBool::new(false),
             disconnected: AtomicBool::new(false),
             relay_task: Mutex::new(None),
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
-            last_state_update: Mutex::new(None),
             handler: Arc::downgrade(&handler),
         });
 
@@ -559,53 +550,9 @@ impl TerminalChannelInner {
                 return Ok(());
             }
 
-            // Throttle state updates - raw output is always sent immediately,
-            // but state updates (for prediction validation) can be rate-limited.
-            // When connection is fast, predictions aren't needed, so we can throttle.
-            let should_send_state = {
-                let mut last_update = self.last_state_update.lock().await;
-                let now = Instant::now();
-                let send = match *last_update {
-                    None => true, // First update, always send
-                    Some(last) => now.duration_since(last) >= STATE_UPDATE_MIN_INTERVAL,
-                };
-                if send {
-                    *last_update = Some(now);
-                }
-                send
-            };
-
-            if should_send_state {
-                // Send state update for reconnection/prediction support
-                let new_state = {
-                    let parser = self.parser.lock().await;
-                    parser.state().clone()
-                };
-
-                let diff = {
-                    let mut last = self.last_sent_state.lock().await;
-                    let diff = if let Some(ref last_state) = *last {
-                        last_state.diff_to(&new_state)
-                    } else {
-                        StateDiff::Full(new_state.clone())
-                    };
-                    *last = Some(new_state);
-                    diff
-                };
-
-                let update = Message::ChannelDataMsg(ChannelData {
-                    channel_id,
-                    payload: ChannelPayload::StateUpdate(StateUpdateData {
-                        diff,
-                        confirmed_input_seq: confirmed_seq,
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_micros() as u64,
-                    }),
-                });
-                let _ = stream.send(&update).await; // Best effort for state update
-            }
+            // Note: StateUpdate removed to fix sync bug with batched output.
+            // The client reconstructs terminal state from raw output.
+            // StateUpdate is only sent on reconnection (see reconnect_output method).
         }
 
         Ok(())
@@ -669,51 +616,9 @@ impl TerminalChannelInner {
                 return Ok(());
             }
 
-            // Throttle state updates
-            let should_send_state = {
-                let mut last_update = self.last_state_update.lock().await;
-                let now = Instant::now();
-                let send = match *last_update {
-                    None => true, // First update, always send
-                    Some(last) => now.duration_since(last) >= STATE_UPDATE_MIN_INTERVAL,
-                };
-                if send {
-                    *last_update = Some(now);
-                }
-                send
-            };
-
-            if should_send_state {
-                // Send state update for reconnection/prediction support
-                let new_state = {
-                    let parser = self.parser.lock().await;
-                    parser.state().clone()
-                };
-
-                let diff = {
-                    let mut last = self.last_sent_state.lock().await;
-                    let diff = if let Some(ref last_state) = *last {
-                        last_state.diff_to(&new_state)
-                    } else {
-                        StateDiff::Full(new_state.clone())
-                    };
-                    *last = Some(new_state);
-                    diff
-                };
-
-                let update = Message::ChannelDataMsg(ChannelData {
-                    channel_id,
-                    payload: ChannelPayload::StateUpdate(StateUpdateData {
-                        diff,
-                        confirmed_input_seq: confirmed_seq,
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_micros() as u64,
-                    }),
-                });
-                let _ = stream.send(&update).await; // Best effort for state update
-            }
+            // Note: StateUpdate removed to fix sync bug with batched output.
+            // The client reconstructs terminal state from raw output.
+            // StateUpdate is only sent on reconnection (see reconnect_output method).
         }
 
         Ok(())

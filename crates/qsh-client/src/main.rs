@@ -657,6 +657,9 @@ async fn run_reconnectable_session(
     #[allow(unused_assignments)]
     let mut client_parser: Option<TerminalParser> = None;
 
+    // Forward handles (started once on first connection, kept alive for session)
+    let mut _forward_handles: Option<ForwardHandles> = None;
+
     // Reconnection loop
     'session: loop {
         // Wait for connection to be available, with periodic refresh of notification bar
@@ -816,7 +819,26 @@ async fn run_reconnectable_session(
         let paste_threshold = cli.paste_threshold;
 
         // Start forwards (only on first connection)
-        // TODO: Handle forward reconnection
+        if is_first_connection && _forward_handles.is_none() {
+            // Get an Arc reference to the connection for sharing with forwards
+            if let Some(conn_arc) = reconnectable.connection() {
+                match start_forwards(cli, &conn_arc).await {
+                    Ok(handles) => {
+                        info!(
+                            local = handles.local.len(),
+                            socks = handles.socks.len(),
+                            remote = handles.remote.len(),
+                            "Started port forwards"
+                        );
+                        _forward_handles = Some(handles);
+                    }
+                    Err(e) => {
+                        // Forward failure is non-fatal if we have a terminal
+                        warn!(error = %e, "Failed to start forwards, continuing with terminal only");
+                    }
+                }
+            }
+        }
 
         // Set up SIGWINCH signal handler
         #[cfg(unix)]
@@ -838,7 +860,27 @@ async fn run_reconnectable_session(
                 _ = resize_event => {
                     if let Ok(new_size) = get_terminal_size() {
                         debug!(cols = new_size.cols, rows = new_size.rows, "Terminal resized");
-                        // TODO: Send resize message to server through channel
+
+                        // Send resize to server
+                        if let Some(conn) = reconnectable.connection() {
+                            if let Err(e) = conn.send_resize(terminal.channel_id(), new_size.cols, new_size.rows).await {
+                                debug!(error = %e, "Failed to send resize");
+                                // Non-fatal - server will sync on next state update
+                            }
+                        }
+
+                        // Update client-side parser with new size
+                        if let Some(ref mut parser) = client_parser {
+                            *parser = TerminalParser::new(new_size.cols, new_size.rows);
+                            renderer.invalidate(); // Force full redraw
+                        }
+
+                        // Clear prediction overlay on resize
+                        if prediction_enabled {
+                            let mut prediction = terminal.prediction_mut().await;
+                            prediction.reset();
+                            prediction_overlay.clear_all();
+                        }
                     }
                 }
 
@@ -871,8 +913,8 @@ async fn run_reconnectable_session(
                         debug!(?msg, "Received control message");
                         match msg {
                             Message::Heartbeat(hb) => {
-                                if let Some(rtt) = heartbeat_tracker.receive_heartbeat(&hb) {
-                                    // debug!(rtt_ms = rtt.as_millis(), "Heartbeat RTT sample");
+                                if let Some(_rtt) = heartbeat_tracker.receive_heartbeat(&hb) {
+                                    // debug!(rtt_ms = _rtt.as_millis(), "Heartbeat RTT sample");
                                 }
                             }
                             Message::ChannelClose(close) => {
@@ -900,7 +942,7 @@ async fn run_reconnectable_session(
                                     );
                                 }
                             }
-                            other => {
+                            _ => {
                                 // Already logged above
                             }
                         }
@@ -1400,7 +1442,7 @@ async fn run_reconnectable_session(
                 render_notification(&notification, &mut stdout).await;
                 // Allow escape handling while reconnecting so the user can quit even if the
                 // connection is stuck.
-                let mut handle_error_fut = reconnectable.handle_error(&e);
+                let handle_error_fut = reconnectable.handle_error(&e);
                 tokio::pin!(handle_error_fut);
 
                 loop {
