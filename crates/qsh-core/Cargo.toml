@@ -7,12 +7,11 @@ license.workspace = true
 description = "Core library for qsh - protocol, types, terminal state"
 
 [features]
-default = ["quiche-backend", "compression"]
+default = ["s2n-quic-backend", "compression"]
 tunnel = ["tun"]
 standalone = [
   "dep:ssh-key",
   "dep:rpassword",
-  "dep:ring",
   "dep:ssh-agent-client-rs",
 ]
 compression = ["dep:zstd"]
@@ -45,6 +44,7 @@ libc = { workspace = true }
 sha2 = "0.10"
 rand = { workspace = true }
 getrandom = "0.3"
+aws-lc-rs = { workspace = true }
 
 # File transfer dependencies
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
@@ -53,7 +53,6 @@ zstd = { version = "0.13", optional = true }
 # Standalone auth dependencies (optional)
 ssh-key = { workspace = true, optional = true }
 rpassword = { workspace = true, optional = true }
-ring = { workspace = true, optional = true }
 ssh-agent-client-rs = { workspace = true, optional = true }
 
 [dev-dependencies]

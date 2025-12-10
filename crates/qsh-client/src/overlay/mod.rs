@@ -4,7 +4,7 @@
 //! - Predicted character display (underlined/dim)
 //! - Mosh-style notification bar
 
-mod notification;
+pub mod notification;
 mod prediction_display;
 
 pub use notification::{NotificationEngine, NotificationStyle};

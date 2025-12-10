@@ -24,6 +24,7 @@ compile_error!("Only one QUIC backend can be enabled at a time. Enable either `q
 
 pub mod config;
 pub mod sender;
+pub mod common;
 
 // Re-export sender types
 pub use sender::{SenderConfig, TransportSender};

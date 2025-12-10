@@ -12,10 +12,10 @@ use tracing::{debug, error, info, trace, warn};
 
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
-    ChannelCloseReason, ChannelData, ChannelId, ChannelPayload, Message, StateDiff,
+    ChannelCloseReason, ChannelData, ChannelId, ChannelPayload, Message,
     StateUpdateData, TerminalInputData, TerminalOutputData, TerminalParams,
 };
-use qsh_core::terminal::{TerminalParser, TerminalState};
+use qsh_core::terminal::{StateDiff, TerminalParser, TerminalState};
 use qsh_core::transport::{Connection, QuicConnection, QuicStream, StreamPair, StreamType, TransportSender};
 
 use crate::pty::{Pty, PtyRelay};

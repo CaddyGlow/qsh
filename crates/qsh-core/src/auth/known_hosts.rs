@@ -11,7 +11,7 @@ use std::io::{self, BufRead, Write};
 use std::path::Path;
 
 use base64::prelude::*;
-use ring::hmac;
+use aws_lc_rs::hmac;
 use ssh_key::public::PublicKey;
 use tracing::{debug, warn};
 

@@ -4,9 +4,14 @@
 //! displaying typed characters immediately with visual distinction,
 //! then confirming or rolling back based on server response.
 
+mod cursor;
 mod engine;
+mod state;
+mod types;
 
-pub use engine::{
-    CellPrediction, DisplayPreference, PredictedEcho, PredictedStyle, Prediction, PredictionEngine,
-    PredictionState,
-};
+#[cfg(test)]
+mod tests;
+
+pub use engine::PredictionEngine;
+pub use state::{DisplayPreference, PredictedStyle, PredictionState};
+pub use types::{CellPrediction, PredictedEcho, Prediction};
