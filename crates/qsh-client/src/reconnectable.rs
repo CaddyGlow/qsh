@@ -250,8 +250,7 @@ impl ReconnectableConnection {
                 (context.reconnect_config(), context.session_id())
             };
 
-            // Inject cached session data for 0-RTT resumption (quiche backend only)
-            // Note: s2n-quic does not support session resumption, so this will be ignored
+            // Inject cached session data for 0-RTT resumption (when supported by backend)
             config.session_data = read_lock(&self.session_data).clone();
 
             // Apply port hopping if needed (Mosh-style)
@@ -267,9 +266,6 @@ impl ReconnectableConnection {
 
             match result {
                 Ok(conn) => {
-                    // Log reconnection success
-                    // Note: 0-RTT (resumed=true) is only available with quiche backend.
-                    // s2n-quic does not expose session resumption APIs, so is_resumed() always returns false.
                     let is_resumed = conn.quic().is_resumed().await;
                     if is_resumed {
                         info!(
@@ -279,7 +275,7 @@ impl ReconnectableConnection {
                             "Reconnection successful (0-RTT)"
                         );
                     } else {
-                        // 1-RTT reconnection (normal for s2n-quic backend)
+                        // 1-RTT reconnection
                         info!(
                             attempt,
                             session_id = ?conn.session_id(),

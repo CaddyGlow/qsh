@@ -17,7 +17,7 @@ use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{HeartbeatPayload, Message};
 use qsh_core::transport::{Connection, QuicAcceptor, QuicConnection, ListenerConfig};
 
-use crate::connection::{ConnectionConfig, ConnectionHandler};
+use crate::connection::{ConnectionConfig, ConnectionHandler, ShutdownReason};
 use crate::registry::ConnectionRegistry;
 use crate::session::SessionConfig;
 use crate::{PendingSession, SessionAuthorizer};
@@ -247,17 +247,27 @@ impl QshListener {
                             conn_config,
                             authorizer_clone,
                             &self.registry,
+                            self.config.bootstrap_mode,
                         )
                         .await;
-
-                        if let Err(e) = &result {
-                            error!(error = %e, "Connection handler error");
-                        }
 
                         // Update peak_session_count after handler completes
                         let count = self.registry.session_count().await;
                         if count > peak_session_count {
                             peak_session_count = count;
+                        }
+
+                        // In bootstrap mode, check if session ended cleanly (no channels left)
+                        // This signals we should exit the server
+                        if self.config.bootstrap_mode {
+                            if let Err(Error::ConnectionClosed) = &result {
+                                info!("Bootstrap mode: session ended, exiting server");
+                                return Ok(());
+                            }
+                        }
+
+                        if let Err(e) = &result {
+                            error!(error = %e, "Connection handler error");
                         }
 
                         info!(
@@ -269,6 +279,7 @@ impl QshListener {
                         // Normal mode: spawn handler task
                         let registry_clone = Arc::clone(&self.registry);
                         let local_addr = self.local_addr;
+                        let bootstrap_mode = self.config.bootstrap_mode;
                         tokio::spawn(async move {
                             if let Err(e) = handle_connection_abstracted(
                                 quic_conn,
@@ -278,6 +289,7 @@ impl QshListener {
                                 conn_config,
                                 authorizer_clone,
                                 &registry_clone,
+                                bootstrap_mode,
                             )
                             .await
                             {
@@ -311,6 +323,7 @@ async fn handle_connection_abstracted(
     conn_config: ConnectionConfig,
     authorizer: Option<Arc<SessionAuthorizer>>,
     registry: &ConnectionRegistry,
+    bootstrap_mode: bool,
 ) -> Result<()> {
     info!(addr = %remote_addr, "Connection established");
 
@@ -321,7 +334,7 @@ async fn handle_connection_abstracted(
     let (handler, shutdown_rx) = pending.accept_with_registry(conn_config, registry).await?;
 
     // Run the channel model session loop
-    run_session_loop(handler, shutdown_rx).await
+    run_session_loop(handler, shutdown_rx, bootstrap_mode).await
 }
 
 /// Why the session loop exited.
@@ -333,6 +346,8 @@ enum SessionExitReason {
     RegistryShutdown,
     /// Connection lost (timeout, error, etc.) - keep PTY alive for reconnection.
     ConnectionLost,
+    /// All channels closed (e.g., shell exited) - close everything.
+    AllChannelsClosed,
 }
 
 /// Run the channel model session loop.
@@ -341,9 +356,14 @@ enum SessionExitReason {
 /// - Connection loss -> detach (keep PTY alive for reconnection)
 /// - Client shutdown request -> shutdown (close PTY)
 /// - Registry shutdown -> shutdown (close PTY)
+/// - All channels closed -> shutdown (close PTY, exit in bootstrap mode)
+///
+/// In bootstrap mode, if all channels are closed, the session ends and
+/// returns an error to trigger server exit.
 async fn run_session_loop(
     handler: Arc<ConnectionHandler>,
-    mut shutdown_rx: mpsc::Receiver<()>,
+    mut shutdown_rx: mpsc::Receiver<ShutdownReason>,
+    bootstrap_mode: bool,
 ) -> Result<()> {
     let remote_addr = handler.remote_addr().await;
     let rtt = handler.rtt().await;
@@ -388,10 +408,18 @@ async fn run_session_loop(
         tokio::select! {
             biased;
 
-            // Handle shutdown signal from registry
-            _ = shutdown_rx.recv() => {
-                debug!("Shutdown signal received");
-                exit_reason = SessionExitReason::RegistryShutdown;
+            // Handle shutdown signal from registry or channel close
+            reason = shutdown_rx.recv() => {
+                match reason {
+                    Some(ShutdownReason::AllChannelsClosed) => {
+                        debug!("All channels closed signal received");
+                        exit_reason = SessionExitReason::AllChannelsClosed;
+                    }
+                    Some(ShutdownReason::RegistryShutdown) | None => {
+                        debug!("Registry shutdown signal received");
+                        exit_reason = SessionExitReason::RegistryShutdown;
+                    }
+                }
                 break;
             }
 
@@ -470,15 +498,46 @@ async fn run_session_loop(
     // Cleanup - only shutdown on explicit request, not on connection loss
     accept_task.abort();
 
+    // Check if we should keep the session alive for reconnection
+    let channel_count = handler.channel_count().await;
+
     match exit_reason {
         SessionExitReason::ConnectionLost => {
-            // Mosh-style: keep PTY alive for reconnection
-            // Don't shutdown - the session in the registry still holds a reference
-            // to the handler, keeping the PTY alive
+            // If there are no channels left, treat as shutdown
+            if channel_count == 0 {
+                info!(
+                    session_id = ?handler.session_id(),
+                    "Session ended (no channels remaining)"
+                );
+                handler.shutdown().await;
+
+                // In bootstrap mode, signal server to exit
+                if bootstrap_mode {
+                    return Err(Error::ConnectionClosed);
+                }
+            } else {
+                // Mosh-style: keep PTY alive for reconnection
+                // Don't shutdown - the session in the registry still holds a reference
+                // to the handler, keeping the PTY alive
+                info!(
+                    session_id = ?handler.session_id(),
+                    channel_count = channel_count,
+                    "Session detached (PTY kept alive for reconnection)"
+                );
+            }
+        }
+        SessionExitReason::AllChannelsClosed => {
+            // All channels closed (e.g., shell exited): close everything
             info!(
                 session_id = ?handler.session_id(),
-                "Session detached (PTY kept alive for reconnection)"
+                "Session ended (all channels closed)"
             );
+            handler.shutdown().await;
+
+            // In bootstrap mode, signal server to exit
+            if bootstrap_mode {
+                return Err(Error::ConnectionClosed);
+            }
         }
         SessionExitReason::ClientShutdown | SessionExitReason::RegistryShutdown => {
             // Explicit shutdown: close everything
@@ -488,6 +547,11 @@ async fn run_session_loop(
                 "Session ended (shutting down PTY)"
             );
             handler.shutdown().await;
+
+            // In bootstrap mode, signal server to exit
+            if bootstrap_mode {
+                return Err(Error::ConnectionClosed);
+            }
         }
     }
 

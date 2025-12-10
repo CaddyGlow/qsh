@@ -5,13 +5,13 @@
 //! - Terminal size detection
 //! - stdin/stdout async streams
 
-use std::io::{self, Read};
+use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
+use tokio::io::unix::AsyncFd;
 use tracing::{debug, warn};
 
 use qsh_core::error::{Error, Result};
@@ -141,79 +141,109 @@ pub fn get_terminal_size() -> Result<TermSize> {
     })
 }
 
-/// Async stdin reader.
+/// Async stdin reader using AsyncFd for true async I/O.
 ///
-/// Spawns a blocking thread to read from stdin and sends
-/// data through an unbounded channel to never block on stdin reads.
+/// Uses tokio's AsyncFd to poll stdin without blocking threads.
+/// This allows the read to be cancelled when the select! loop exits.
 pub struct StdinReader {
-    rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    _cancel_tx: mpsc::Sender<()>,
+    async_fd: AsyncFd<RawFd>,
+    fd: RawFd,
 }
 
 impl StdinReader {
     /// Create a new stdin reader.
+    ///
+    /// Sets stdin to non-blocking mode and wraps it in AsyncFd.
     pub fn new() -> Self {
-        // Use unbounded channel to never block stdin reads
-        let (tx, rx) = mpsc::unbounded_channel();
-        let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(1);
+        let fd = io::stdin().as_raw_fd();
 
-        std::thread::spawn(move || {
-            use std::os::unix::io::AsRawFd;
-            let stdin = io::stdin();
-            let fd = stdin.as_raw_fd();
-
-            // Lock stdin for the duration to avoid any buffering issues
-            let mut stdin_lock = stdin.lock();
-            let mut buf = [0u8; 4096];
-
-            loop {
-                // Check if cancelled (non-blocking)
-                if cancel_rx.try_recv().is_ok() {
-                    break;
-                }
-
-                // Read directly - in raw mode this returns immediately when data is available
-                match stdin_lock.read(&mut buf) {
-                    Ok(0) => {
-                        // EOF
-                        tracing::debug!("stdin EOF");
-                        break;
-                    }
-                    Ok(n) => {
-                        tracing::debug!(
-                            len = n,
-                            data = ?&buf[..n.min(16)],
-                            fd = fd,
-                            "stdin read"
-                        );
-                        if tx.send(buf[..n].to_vec()).is_err() {
-                            // Receiver dropped
-                            tracing::debug!("stdin receiver dropped");
-                            break;
-                        }
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                        // Interrupted by signal, retry
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "stdin read error");
-                        break;
-                    }
-                }
+        // Set non-blocking mode
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
             }
-            tracing::debug!("stdin reader thread exiting");
-        });
-
-        Self {
-            rx,
-            _cancel_tx: cancel_tx,
         }
+
+        // AsyncFd requires the fd to be non-blocking
+        let async_fd = AsyncFd::new(fd).expect("failed to create AsyncFd for stdin");
+
+        Self { async_fd, fd }
     }
 
     /// Read data from stdin.
+    ///
+    /// Returns None on EOF or error, Some(data) on successful read.
+    /// This is fully async and can be cancelled by dropping the future.
     pub async fn read(&mut self) -> Option<Vec<u8>> {
-        self.rx.recv().await
+        let mut buf = [0u8; 4096];
+
+        loop {
+            // Wait for stdin to be readable
+            let mut guard = match self.async_fd.readable().await {
+                Ok(guard) => guard,
+                Err(e) => {
+                    tracing::error!(error = %e, "stdin readable error");
+                    return None;
+                }
+            };
+
+            // Try to read - may return WouldBlock if spurious wakeup
+            match guard.try_io(|inner| {
+                let n = unsafe {
+                    libc::read(
+                        *inner.get_ref(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                    )
+                };
+                if n < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }) {
+                Ok(Ok(0)) => {
+                    // EOF
+                    tracing::debug!("stdin EOF");
+                    return None;
+                }
+                Ok(Ok(n)) => {
+                    tracing::debug!(
+                        len = n,
+                        data = ?&buf[..n.min(16)],
+                        fd = self.fd,
+                        "stdin read"
+                    );
+                    return Some(buf[..n].to_vec());
+                }
+                Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => {
+                    // Interrupted by signal, retry
+                    continue;
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "stdin read error");
+                    return None;
+                }
+                Err(_would_block) => {
+                    // Spurious wakeup, loop back to wait again
+                    continue;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for StdinReader {
+    fn drop(&mut self) {
+        // Restore blocking mode for stdin
+        unsafe {
+            let flags = libc::fcntl(self.fd, libc::F_GETFL);
+            if flags >= 0 {
+                libc::fcntl(self.fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+            }
+        }
+        tracing::debug!("stdin reader dropped, restored blocking mode");
     }
 }
 

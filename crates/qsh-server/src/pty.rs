@@ -445,7 +445,7 @@ impl PtyRelay {
                     }
                     Ok(None) => {
                         // EOF - shell exited
-                        info!("PTY EOF - shell exited");
+                        info!("PTY EOF - shell exited, breaking output loop");
                         break;
                     }
                     Err(e) => {
@@ -455,7 +455,7 @@ impl PtyRelay {
                     }
                 }
             }
-            debug!("PTY output task ended");
+            info!("PTY output task ended - dropping output_tx to signal EOF");
             // Drop output_tx - this signals EOF to the receiver
         });
 

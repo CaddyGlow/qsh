@@ -2,18 +2,18 @@
 //!
 //! Manages an interactive PTY session within a channel.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
-    ChannelData, ChannelId, ChannelPayload, Message, StateDiff, StateUpdateData, TerminalInputData,
-    TerminalOutputData, TerminalParams,
+    ChannelCloseReason, ChannelData, ChannelId, ChannelPayload, Message, StateDiff,
+    StateUpdateData, TerminalInputData, TerminalOutputData, TerminalParams,
 };
 use qsh_core::terminal::{TerminalParser, TerminalState};
 use qsh_core::transport::{Connection, QuicConnection, QuicStream, StreamPair, StreamType};
@@ -61,6 +61,8 @@ struct TerminalChannelInner {
     shutdown_tx: Mutex<Option<mpsc::Sender<()>>>,
     /// Last time a state update was sent (for throttling).
     last_state_update: Mutex<Option<Instant>>,
+    /// Weak reference to the connection handler for notifying PTY exit.
+    handler: Weak<crate::connection::ConnectionHandler>,
 }
 
 /// Real PTY control implementation.
@@ -98,7 +100,7 @@ impl TerminalChannel {
         channel_id: ChannelId,
         params: TerminalParams,
         quic: Arc<QuicConnection>,
-        _handler: Arc<crate::connection::ConnectionHandler>,
+        handler: Arc<crate::connection::ConnectionHandler>,
     ) -> Result<(Self, TerminalState)> {
         let cols = params.term_size.cols;
         let rows = params.term_size.rows;
@@ -159,6 +161,7 @@ impl TerminalChannel {
             relay_task: Mutex::new(None),
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
             last_state_update: Mutex::new(None),
+            handler: Arc::downgrade(&handler),
         });
 
         // Spawn output relay task
@@ -180,7 +183,7 @@ impl TerminalChannel {
                             }
                             None => {
                                 // PTY has exited - this is the only reason to close the channel
-                                info!(channel_id = %inner_clone.channel_id, "PTY output closed");
+                                info!(channel_id = %inner_clone.channel_id, "PTY output_rx returned None - PTY exited, breaking relay loop");
                                 break;
                             }
                         }
@@ -190,8 +193,45 @@ impl TerminalChannel {
 
             // Mark channel as closed only when PTY actually exits
             inner_clone.closed.store(true, Ordering::SeqCst);
+
+            // Try to get exit code
+            let exit_code = inner_clone.pty_control.try_wait().ok().flatten();
+            info!(
+                channel_id = %inner_clone.channel_id,
+                exit_code = ?exit_code,
+                "Terminal channel closed (PTY exited)"
+            );
+
+            // IMPORTANT: Send ChannelClose BEFORE closing the output stream.
+            // This ensures the client receives the ChannelClose message before
+            // it detects the stream closure, allowing it to exit gracefully
+            // instead of treating it as a transient network error.
+            if let Some(handler) = inner_clone.handler.upgrade() {
+                let reason = ChannelCloseReason::ProcessExited { exit_code };
+                debug!(
+                    channel_id = %inner_clone.channel_id,
+                    reason = ?reason,
+                    "Sending ChannelClose before closing output stream"
+                );
+                handler.close_channel(inner_clone.channel_id, reason).await;
+                debug!(
+                    channel_id = %inner_clone.channel_id,
+                    "ChannelClose sent, now closing output stream"
+                );
+            } else {
+                debug!(
+                    channel_id = %inner_clone.channel_id,
+                    "Handler not available, skipping ChannelClose"
+                );
+            }
+
+            // Now close the output stream
             let mut stream_guard = inner_clone.output_stream.lock().await;
             if let Some(ref mut stream) = *stream_guard {
+                debug!(
+                    channel_id = %inner_clone.channel_id,
+                    "Finishing output stream"
+                );
                 if let Err(e) = stream.finish().await {
                     debug!(
                         channel_id = %inner_clone.channel_id,
@@ -199,9 +239,12 @@ impl TerminalChannel {
                         "Failed to finish output stream (client may have disconnected)"
                     );
                 }
+                debug!(
+                    channel_id = %inner_clone.channel_id,
+                    "Output stream finished"
+                );
             }
             *stream_guard = None;
-            info!(channel_id = %inner_clone.channel_id, "Terminal channel closed (PTY exited)");
         });
 
         *inner.relay_task.lock().await = Some(relay_task);

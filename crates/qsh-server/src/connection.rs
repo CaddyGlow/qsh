@@ -67,6 +67,19 @@ impl Default for ConnectionConfig {
 }
 
 // =============================================================================
+// Shutdown Reason
+// =============================================================================
+
+/// Reason for session shutdown signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownReason {
+    /// Registry/server shutdown - close everything.
+    RegistryShutdown,
+    /// All channels closed (e.g., shell exited) - close everything.
+    AllChannelsClosed,
+}
+
+// =============================================================================
 // Connection Handler
 // =============================================================================
 
@@ -104,8 +117,8 @@ pub struct ConnectionHandler {
     pending_channel_opens: Mutex<HashMap<ChannelId, oneshot::Sender<Result<()>>>>,
     /// Remote forward listeners (bind_host:bind_port -> listener handle).
     remote_forward_listeners: Mutex<HashMap<(String, u16), RemoteForwardListener>>,
-    /// Channel for signaling connection shutdown.
-    shutdown_tx: Mutex<mpsc::Sender<()>>,
+    /// Channel for signaling connection shutdown with reason.
+    shutdown_tx: Mutex<mpsc::Sender<ShutdownReason>>,
     /// Last activity timestamp.
     last_activity: Mutex<Instant>,
 }
@@ -125,7 +138,7 @@ impl ConnectionHandler {
         control: QuicStream,
         session_id: SessionId,
         config: ConnectionConfig,
-    ) -> (Arc<Self>, mpsc::Receiver<()>) {
+    ) -> (Arc<Self>, mpsc::Receiver<ShutdownReason>) {
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
         // Extract sender before wrapping stream - allows concurrent send/recv
@@ -195,7 +208,7 @@ impl ConnectionHandler {
         &self,
         new_quic: QuicConnection,
         new_control: QuicStream,
-        new_shutdown_tx: mpsc::Sender<()>,
+        new_shutdown_tx: mpsc::Sender<ShutdownReason>,
     ) {
         let new_quic = Arc::new(new_quic);
         let new_control_sender = new_control.sender().expect("control stream must support sending");
@@ -284,6 +297,14 @@ impl ConnectionHandler {
         for (channel_id, handle) in channels.iter() {
             let channel_type = match handle {
                 ChannelHandle::Terminal(terminal) => {
+                    // Skip closed terminal channels (PTY has exited)
+                    if terminal.is_closed() {
+                        debug!(
+                            channel_id = %channel_id,
+                            "Skipping closed terminal channel in get_existing_channels"
+                        );
+                        continue;
+                    }
                     // Get current terminal state
                     let state = {
                         let parser = terminal.parser();
@@ -572,6 +593,61 @@ impl ConnectionHandler {
     ) -> Result<()> {
         let accept = Message::ChannelAccept(ChannelAcceptPayload { channel_id, data });
         self.send_control(&accept).await
+    }
+
+    /// Close a channel from the server side (e.g., when PTY exits).
+    ///
+    /// This removes the channel from the handler and sends a ChannelClose
+    /// message to the client. The client should then exit gracefully.
+    ///
+    /// If this was the last channel, triggers a session shutdown signal.
+    pub async fn close_channel(&self, channel_id: ChannelId, reason: ChannelCloseReason) {
+        debug!(
+            channel_id = %channel_id,
+            reason = ?reason,
+            "close_channel called"
+        );
+
+        // Remove from channels map and get remaining count
+        let (channel, remaining_count) = {
+            let mut channels = self.channels.write().await;
+            let ch = channels.remove(&channel_id);
+            (ch, channels.len())
+        };
+
+        // Clean up the channel if it existed
+        if let Some(handle) = channel {
+            debug!(channel_id = %channel_id, "Closing channel handle");
+            handle.close().await;
+        }
+
+        // Send close notification to client (best effort)
+        let close_msg = Message::ChannelClose(ChannelClosePayload {
+            channel_id,
+            reason: reason.clone(),
+        });
+        debug!(channel_id = %channel_id, "Sending ChannelClose message");
+        if let Err(e) = self.send_control(&close_msg).await {
+            debug!(
+                channel_id = %channel_id,
+                error = %e,
+                "Failed to send ChannelClose (client may have disconnected)"
+            );
+        } else {
+            info!(
+                channel_id = %channel_id,
+                reason = %reason,
+                "Sent ChannelClose to client"
+            );
+        }
+
+        // If no channels remain, trigger session shutdown
+        if remaining_count == 0 {
+            info!("All channels closed, triggering session shutdown");
+            // Close the QUIC connection to wake up any pending recv_control() call in the session loop
+            self.quic.read().await.close_connection().await;
+            let _ = self.shutdown_tx.lock().await.try_send(ShutdownReason::AllChannelsClosed);
+        }
     }
 
     // =========================================================================
@@ -1016,8 +1092,13 @@ impl ConnectionHandler {
     ) -> Result<()> {
         match stream_type {
             StreamType::ChannelIn(channel_id) | StreamType::ChannelBidi(channel_id) => {
-                let channels = self.channels.read().await;
-                if let Some(handle) = channels.get(&channel_id) {
+                // Clone the handle to release the lock before the potentially long-running
+                // handle_incoming_stream call (which loops forever reading input).
+                let handle = {
+                    let channels = self.channels.read().await;
+                    channels.get(&channel_id).cloned()
+                };
+                if let Some(handle) = handle {
                     handle.handle_incoming_stream(stream).await
                 } else {
                     warn!(channel_id = %channel_id, "Stream for unknown channel");
@@ -1066,7 +1147,7 @@ impl ConnectionHandler {
 
     /// Signal connection shutdown.
     pub async fn shutdown(&self) {
-        let _ = self.shutdown_tx.lock().await.send(()).await;
+        let _ = self.shutdown_tx.lock().await.send(ShutdownReason::RegistryShutdown).await;
 
         // Shutdown all remote forward listeners
         let listeners: Vec<_> = {

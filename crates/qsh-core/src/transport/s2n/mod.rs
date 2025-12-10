@@ -5,28 +5,22 @@
 //!
 //! # Session Resumption / 0-RTT
 //!
-//! **Note:** s2n-quic (as of v1.51) does not expose a public API for session ticket
-//! export/import. The TLS 1.3 session tickets are handled internally by s2n-quic's
-//! integration with s2n-tls, but the session data is not accessible to applications.
-//!
-//! This means QUIC-level 0-RTT session resumption is NOT available with s2n-quic.
-//! Reconnection will always perform a full 1-RTT handshake.
-//!
-//! **Application-level session resumption** (mosh-style: PTY stays alive, channels
-//! restore on reconnect) works correctly and is the primary reconnection mechanism
-//! for qsh.
-//!
-//! For 0-RTT session resumption support, consider using the quiche backend which
-//! exposes session ticket APIs via `session()` and `set_session()`.
+//! s2n-quic supports TLS session tickets for 0-RTT resumption. We capture the
+//! ticket bytes via s2n-tls callbacks and reuse them on reconnect, following the
+//! upstream resumption example. Application-level resumption (mosh-style) still
+//! works the same way.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use bytes::{Buf, BytesMut};
 use s2n_quic::stream::{BidirectionalStream, ReceiveStream, SendStream};
+use s2n_quic::provider::tls::s2n_tls::callbacks::ConnectionFuture;
+use tokio::sync::Notify;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
@@ -61,6 +55,110 @@ pub struct ConnectionStats {
     bytes_lost: AtomicU64,
     /// Total packets sent (for loss ratio calculation).
     packets_sent: AtomicU64,
+}
+
+/// Handshake status shared between the event subscriber and connection wrapper.
+#[derive(Debug, Default)]
+pub struct HandshakeState {
+    complete: AtomicBool,
+    confirmed: AtomicBool,
+}
+
+impl HandshakeState {
+    fn mark_complete(&self) {
+        self.complete.store(true, Ordering::Relaxed);
+    }
+
+    fn mark_confirmed(&self) {
+        self.complete.store(true, Ordering::Relaxed);
+        self.confirmed.store(true, Ordering::Relaxed);
+    }
+
+    fn is_complete(&self) -> bool {
+        self.complete.load(Ordering::Relaxed)
+    }
+}
+
+/// Shared session ticket state used for 0-RTT resumption.
+#[derive(Default)]
+pub(crate) struct SessionTicketState {
+    ticket: std::sync::Mutex<Option<Vec<u8>>>,
+    resumed: AtomicBool,
+    notify: Notify,
+}
+
+impl SessionTicketState {
+    fn new(initial: Option<Vec<u8>>) -> Arc<Self> {
+        Arc::new(Self {
+            ticket: std::sync::Mutex::new(initial),
+            resumed: AtomicBool::new(false),
+            notify: Notify::new(),
+        })
+    }
+
+    fn set_ticket(&self, data: Vec<u8>) {
+        *self.ticket.lock().unwrap() = Some(data);
+        self.notify.notify_waiters();
+    }
+
+    fn ticket(&self) -> Option<Vec<u8>> {
+        self.ticket.lock().unwrap().clone()
+    }
+
+    fn set_resumed(&self, resumed: bool) {
+        self.resumed.store(resumed, Ordering::Relaxed);
+        self.notify.notify_waiters();
+    }
+
+    fn is_resumed(&self) -> bool {
+        self.resumed.load(Ordering::Relaxed)
+    }
+}
+
+/// Handler that injects and captures session tickets for resumption.
+#[derive(Clone)]
+struct SessionTicketHandler {
+    state: Arc<SessionTicketState>,
+}
+
+impl SessionTicketHandler {
+    fn new(state: Arc<SessionTicketState>) -> Self {
+        Self { state }
+    }
+}
+
+impl s2n_quic::provider::tls::s2n_tls::config::ConnectionInitializer for SessionTicketHandler {
+    fn initialize_connection(
+        &self,
+        connection: &mut s2n_quic::provider::tls::s2n_tls::connection::Connection,
+    ) -> std::result::Result<
+        Option<Pin<Box<dyn ConnectionFuture>>>,
+        s2n_quic::provider::tls::s2n_tls::error::Error,
+    > {
+        if let Some(ticket) = self.state.ticket() {
+            // Best effort; if resumption fails the handshake falls back to full 1-RTT.
+            let _ = connection.set_session_ticket(&ticket);
+        }
+        Ok(None)
+    }
+}
+
+impl s2n_quic::provider::tls::s2n_tls::callbacks::SessionTicketCallback
+    for SessionTicketHandler
+{
+    fn on_session_ticket(
+        &self,
+        connection: &mut s2n_quic::provider::tls::s2n_tls::connection::Connection,
+        session_ticket: &s2n_quic::provider::tls::s2n_tls::callbacks::SessionTicket,
+    ) {
+        if let Ok(size) = session_ticket.len() {
+            let mut data = vec![0; size];
+            if session_ticket.data(&mut data).is_ok() {
+                self.state.set_ticket(data);
+            }
+        }
+        self.state.set_resumed(connection.resumed());
+    }
 }
 
 impl ConnectionStats {
@@ -121,18 +219,20 @@ impl ConnectionStats {
 /// ConnectionStats structure.
 pub struct StatsSubscriber {
     stats: Arc<ConnectionStats>,
+    handshake: Arc<HandshakeState>,
 }
 
 impl StatsSubscriber {
     /// Create a new statistics subscriber with shared stats.
-    pub fn new(stats: Arc<ConnectionStats>) -> Self {
-        Self { stats }
+    pub fn new(stats: Arc<ConnectionStats>, handshake: Arc<HandshakeState>) -> Self {
+        Self { stats, handshake }
     }
 }
 
 /// Per-connection context for the stats subscriber.
 pub struct StatsContext {
     stats: Arc<ConnectionStats>,
+    handshake: Arc<HandshakeState>,
 }
 
 impl s2n_quic::provider::event::Subscriber for StatsSubscriber {
@@ -145,6 +245,7 @@ impl s2n_quic::provider::event::Subscriber for StatsSubscriber {
     ) -> Self::ConnectionContext {
         StatsContext {
             stats: Arc::clone(&self.stats),
+            handshake: Arc::clone(&self.handshake),
         }
     }
 
@@ -193,6 +294,20 @@ impl s2n_quic::provider::event::Subscriber for StatsSubscriber {
         _event: &s2n_quic::provider::event::events::PacketSent,
     ) {
         context.stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn on_handshake_status_updated(
+        &mut self,
+        context: &mut Self::ConnectionContext,
+        _meta: &s2n_quic::provider::event::events::ConnectionMeta,
+        event: &s2n_quic::provider::event::events::HandshakeStatusUpdated,
+    ) {
+        use s2n_quic::provider::event::events::HandshakeStatus::*;
+        match event.status {
+            Complete { .. } | HandshakeDoneLost { .. } => context.handshake.mark_complete(),
+            HandshakeDoneAcked { .. } | Confirmed { .. } => context.handshake.mark_confirmed(),
+            _ => {}
+        }
     }
 }
 
@@ -654,14 +769,20 @@ pub struct S2nConnection {
     is_server: bool,
     /// Connection statistics (populated by event subscriber).
     stats: Arc<ConnectionStats>,
+    /// Handshake status tracking.
+    handshake: Arc<HandshakeState>,
+    /// Session ticket/resumption tracking.
+    session_state: Arc<SessionTicketState>,
 }
 
 impl S2nConnection {
     /// Create a new connection wrapper from a client connection.
-    pub async fn from_client_connection(
+    pub(crate) async fn from_client_connection(
         mut conn: s2n_quic::connection::Connection,
         local_addr: SocketAddr,
         stats: Arc<ConnectionStats>,
+        handshake: Arc<HandshakeState>,
+        session_state: Arc<SessionTicketState>,
     ) -> Result<Self> {
         let remote_addr = conn.remote_addr().map_err(|e| Error::Transport {
             message: format!("failed to get remote address: {}", e),
@@ -672,6 +793,8 @@ impl S2nConnection {
             message: format!("failed to open control stream: {}", e),
         })?;
 
+        handshake.mark_confirmed();
+
         Ok(Self {
             conn: Mutex::new(conn),
             remote_addr,
@@ -681,14 +804,18 @@ impl S2nConnection {
             control_stream: Mutex::new(Some(control_stream)),
             is_server: false,
             stats,
+            handshake,
+            session_state,
         })
     }
 
     /// Create a new connection wrapper from a server connection.
-    pub async fn from_server_connection(
+    pub(crate) async fn from_server_connection(
         mut conn: s2n_quic::connection::Connection,
         local_addr: SocketAddr,
         stats: Arc<ConnectionStats>,
+        handshake: Arc<HandshakeState>,
+        session_state: Arc<SessionTicketState>,
     ) -> Result<Self> {
         let remote_addr = conn.remote_addr().map_err(|e| Error::Transport {
             message: format!("failed to get remote address: {}", e),
@@ -701,6 +828,8 @@ impl S2nConnection {
             message: "connection closed before control stream".to_string(),
         })?;
 
+        handshake.mark_confirmed();
+
         Ok(Self {
             conn: Mutex::new(conn),
             remote_addr,
@@ -710,30 +839,24 @@ impl S2nConnection {
             control_stream: Mutex::new(Some(control_stream)),
             is_server: true,
             stats,
+            handshake,
+            session_state,
         })
     }
 
     /// Get session data for 0-RTT resumption on reconnect.
-    ///
-    /// **Note:** Always returns `None` for s2n-quic. Session resumption APIs
-    /// are not exposed by s2n-quic. Use the quiche backend for 0-RTT support.
     pub async fn session_data(&self) -> Option<Vec<u8>> {
-        None
+        self.session_state.ticket()
     }
 
     /// Check if the connection has early data available (0-RTT phase).
-    ///
-    /// **Note:** Always returns `false` for s2n-quic.
     pub async fn is_in_early_data(&self) -> bool {
-        false
+        !self.handshake.is_complete()
     }
 
     /// Check if the connection was resumed from a previous session (0-RTT).
-    ///
-    /// **Note:** Always returns `false` for s2n-quic. Session resumption APIs
-    /// are not exposed by s2n-quic.
     pub async fn is_resumed(&self) -> bool {
-        false
+        self.session_state.is_resumed()
     }
 
     /// Get packet loss ratio (0.0 - 1.0).
@@ -759,6 +882,21 @@ impl S2nConnection {
     /// Get the connection statistics.
     pub fn stats(&self) -> &ConnectionStats {
         &self.stats
+    }
+
+    /// Close the connection gracefully.
+    ///
+    /// This initiates a QUIC connection close. After calling this,
+    /// any pending stream operations will return errors.
+    pub async fn close_connection(&self) {
+        debug!("close_connection called, setting closed flag");
+        self.closed.store(true, Ordering::SeqCst);
+
+        // Close the s2n-quic connection to wake up any pending recv operations
+        let conn = self.conn.lock().await;
+        // Use application error code 0 (NO_ERROR)
+        conn.close(0u8.into());
+        debug!("s2n-quic connection closed");
     }
 
     /// Accept an incoming bidirectional stream.
@@ -1100,6 +1238,21 @@ pub fn cert_hash(cert_der: &[u8]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
+fn derive_ticket_key_material(ticket_key: Option<&[u8]>) -> (Vec<u8>, Vec<u8>) {
+    use sha2::{Digest, Sha256};
+
+    if let Some(key) = ticket_key {
+        let digest = Sha256::digest(key);
+        let key_bytes = digest[..16].to_vec();
+        let name = digest[16..24].to_vec();
+        (key_bytes, name)
+    } else {
+        let key_bytes: [u8; 16] = rand::random();
+        let name = key_bytes[..8].to_vec();
+        (key_bytes.to_vec(), name)
+    }
+}
+
 // =============================================================================
 // s2n-quic Configuration Helpers
 // =============================================================================
@@ -1140,10 +1293,11 @@ pub fn server_config(cert_pem: &[u8], key_pem: &[u8], bind_addr: &str) -> Result
 pub fn server_config_with_ticket_key(
     cert_pem: &[u8],
     key_pem: &[u8],
-    _ticket_key: Option<&[u8]>,
+    ticket_key: Option<&[u8]>,
     bind_addr: &str,
 ) -> Result<s2n_quic::server::Server> {
     use s2n_quic::Server;
+    use s2n_quic::provider::tls::s2n_tls;
 
     let cert_pem_str = std::str::from_utf8(cert_pem).map_err(|e| Error::CertificateError {
         message: format!("invalid certificate PEM encoding: {}", e),
@@ -1153,8 +1307,26 @@ pub fn server_config_with_ticket_key(
         message: format!("invalid key PEM encoding: {}", e),
     })?;
 
+    let (ticket_key_bytes, ticket_key_name) = derive_ticket_key_material(ticket_key);
+
+    let mut tls = s2n_tls::Server::builder()
+        .with_certificate(cert_pem_str, key_pem_str)
+        .map_err(|e| Error::CertificateError {
+            message: format!("failed to configure TLS: {}", e),
+        })?;
+
+    tls.config_mut()
+        .add_session_ticket_key(&ticket_key_name, &ticket_key_bytes, SystemTime::now())
+        .map_err(|e| Error::Transport {
+            message: format!("failed to configure session ticket key: {}", e),
+        })?;
+
+    let tls = tls.build().map_err(|e| Error::Transport {
+        message: format!("failed to build TLS config: {}", e),
+    })?;
+
     Server::builder()
-        .with_tls((cert_pem_str, key_pem_str))
+        .with_tls(tls)
         .map_err(|e| Error::CertificateError {
             message: format!("failed to configure TLS: {}", e),
         })?
@@ -1216,6 +1388,7 @@ pub fn build_server_config(
     bind_addr: &str,
 ) -> Result<s2n_quic::server::Server> {
     use s2n_quic::Server;
+    use s2n_quic::provider::tls::s2n_tls;
 
     let creds = builder.credentials().ok_or_else(|| Error::Transport {
         message: "server config requires TLS credentials".to_string(),
@@ -1229,8 +1402,27 @@ pub fn build_server_config(
         message: format!("invalid key PEM encoding: {}", e),
     })?;
 
+    let (ticket_key_bytes, ticket_key_name) =
+        derive_ticket_key_material(creds.ticket_key.as_deref());
+
+    let mut tls = s2n_tls::Server::builder()
+        .with_certificate(cert_pem_str, key_pem_str)
+        .map_err(|e| Error::CertificateError {
+            message: format!("failed to configure TLS certificate: {}", e),
+        })?;
+
+    tls.config_mut()
+        .add_session_ticket_key(&ticket_key_name, &ticket_key_bytes, SystemTime::now())
+        .map_err(|e| Error::Transport {
+            message: format!("failed to configure session ticket key: {}", e),
+        })?;
+
+    let tls = tls.build().map_err(|e| Error::Transport {
+        message: format!("failed to build TLS config: {}", e),
+    })?;
+
     Server::builder()
-        .with_tls((cert_pem_str, key_pem_str))
+        .with_tls(tls)
         .map_err(|e| Error::CertificateError {
             message: format!("failed to configure TLS: {}", e),
         })?
@@ -1251,6 +1443,30 @@ pub fn build_server_config(
 use super::{ConnectConfig, ConnectResult, ListenerConfig};
 use std::time::Instant;
 
+async fn wait_for_session_ticket(
+    state: &Arc<SessionTicketState>,
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    if let Some(ticket) = state.ticket() {
+        return Some(ticket);
+    }
+
+    let _ = tokio::time::timeout(timeout, state.notify.notified()).await.ok()?;
+    state.ticket()
+}
+
+async fn wait_for_resumption_flag(
+    state: &Arc<SessionTicketState>,
+    timeout: Duration,
+) -> bool {
+    if state.is_resumed() {
+        return true;
+    }
+
+    let _ = tokio::time::timeout(timeout, state.notify.notified()).await;
+    state.is_resumed()
+}
+
 /// Establish a QUIC client connection using s2n-quic.
 ///
 /// This performs the full QUIC/TLS handshake and returns a connected
@@ -1260,15 +1476,14 @@ use std::time::Instant;
 /// * `config` - Connection configuration including server address, timeouts, and optional session data
 ///
 /// # Returns
-/// * `Ok(ConnectResult)` - Contains the connection, resume status (always false for s2n-quic), and session data (always None)
+/// * `Ok(ConnectResult)` - Contains the connection, resume status, and cached session data (if available)
 /// * `Err(Error)` - On connection failure (timeout, handshake failure, certificate mismatch)
 ///
 /// # 0-RTT Session Resumption
-/// **NOT SUPPORTED** with s2n-quic. The `session_data` field in `ConnectConfig` is ignored,
-/// and `ConnectResult.session_data` will always be `None`. Reconnection will always use
-/// a full 1-RTT handshake.
-///
-/// For 0-RTT support, use the quiche backend instead.
+/// s2n-quic uses TLS session tickets for 0-RTT. Any provided `session_data` is
+/// applied via s2n-tls, and new tickets are captured for reuse on reconnect. If
+/// a ticket has not arrived before the function returns, it can still be fetched
+/// later via `connection.session_data()`.
 ///
 /// # Certificate Verification
 /// - X.509 verification is disabled for bootstrap mode (self-signed certificates)
@@ -1282,7 +1497,10 @@ pub async fn connect_quic(config: &ConnectConfig) -> Result<ConnectResult<S2nCon
 
     // Create shared statistics for event subscriber
     let stats = Arc::new(ConnectionStats::default());
-    let event_subscriber = StatsSubscriber::new(Arc::clone(&stats));
+    let handshake_state = Arc::new(HandshakeState::default());
+    let event_subscriber = StatsSubscriber::new(Arc::clone(&stats), Arc::clone(&handshake_state));
+    let session_state = SessionTicketState::new(config.session_data.clone());
+    let ticket_handler = SessionTicketHandler::new(Arc::clone(&session_state));
 
     // Build the client
     // Note: s2n-quic binds internally, we can't specify a local port directly
@@ -1293,16 +1511,25 @@ pub async fn connect_quic(config: &ConnectConfig) -> Result<ConnectResult<S2nCon
         format!("[::]:{}", config.local_port.unwrap_or(0))
     };
 
-    // Note: session_data is ignored - s2n-quic does not expose session resumption APIs
-    // See module-level documentation for details
-    if config.session_data.is_some() {
-        debug!("session_data provided but s2n-quic does not support 0-RTT session resumption");
-    }
-
     // Configure TLS
     // For bootstrap mode, we disable X.509 verification since we're using
     // self-signed certificates with hash-based pinning
     let mut tls_builder = s2n_tls::Client::builder();
+
+    tls_builder
+        .config_mut()
+        .enable_session_tickets(true)
+        .map_err(|e| Error::Transport {
+            message: format!("failed to enable session tickets: {}", e),
+        })?
+        .set_session_ticket_callback(ticket_handler.clone())
+        .map_err(|e| Error::Transport {
+            message: format!("failed to set session ticket callback: {}", e),
+        })?
+        .set_connection_initializer(ticket_handler.clone())
+        .map_err(|e| Error::Transport {
+            message: format!("failed to set connection initializer: {}", e),
+        })?;
 
     // Disable X.509 verification for self-signed certificates
     // SAFETY: This is used for bootstrap mode where certificates are verified via hash pinning
@@ -1374,16 +1601,25 @@ pub async fn connect_quic(config: &ConnectConfig) -> Result<ConnectResult<S2nCon
         connection,
         local_addr,
         stats,
+        handshake_state,
+        Arc::clone(&session_state),
     ).await?;
 
     // Note: Certificate hash verification should be done at the application layer
     // s2n-quic doesn't expose the peer certificate chain directly
 
-    // 0-RTT is not supported - always return resumed=false and session_data=None
+    // Wait briefly for session ticket delivery so callers can cache it for the
+    // next reconnect. If a ticket hasn't arrived yet, the connection can still
+    // export it later via `session_data()`.
+    let resumed =
+        wait_for_resumption_flag(&session_state, Duration::from_millis(500)).await;
+    let session_data =
+        wait_for_session_ticket(&session_state, Duration::from_millis(500)).await;
+
     Ok(ConnectResult {
         connection: s2n_conn,
-        resumed: false,
-        session_data: None,
+        resumed,
+        session_data,
     })
 }
 
@@ -1416,26 +1652,34 @@ impl S2nAcceptor {
             message: format!("invalid key PEM encoding: {}", e),
         })?;
 
+        let (ticket_key_bytes, ticket_key_name) =
+            derive_ticket_key_material(config.ticket_key.as_deref());
+
         // Configure limits including idle timeout
+        let idle_timeout = config.idle_timeout;
         let limits = s2n_quic::provider::limits::Limits::new()
-            .with_max_idle_timeout(config.idle_timeout)
+            .with_max_idle_timeout(idle_timeout)
             .map_err(|e| Error::Transport {
                 message: format!("failed to configure idle timeout: {}", e),
             })?;
 
-        // Build TLS config
-        // Note: Session ticket configuration is ignored since s2n-quic doesn't expose
-        // session resumption APIs to applications. The ticket_key in ListenerConfig
-        // is ignored for the s2n-quic backend.
-        let tls = s2n_tls::Server::builder()
+        // Build TLS config with a stable session ticket key for 0-RTT.
+        let mut tls_builder = s2n_tls::Server::builder()
             .with_certificate(cert_pem_str, key_pem_str)
             .map_err(|e| Error::CertificateError {
                 message: format!("failed to configure TLS certificate: {}", e),
-            })?
-            .build()
-            .map_err(|e| Error::Transport {
-                message: format!("failed to build TLS config: {}", e),
             })?;
+
+        tls_builder
+            .config_mut()
+            .add_session_ticket_key(&ticket_key_name, &ticket_key_bytes, SystemTime::now())
+            .map_err(|e| Error::Transport {
+                message: format!("failed to configure session ticket key: {}", e),
+            })?;
+
+        let tls = tls_builder.build().map_err(|e| Error::Transport {
+            message: format!("failed to build TLS config: {}", e),
+        })?;
 
         let server = Server::builder()
             .with_tls(tls)
@@ -1498,9 +1742,19 @@ impl S2nAcceptor {
         // or remain at default values. For full stats on server side, we'd need to
         // rebuild the Server with an event subscriber, but that's complex for per-connection stats.
         let stats = Arc::new(ConnectionStats::default());
+        let handshake = Arc::new(HandshakeState::default());
+        handshake.mark_confirmed();
+        let session_state = SessionTicketState::new(None);
 
         // Wrap in S2nConnection
-        let s2n_conn = S2nConnection::from_server_connection(connection, self.local_addr, stats).await?;
+        let s2n_conn = S2nConnection::from_server_connection(
+            connection,
+            self.local_addr,
+            stats,
+            handshake,
+            session_state,
+        )
+        .await?;
 
         Ok((s2n_conn, remote_addr))
     }

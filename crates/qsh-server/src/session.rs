@@ -20,7 +20,7 @@ use qsh_core::protocol::{
 use qsh_core::transport::{Connection, QuicConnection, QuicStream, StreamPair, StreamType};
 use rand::Rng;
 
-use crate::connection::{ConnectionConfig, ConnectionHandler};
+use crate::connection::{ConnectionConfig, ConnectionHandler, ShutdownReason};
 
 /// Server session configuration.
 #[derive(Debug, Clone)]
@@ -202,7 +202,7 @@ impl PendingSession {
     pub async fn accept_channel_model(
         mut self,
         conn_config: ConnectionConfig,
-    ) -> Result<(Arc<ConnectionHandler>, tokio::sync::mpsc::Receiver<()>)> {
+    ) -> Result<(Arc<ConnectionHandler>, tokio::sync::mpsc::Receiver<ShutdownReason>)> {
         let session_id = SessionId::new();
 
         // Send HelloAck (channels created separately via ChannelOpen)
@@ -243,7 +243,7 @@ impl PendingSession {
         mut self,
         conn_config: ConnectionConfig,
         registry: &crate::registry::ConnectionRegistry,
-    ) -> Result<(Arc<ConnectionHandler>, tokio::sync::mpsc::Receiver<()>)> {
+    ) -> Result<(Arc<ConnectionHandler>, tokio::sync::mpsc::Receiver<ShutdownReason>)> {
         let client_addr = self.quic.remote_addr();
 
         // Check if this is a session resume attempt
@@ -278,7 +278,7 @@ impl PendingSession {
                     let existing_channels = handler.get_existing_channels().await;
 
                     // Update the handler's QUIC connection to the new one
-                    let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+                    let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel::<ShutdownReason>(1);
                     handler.reconnect(self.quic, self.control, shutdown_tx).await;
 
                     // Send HelloAck with existing session ID and channel info

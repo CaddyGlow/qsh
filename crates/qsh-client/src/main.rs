@@ -632,6 +632,11 @@ async fn run_reconnectable_session(
 
     // Track current reconnect error for notification updates
     let mut reconnect_error: Option<String> = None;
+    // Track user-requested disconnect even while reconnecting
+    let mut disconnect_requested = false;
+
+    // Track if this is the first connection (vs a reconnection)
+    let mut is_first_connection = true;
 
     // Create stdin/stdout handlers
     let mut stdin = StdinReader::new();
@@ -653,7 +658,7 @@ async fn run_reconnectable_session(
     let mut client_parser: Option<TerminalParser> = None;
 
     // Reconnection loop
-    loop {
+    'session: loop {
         // Wait for connection to be available, with periodic refresh of notification bar
         render_notification(&notification, &mut stdout).await;
 
@@ -718,8 +723,13 @@ async fn run_reconnectable_session(
             }
 
             restored
+        } else if !is_first_connection {
+            // Reconnection with no restored terminal means the shell exited while
+            // we were disconnected. Exit gracefully instead of opening a new shell.
+            info!("Shell exited during network interruption, exiting cleanly");
+            break;
         } else {
-            // New terminal: open a fresh channel
+            // First connection: open a fresh terminal channel
             let terminal_params = qsh_core::protocol::TerminalParams {
                 term_size,
                 term_type: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
@@ -745,6 +755,9 @@ async fn run_reconnectable_session(
                 }
             }
         };
+
+        // Mark that we've completed first connection
+        is_first_connection = false;
 
         info!(channel_id = ?terminal.channel_id(), "Terminal channel ready");
 
@@ -846,14 +859,40 @@ async fn run_reconnectable_session(
                     }
                 } => {
                     if let Some(msg) = result {
+                        debug!(?msg, "Received control message");
                         match msg {
                             Message::Heartbeat(hb) => {
                                 if let Some(rtt) = heartbeat_tracker.receive_heartbeat(&hb) {
                                     // debug!(rtt_ms = rtt.as_millis(), "Heartbeat RTT sample");
                                 }
                             }
+                            Message::ChannelClose(close) => {
+                                // Server closed a channel - check if it's our terminal
+                                debug!(
+                                    channel_id = %close.channel_id,
+                                    reason = %close.reason,
+                                    our_channel = %terminal.channel_id(),
+                                    "Received ChannelClose"
+                                );
+                                if close.channel_id == terminal.channel_id() {
+                                    info!(
+                                        channel_id = %close.channel_id,
+                                        reason = %close.reason,
+                                        "Server closed terminal channel - exiting"
+                                    );
+                                    // Mark terminal as closed and exit cleanly
+                                    terminal.mark_closed();
+                                    break Ok(());
+                                } else {
+                                    debug!(
+                                        channel_id = %close.channel_id,
+                                        reason = %close.reason,
+                                        "Server closed unknown channel"
+                                    );
+                                }
+                            }
                             other => {
-                                debug!(?other, "Received control message");
+                                // Already logged above
                             }
                         }
                     }
@@ -985,6 +1024,11 @@ async fn run_reconnectable_session(
                 result = terminal.recv_event() => {
                     match result {
                         Ok(qsh_client::TerminalEvent::Output(output)) => {
+                            debug!(
+                                len = output.data.len(),
+                                confirmed_seq = output.confirmed_input_seq,
+                                "Received terminal output"
+                            );
                             // Update notification engine (mosh-style)
                             let now = std::time::Instant::now();
                             notification.server_heard(now);
@@ -1081,10 +1125,53 @@ async fn run_reconnectable_session(
                             render_notification(&notification, &mut stdout).await;
                         }
                         Err(e) => {
-                            // ConnectionClosed is transient - trigger reconnection
-                            // Other errors may be fatal or transient (handled by outer loop)
+                            debug!(error = %e, "recv_event returned error");
+                            // Before treating as transient, check if server sent ChannelClose.
+                            // This handles the race where output stream closes before we
+                            // process the ChannelClose message on the control stream.
                             if matches!(e, qsh_core::Error::ConnectionClosed) {
-                                info!("Channel closed, will attempt reconnect");
+                                debug!("Output stream closed, checking for pending ChannelClose");
+                                if let Some(conn) = reconnectable.connection() {
+                                    // Use try_recv or a short timeout to check for ChannelClose
+                                    debug!("Waiting up to 100ms for ChannelClose on control stream");
+                                    match tokio::time::timeout(
+                                        Duration::from_millis(100),
+                                        conn.recv_control()
+                                    ).await {
+                                        Ok(Ok(Message::ChannelClose(close))) => {
+                                            debug!(
+                                                channel_id = %close.channel_id,
+                                                reason = %close.reason,
+                                                our_channel = %terminal.channel_id(),
+                                                "Got ChannelClose from timeout check"
+                                            );
+                                            if close.channel_id == terminal.channel_id() {
+                                                info!(
+                                                    channel_id = %close.channel_id,
+                                                    reason = %close.reason,
+                                                    "Server closed terminal channel (detected on stream close)"
+                                                );
+                                                terminal.mark_closed();
+                                                break Ok(());
+                                            }
+                                        }
+                                        Ok(Ok(other)) => {
+                                            debug!(?other, "Got non-ChannelClose message from timeout check");
+                                            info!("Channel closed, will attempt reconnect");
+                                        }
+                                        Ok(Err(ctrl_err)) => {
+                                            debug!(error = %ctrl_err, "Control stream error in timeout check");
+                                            info!("Channel closed, will attempt reconnect");
+                                        }
+                                        Err(_timeout) => {
+                                            debug!("Timeout waiting for ChannelClose");
+                                            info!("Channel closed, will attempt reconnect");
+                                        }
+                                    }
+                                } else {
+                                    debug!("No connection available for ChannelClose check");
+                                    info!("Channel closed, will attempt reconnect");
+                                }
                             } else {
                                 warn!(error = %e, "recv_event error");
                             }
@@ -1187,7 +1274,48 @@ async fn run_reconnectable_session(
                 notification.set_reconnecting(&error_msg);
 
                 render_notification(&notification, &mut stdout).await;
-                reconnectable.handle_error(&e).await;
+                // Allow escape handling while reconnecting so the user can quit even if the
+                // connection is stuck.
+                let mut handle_error_fut = reconnectable.handle_error(&e);
+                tokio::pin!(handle_error_fut);
+
+                loop {
+                    tokio::select! {
+                        _ = &mut handle_error_fut => {
+                            // Reconnection attempt finished (either success or give up)
+                            break;
+                        }
+                        input = stdin.read() => {
+                            let Some(data) = input else {
+                                info!("EOF on stdin during reconnection");
+                                disconnect_requested = true;
+                                reconnectable.disconnect();
+                                break;
+                            };
+
+                            match escape_handler.process(&data) {
+                                EscapeResult::Command(EscapeCommand::Disconnect) => {
+                                    info!("Escape sequence: disconnect (during reconnection)");
+                                    disconnect_requested = true;
+                                    reconnectable.disconnect();
+                                    break;
+                                }
+                                EscapeResult::Waiting
+                                | EscapeResult::Command(EscapeCommand::ToggleOverlay)
+                                | EscapeResult::Command(EscapeCommand::SendEscapeKey)
+                                | EscapeResult::PassThrough(_) => {
+                                    // Ignore other input while disconnected
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if disconnect_requested {
+                    break 'session;
+                }
+
                 // Continue outer loop - will wait for reconnection
             }
             Err(e) => {

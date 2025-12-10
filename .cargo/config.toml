@@ -4,7 +4,13 @@
 # Linux musl targets (static linking)
 # Note: zstd-sys and other C deps need _FORTIFY_SOURCE disabled for musl
 [target.x86_64-unknown-linux-musl]
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = [
+  "-C",
+  "target-feature=+crt-static",
+  # "-C",
+  # "link-arg=--ld-path=/home/rick/.cargo/bin/wild",
+]
+
 
 [target.aarch64-unknown-linux-musl]
 rustflags = ["-C", "target-feature=+crt-static"]
@@ -16,6 +22,11 @@ rustflags = ["-C", "target-feature=+crt-static"]
 # Disable glibc fortification for musl builds (zstd-sys uses __memcpy_chk otherwise)
 CFLAGS_x86_64_unknown_linux_musl = "-U_FORTIFY_SOURCE"
 CFLAGS_aarch64_unknown_linux_musl = "-U_FORTIFY_SOURCE"
+
+
+[target.x86_64-unknown-linux-gnu]
+# linker = "gcc"
+# rustflags = ["-C", "link-arg=--ld-path=/home/rick/.cargo/bin/wild"]
 
 # Windows targets (static linking)
 [target.x86_64-pc-windows-gnu]

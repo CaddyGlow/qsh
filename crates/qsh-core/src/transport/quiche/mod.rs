@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
 use tokio::sync::{Mutex, RwLock};
-use tracing::debug;
+use tracing::{debug, trace};
 
 use crate::error::{Error, Result};
 use crate::protocol::{ChannelId, Codec, Message};
@@ -193,6 +193,7 @@ impl StreamPair for QuicheStream {
         let conn = Arc::clone(&self.conn);
         let stream_id = self.stream_id;
         let recv_only = self.recv_only;
+        let msg_debug = format!("{:?}", msg);
 
         async move {
             if recv_only {
@@ -201,6 +202,7 @@ impl StreamPair for QuicheStream {
                 });
             }
             let data = data?;
+            trace!(stream_id = stream_id, msg = %msg_debug, len = data.len(), "quiche stream send");
             conn.stream_send(stream_id, &data, false).await
         }
     }
@@ -226,6 +228,7 @@ impl StreamPair for QuicheStream {
 
             loop {
                 if let Some(msg) = Codec::decode(&mut recv_buf)? {
+                    trace!(stream_id = stream_id, msg = ?msg, "quiche stream recv");
                     return Ok(msg);
                 }
 
@@ -237,11 +240,16 @@ impl StreamPair for QuicheStream {
                     Ok(_) => {
                         // EOF
                         if let Some(msg) = Codec::decode(&mut recv_buf)? {
+                            trace!(stream_id = stream_id, msg = ?msg, "quiche stream recv (EOF)");
                             return Ok(msg);
                         }
+                        trace!(stream_id = stream_id, "quiche stream recv EOF (no more messages)");
                         return Err(Error::ConnectionClosed);
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        trace!(stream_id = stream_id, error = %e, "quiche stream recv error");
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -401,6 +409,7 @@ pub struct QuicheSender {
 impl QuicheSender {
     /// Send a message (includes flush for low latency).
     pub async fn send(&self, msg: &Message) -> Result<()> {
+        trace!(stream_id = self.stream_id, msg = ?msg, "quiche sender send");
         let data = Codec::encode(msg)?;
         self.conn.stream_send(self.stream_id, &data, false).await
     }
@@ -551,6 +560,12 @@ impl QuicheConnectionInner {
     /// Receive data from a stream.
     pub async fn stream_recv(&self, stream_id: u64, buf: &mut [u8]) -> Result<usize> {
         loop {
+            // Check our closed flag first (set by close_connection())
+            if self.closed.load(Ordering::SeqCst) {
+                debug!(stream_id, "stream_recv: closed flag is set, returning ConnectionClosed");
+                return Err(Error::ConnectionClosed);
+            }
+
             {
                 let mut conn = self.conn.lock().await;
 
@@ -612,6 +627,12 @@ impl QuicheConnectionInner {
     /// - The connection stays alive during normal user idle periods
     /// - Keepalive interval adapts to RTT (like Mosh's SRTT/2 approach)
     pub async fn drive_io(&self) -> Result<()> {
+        // Check our closed flag first (set by close_connection())
+        if self.closed.load(Ordering::SeqCst) {
+            debug!("drive_io: closed flag is set, returning ConnectionClosed");
+            return Err(Error::ConnectionClosed);
+        }
+
         let mut buf = [0u8; 65535];
 
         // Compute RTT-adaptive keepalive interval (Mosh-style: RTT/2)
@@ -664,12 +685,12 @@ impl QuicheConnectionInner {
         // Try to receive a packet, honoring quiche's timeout semantics:
         // - If quiche requests a timeout, use that as the recv timeout and
         //   call `on_timeout()` only when that timer actually fires.
-        // - If quiche has no pending timeout, block until a packet arrives.
-        let recv_result = if let Some(t) = quiche_timeout {
-            tokio::time::timeout(t, self.socket.recv_from(&mut buf)).await
-        } else {
-            Ok(self.socket.recv_from(&mut buf).await)
-        };
+        // - If quiche has no pending timeout, use a short max timeout to
+        //   ensure we periodically return and allow stream state checks.
+        //   This is important for detecting stream closures promptly.
+        const MAX_RECV_TIMEOUT: Duration = Duration::from_millis(100);
+        let recv_timeout = quiche_timeout.unwrap_or(MAX_RECV_TIMEOUT);
+        let recv_result = tokio::time::timeout(recv_timeout, self.socket.recv_from(&mut buf)).await;
 
         match recv_result {
             Ok(Ok((len, from))) => {
@@ -814,6 +835,20 @@ impl QuicheConnectionInner {
     /// Check if connection is closed.
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Close the connection gracefully.
+    ///
+    /// This initiates a QUIC connection close. After calling this,
+    /// `is_closed()` will return true and any pending `stream_recv()` calls
+    /// will return `ConnectionClosed`.
+    pub async fn close_connection(&self) {
+        debug!("close_connection called, setting closed flag");
+        self.closed.store(true, Ordering::SeqCst);
+        let mut conn = self.conn.lock().await;
+        // Close with NO_ERROR code (0) and no reason phrase
+        let result = conn.close(false, 0, b"");
+        debug!(?result, "quiche conn.close() result");
     }
 
     /// Get RTT of last path for application use.
@@ -1068,6 +1103,14 @@ impl QuicheConnection {
     /// reduced latency.
     pub async fn is_resumed(&self) -> bool {
         self.inner.is_resumed().await
+    }
+
+    /// Close the connection gracefully.
+    ///
+    /// This initiates a QUIC connection close. After calling this,
+    /// any pending `stream_recv()` calls will return `ConnectionClosed`.
+    pub async fn close_connection(&self) {
+        self.inner.close_connection().await
     }
 
     /// Get async RTT estimate (smoothed).
