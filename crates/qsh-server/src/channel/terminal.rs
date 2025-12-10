@@ -16,7 +16,7 @@ use qsh_core::protocol::{
     StateUpdateData, TerminalInputData, TerminalOutputData, TerminalParams,
 };
 use qsh_core::terminal::{TerminalParser, TerminalState};
-use qsh_core::transport::{Connection, QuicConnection, QuicStream, StreamPair, StreamType};
+use qsh_core::transport::{Connection, QuicConnection, QuicStream, StreamPair, StreamType, TransportSender};
 
 use crate::pty::{Pty, PtyRelay};
 use crate::registry::PtyControl;
@@ -164,28 +164,84 @@ impl TerminalChannel {
             handler: Arc::downgrade(&handler),
         });
 
-        // Spawn output relay task
+        // Spawn output relay task with Mosh-style output batching (8ms mindelay for server)
         let inner_clone = Arc::clone(&inner);
         let mut output_rx = output_rx;
         let relay_task = tokio::spawn(async move {
+            // Initialize TransportSender for Mosh-style output coalescing
+            // Server uses 8ms mindelay (vs 1ms for client) for efficient output batching
+            let mut output_sender = TransportSender::for_server();
+
             loop {
                 tokio::select! {
+                    biased;
+
                     _ = shutdown_rx.recv() => {
                         debug!(channel_id = %inner_clone.channel_id, "Terminal relay shutdown");
+                        // Flush any pending output before shutdown
+                        if output_sender.has_pending() {
+                            let data = output_sender.flush();
+                            let _ = inner_clone.send_output_to_client(data).await;
+                        }
                         break;
                     }
+
                     output = output_rx.recv() => {
                         match output {
                             Some(data) => {
-                                // Process output - updates terminal state and sends if connected
-                                // Disconnection is handled internally, we never break the loop
-                                let _ = inner_clone.process_output(data).await;
+                                // Update terminal state immediately (for accurate tracking)
+                                // This also broadcasts to local subscribers
+                                inner_clone.update_state_and_broadcast(&data).await;
+
+                                // Push to TransportSender for batched network send
+                                output_sender.push(&data);
+                                trace!(
+                                    channel_id = %inner_clone.channel_id,
+                                    output_len = data.len(),
+                                    pending_len = output_sender.pending_len(),
+                                    "Pushed output to TransportSender"
+                                );
+
+                                // Check if ready to send (timer may have expired)
+                                if let Some(batched) = output_sender.tick() {
+                                    trace!(
+                                        channel_id = %inner_clone.channel_id,
+                                        len = batched.len(),
+                                        send_interval_ms = output_sender.send_interval().as_millis(),
+                                        "TransportSender tick flush (inline)"
+                                    );
+                                    let _ = inner_clone.send_output_to_client(batched).await;
+                                }
                             }
                             None => {
-                                // PTY has exited - this is the only reason to close the channel
+                                // PTY has exited - flush remaining output then break
+                                if output_sender.has_pending() {
+                                    let data = output_sender.flush();
+                                    debug!(
+                                        channel_id = %inner_clone.channel_id,
+                                        len = data.len(),
+                                        "Flushing remaining output on PTY exit"
+                                    );
+                                    let _ = inner_clone.send_output_to_client(data).await;
+                                }
                                 info!(channel_id = %inner_clone.channel_id, "PTY output_rx returned None - PTY exited, breaking relay loop");
                                 break;
                             }
+                        }
+                    }
+
+                    // TransportSender timer: flush pending output when timing allows
+                    // (Mosh-style: max(mindelay_clock + 8ms, last_send + send_interval))
+                    _ = tokio::time::sleep_until(output_sender.next_send_time().into()),
+                        if output_sender.has_pending() => {
+                        if let Some(batched) = output_sender.tick() {
+                            trace!(
+                                channel_id = %inner_clone.channel_id,
+                                len = batched.len(),
+                                send_interval_ms = output_sender.send_interval().as_millis(),
+                                "TransportSender timer flush"
+                            );
+                            let _ = inner_clone.send_output_to_client(batched).await;
                         }
                     }
                 }
@@ -453,7 +509,11 @@ impl TerminalChannel {
 }
 
 impl TerminalChannelInner {
-    /// Process PTY output and send to client.
+    /// Process PTY output and send to client (non-batched version).
+    ///
+    /// Note: The relay task uses the batched version via TransportSender.
+    /// This method is retained for potential direct use cases.
+    #[allow(dead_code)]
     async fn process_output(&self, data: Vec<u8>) -> Result<()> {
         if self.closed.load(Ordering::SeqCst) {
             return Ok(());
@@ -502,6 +562,114 @@ impl TerminalChannelInner {
             // Throttle state updates - raw output is always sent immediately,
             // but state updates (for prediction validation) can be rate-limited.
             // When connection is fast, predictions aren't needed, so we can throttle.
+            let should_send_state = {
+                let mut last_update = self.last_state_update.lock().await;
+                let now = Instant::now();
+                let send = match *last_update {
+                    None => true, // First update, always send
+                    Some(last) => now.duration_since(last) >= STATE_UPDATE_MIN_INTERVAL,
+                };
+                if send {
+                    *last_update = Some(now);
+                }
+                send
+            };
+
+            if should_send_state {
+                // Send state update for reconnection/prediction support
+                let new_state = {
+                    let parser = self.parser.lock().await;
+                    parser.state().clone()
+                };
+
+                let diff = {
+                    let mut last = self.last_sent_state.lock().await;
+                    let diff = if let Some(ref last_state) = *last {
+                        last_state.diff_to(&new_state)
+                    } else {
+                        StateDiff::Full(new_state.clone())
+                    };
+                    *last = Some(new_state);
+                    diff
+                };
+
+                let update = Message::ChannelDataMsg(ChannelData {
+                    channel_id,
+                    payload: ChannelPayload::StateUpdate(StateUpdateData {
+                        diff,
+                        confirmed_input_seq: confirmed_seq,
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_micros() as u64,
+                    }),
+                });
+                let _ = stream.send(&update).await; // Best effort for state update
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Update terminal state and broadcast locally (immediate, no network send).
+    ///
+    /// Used by TransportSender-based relay to track state immediately while
+    /// batching network sends.
+    async fn update_state_and_broadcast(&self, data: &[u8]) {
+        if self.closed.load(Ordering::SeqCst) {
+            return;
+        }
+
+        // Update terminal state (always, even when disconnected)
+        {
+            let mut parser = self.parser.lock().await;
+            parser.process(data);
+        }
+
+        // Broadcast to any local subscribers
+        let _ = self.output_tx.send(data.to_vec());
+    }
+
+    /// Send batched output to client (called from TransportSender timer).
+    ///
+    /// This handles the network send portion, including optional state updates.
+    async fn send_output_to_client(&self, data: Vec<u8>) -> Result<()> {
+        if self.closed.load(Ordering::SeqCst) || data.is_empty() {
+            return Ok(());
+        }
+
+        // Skip sending if disconnected - state is tracked, client will get it on reconnect
+        if self.disconnected.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        // Send to client
+        let mut stream_guard = self.output_stream.lock().await;
+        if let Some(ref mut stream) = *stream_guard {
+            let confirmed_seq = self.confirmed_input_seq.load(Ordering::SeqCst);
+            let channel_id = self.channel_id;
+
+            // Send raw output (batched)
+            let output = Message::ChannelDataMsg(ChannelData {
+                channel_id,
+                payload: ChannelPayload::TerminalOutput(TerminalOutputData {
+                    data: data.clone(),
+                    confirmed_input_seq: confirmed_seq,
+                }),
+            });
+            if let Err(e) = stream.send(&output).await {
+                // Connection lost - mark disconnected and stop trying to send
+                if !self.disconnected.swap(true, Ordering::SeqCst) {
+                    info!(
+                        channel_id = %channel_id,
+                        error = %e,
+                        "Output stream disconnected, waiting for reconnection"
+                    );
+                }
+                return Ok(());
+            }
+
+            // Throttle state updates
             let should_send_state = {
                 let mut last_update = self.last_state_update.lock().await;
                 let now = Instant::now();

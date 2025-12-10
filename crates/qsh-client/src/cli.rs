@@ -255,6 +255,27 @@ pub struct Cli {
     #[arg(long = "escape-key", default_value = "ctrl+^", value_name = "KEY")]
     pub escape_key: String,
 
+    // === TransportSender (Mosh-style keystroke batching) ===
+    /// Minimum delay before sending input (milliseconds).
+    /// Mosh uses 1ms for client, allowing very short coalescing windows.
+    #[arg(long = "send-mindelay", default_value = "1", value_name = "MS")]
+    pub send_mindelay_ms: u64,
+
+    /// Minimum send interval (milliseconds).
+    /// Mosh uses 20ms as the floor for adaptive timing.
+    #[arg(long = "send-interval-min", default_value = "20", value_name = "MS")]
+    pub send_interval_min_ms: u64,
+
+    /// Maximum send interval (milliseconds).
+    /// Mosh uses 250ms as the ceiling for adaptive timing.
+    #[arg(long = "send-interval-max", default_value = "250", value_name = "MS")]
+    pub send_interval_max_ms: u64,
+
+    /// Paste detection threshold (bytes).
+    /// Input larger than this resets prediction and flushes immediately.
+    #[arg(long = "paste-threshold", default_value = "100", value_name = "BYTES")]
+    pub paste_threshold: usize,
+
     /// Notification bar display style (mosh-style auto-showing bar).
     #[arg(long = "notification-style", value_enum, default_value = "minimal")]
     pub notification_style: NotificationStyle,
@@ -410,6 +431,17 @@ impl Cli {
     /// Check if this is forwarding-only mode (-N with no command).
     pub fn is_forward_only(&self) -> bool {
         self.no_pty && self.command.is_empty()
+    }
+
+    /// Create SenderConfig from CLI options (Mosh-style keystroke batching).
+    pub fn sender_config(&self) -> qsh_core::transport::SenderConfig {
+        qsh_core::transport::SenderConfig {
+            send_mindelay: std::time::Duration::from_millis(self.send_mindelay_ms),
+            send_interval_min: std::time::Duration::from_millis(self.send_interval_min_ms),
+            send_interval_max: std::time::Duration::from_millis(self.send_interval_max_ms),
+            // ACK delay/interval are not exposed via CLI (use Mosh defaults)
+            ..qsh_core::transport::SenderConfig::client()
+        }
     }
 }
 

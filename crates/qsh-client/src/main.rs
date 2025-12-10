@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use tokio::time::MissedTickBehavior;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use qsh_client::cli::{NotificationStyle as CliNotificationStyle, SshBootstrapMode};
 use qsh_client::overlay::{NotificationEngine, NotificationStyle, PredictionOverlay};
@@ -23,7 +23,7 @@ use qsh_client::{
 };
 use qsh_core::protocol::Message;
 use qsh_core::terminal::TerminalParser;
-use qsh_core::transport::Connection;
+use qsh_core::transport::{Connection, TransportSender};
 
 #[cfg(feature = "standalone")]
 use qsh_client::standalone::authenticate as standalone_authenticate;
@@ -806,6 +806,15 @@ async fn run_reconnectable_session(
             prediction.init_cursor(0, 0);
         }
 
+        // Initialize TransportSender for Mosh-style keystroke coalescing
+        // Uses CLI options for send_mindelay, send_interval_min/max
+        let mut transport_sender = TransportSender::new(cli.sender_config());
+        // Track pending batch metadata (assigned on first push, used on flush)
+        let mut pending_seq: Option<u64> = None;
+        let mut pending_predictable = false;
+        // Paste threshold from CLI (Mosh default: 100 bytes)
+        let paste_threshold = cli.paste_threshold;
+
         // Start forwards (only on first connection)
         // TODO: Handle forward reconnection
 
@@ -922,8 +931,21 @@ async fn run_reconnectable_session(
                         }
                         EscapeResult::Command(EscapeCommand::SendEscapeKey) => {
                             notification.clear_message(); // Clear info bar
-                            // Send the escape character itself
-                            let _ = terminal.queue_input(&[escape_key.unwrap_or(0x1e)], false);
+                            // Send the escape character itself - flush immediately
+                            let esc = [escape_key.unwrap_or(0x1e)];
+                            // Reserve sequence for this batch
+                            if pending_seq.is_none() {
+                                pending_seq = Some(terminal.reserve_sequence());
+                            }
+                            transport_sender.push(&esc);
+                            // Force flush immediately (user action)
+                            let data = transport_sender.flush();
+                            if !data.is_empty() {
+                                if let Some(seq) = pending_seq.take() {
+                                    let _ = terminal.queue_input_with_seq(&data, seq, pending_predictable);
+                                    pending_predictable = false;
+                                }
+                            }
                             continue;
                         }
                         EscapeResult::Waiting => {
@@ -944,78 +966,167 @@ async fn run_reconnectable_session(
                             // Clear info bar (escape sequence resolved or timed out)
                             notification.clear_message();
 
+                            // Mosh-style paste detection: >threshold bytes triggers immediate flush
+                            // and disables prediction for this input
+                            let is_paste = pass_data.len() > paste_threshold;
+                            if is_paste {
+                                debug!(
+                                    len = pass_data.len(),
+                                    threshold = paste_threshold,
+                                    "Paste detected, will flush immediately"
+                                );
+                            }
+
                             // Check if input contains predictable characters
                             let has_predictable = prediction_enabled
+                                && !is_paste
                                 && pass_data.iter().any(|&b| is_predictable_char(b));
 
-                            // Queue the input (mark as predictable if it has printable chars)
-                            let seq = match terminal.queue_input(&pass_data, has_predictable) {
-                                Ok(seq) => seq,
-                                Err(e) => {
-                                    warn!(error = %e, "Failed to queue input");
-                                    break Err(e);
-                                }
-                            };
+                            // Track predictable flag for batch
+                            pending_predictable |= has_predictable;
 
-                            // If prediction enabled, process input with mosh-style tracking
+                            // Reserve sequence for this batch (first push assigns sequence)
+                            if pending_seq.is_none() {
+                                pending_seq = Some(terminal.reserve_sequence());
+                            }
+                            let seq = pending_seq.unwrap();
+
+                            // Mosh-style: prediction runs IMMEDIATELY (before send timing)
                             if prediction_enabled {
                                 let mut prediction = terminal.prediction_mut().await;
 
-                                // Get current cursor position (from client parser or predicted)
-                                let cursor = if let Some(pred_cursor) = prediction.get_predicted_cursor() {
-                                    pred_cursor
-                                } else if let Some(ref parser) = client_parser {
-                                    let state = parser.state();
-                                    (state.cursor.col, state.cursor.row)
+                                // Reset prediction on paste (Mosh stmclient.cc:333-335)
+                                if is_paste {
+                                    prediction.reset();
+                                    prediction_overlay.clear_all();
                                 } else {
-                                    (0, 0)
-                                };
+                                    // Get current cursor position (from client parser or predicted)
+                                    let cursor = if let Some(pred_cursor) = prediction.get_predicted_cursor() {
+                                        pred_cursor
+                                    } else if let Some(ref parser) = client_parser {
+                                        let state = parser.state();
+                                        (state.cursor.col, state.cursor.row)
+                                    } else {
+                                        (0, 0)
+                                    };
 
-                                // Only render if prediction engine says we should display
-                                if prediction.should_display() {
-                                    // Process each byte with position tracking
-                                    for &byte in &pass_data {
-                                        if let Some(echo) = prediction.new_user_byte(byte, cursor, term_size.cols, seq) {
-                                            // Add to overlay for position-based rendering
-                                            let pred_cursor = prediction.get_predicted_cursor().unwrap_or(cursor);
-                                            // The cursor after new_user_byte points to the next position,
-                                            // so the character was placed at pred_cursor - 1 (wrapping handled)
-                                            let char_col = if pred_cursor.0 == 0 && pred_cursor.1 > cursor.1 {
-                                                // Wrapped to next line, char was at end of previous line
-                                                term_size.cols.saturating_sub(1)
-                                            } else {
-                                                pred_cursor.0.saturating_sub(1)
-                                            };
-                                            let char_row = if pred_cursor.0 == 0 && pred_cursor.1 > cursor.1 {
-                                                pred_cursor.1.saturating_sub(1)
-                                            } else {
-                                                pred_cursor.1
-                                            };
+                                    // Only render if prediction engine says we should display
+                                    if prediction.should_display() {
+                                        // Process each byte with position tracking
+                                        for &byte in &pass_data {
+                                            if let Some(echo) = prediction.new_user_byte(byte, cursor, term_size.cols, seq) {
+                                                // Add to overlay for position-based rendering
+                                                let pred_cursor = prediction.get_predicted_cursor().unwrap_or(cursor);
+                                                // The cursor after new_user_byte points to the next position,
+                                                // so the character was placed at pred_cursor - 1 (wrapping handled)
+                                                let char_col = if pred_cursor.0 == 0 && pred_cursor.1 > cursor.1 {
+                                                    // Wrapped to next line, char was at end of previous line
+                                                    term_size.cols.saturating_sub(1)
+                                                } else {
+                                                    pred_cursor.0.saturating_sub(1)
+                                                };
+                                                let char_row = if pred_cursor.0 == 0 && pred_cursor.1 > cursor.1 {
+                                                    pred_cursor.1.saturating_sub(1)
+                                                } else {
+                                                    pred_cursor.1
+                                                };
 
-                                            // Render prediction at position using position-based overlay
-                                            let pred = Prediction {
-                                                sequence: echo.sequence,
-                                                char: echo.char,
-                                                col: char_col,
-                                                row: char_row,
-                                                timestamp: std::time::Instant::now(),
-                                            };
-                                            prediction_overlay.add(&pred, echo.style);
+                                                // Render prediction at position using position-based overlay
+                                                let pred = Prediction {
+                                                    sequence: echo.sequence,
+                                                    char: echo.char,
+                                                    col: char_col,
+                                                    row: char_row,
+                                                    timestamp: std::time::Instant::now(),
+                                                };
+                                                prediction_overlay.add(&pred, echo.style);
+                                            }
                                         }
-                                    }
 
-                                    // Render the prediction overlay
-                                    let overlay_output = prediction_overlay.render();
-                                    if !overlay_output.is_empty() {
-                                        let _ = stdout.write(overlay_output.as_bytes()).await;
-                                    }
-                                } else {
-                                    // Still process bytes for cursor tracking even if not displaying
-                                    for &byte in &pass_data {
-                                        let _ = prediction.new_user_byte(byte, cursor, term_size.cols, seq);
+                                        // Render the prediction overlay
+                                        let overlay_output = prediction_overlay.render();
+                                        if !overlay_output.is_empty() {
+                                            let _ = stdout.write(overlay_output.as_bytes()).await;
+                                        }
+                                    } else {
+                                        // Still process bytes for cursor tracking even if not displaying
+                                        for &byte in &pass_data {
+                                            let _ = prediction.new_user_byte(byte, cursor, term_size.cols, seq);
+                                        }
                                     }
                                 }
                             }
+
+                            // Accumulate in TransportSender (Mosh-style batching)
+                            transport_sender.push(&pass_data);
+                            trace!(
+                                input_len = pass_data.len(),
+                                pending_len = transport_sender.pending_len(),
+                                seq = seq,
+                                "Pushed input to TransportSender"
+                            );
+
+                            // Check for quit/suspend sequences that should flush immediately
+                            let has_quit_signal = pass_data.iter().any(|&b| b == 0x03 || b == 0x1A);
+                            if has_quit_signal {
+                                debug!("Quit/suspend signal detected, will flush immediately");
+                            }
+
+                            // Determine if we should flush now
+                            let should_flush = is_paste || has_quit_signal;
+
+                            if should_flush {
+                                // Force flush on paste or quit sequence
+                                let data = transport_sender.flush();
+                                if !data.is_empty() {
+                                    debug!(
+                                        len = data.len(),
+                                        reason = if is_paste { "paste" } else { "quit_signal" },
+                                        "Force flushing TransportSender"
+                                    );
+                                    if let Some(seq) = pending_seq.take() {
+                                        if let Err(e) = terminal.queue_input_with_seq(&data, seq, pending_predictable) {
+                                            warn!(error = %e, "Failed to queue input");
+                                            break Err(e);
+                                        }
+                                        pending_predictable = false;
+                                    }
+                                }
+                            } else if let Some(data) = transport_sender.tick() {
+                                // Timer-based flush (Mosh timing algorithm)
+                                trace!(
+                                    len = data.len(),
+                                    send_interval_ms = transport_sender.send_interval().as_millis(),
+                                    "TransportSender tick flush (inline)"
+                                );
+                                if let Some(seq) = pending_seq.take() {
+                                    if let Err(e) = terminal.queue_input_with_seq(&data, seq, pending_predictable) {
+                                        warn!(error = %e, "Failed to queue input");
+                                        break Err(e);
+                                    }
+                                    pending_predictable = false;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // TransportSender timer: flush pending input when timing allows
+                // (Mosh-style: max(mindelay_clock + SEND_MINDELAY, last_send + send_interval))
+                _ = tokio::time::sleep_until(transport_sender.next_send_time().into()),
+                    if transport_sender.has_pending() => {
+                    if let Some(data) = transport_sender.tick() {
+                        trace!(
+                            len = data.len(),
+                            send_interval_ms = transport_sender.send_interval().as_millis(),
+                            "TransportSender timer flush"
+                        );
+                        if let Some(seq) = pending_seq.take() {
+                            if let Err(e) = terminal.queue_input_with_seq(&data, seq, pending_predictable) {
+                                warn!(error = %e, "Failed to queue input from sender timer");
+                                break Err(e);
+                            }
+                            pending_predictable = false;
                         }
                     }
                 }
@@ -1024,7 +1135,7 @@ async fn run_reconnectable_session(
                 result = terminal.recv_event() => {
                     match result {
                         Ok(qsh_client::TerminalEvent::Output(output)) => {
-                            debug!(
+                            trace!(
                                 len = output.data.len(),
                                 confirmed_seq = output.confirmed_input_seq,
                                 "Received terminal output"
@@ -1098,7 +1209,7 @@ async fn run_reconnectable_session(
 
                             // Render the full state to the terminal (mosh-style resync)
                             if let qsh_core::terminal::StateDiff::Full(ref state) = update.diff {
-                                info!("Received state sync after reconnection");
+                                debug!("Received full state sync (resync or large change)");
 
                                 // Update client parser to match server state
                                 if let Some(ref mut parser) = client_parser {
@@ -1186,6 +1297,9 @@ async fn run_reconnectable_session(
                     if let Some(srtt) = heartbeat_tracker.srtt() {
                         notification.update_rtt(srtt);
 
+                        // Update TransportSender RTT for adaptive send_interval
+                        transport_sender.set_rtt(srtt);
+
                         // Update prediction engine RTT for adaptive display
                         if prediction_enabled {
                             let mut prediction = terminal.prediction_mut().await;
@@ -1255,6 +1369,16 @@ async fn run_reconnectable_session(
                 }
             }
         };
+
+        // Flush any pending input before handling session result
+        if transport_sender.has_pending() {
+            let data = transport_sender.flush();
+            if !data.is_empty() {
+                if let Some(seq) = pending_seq.take() {
+                    let _ = terminal.queue_input_with_seq(&data, seq, pending_predictable);
+                }
+            }
+        }
 
         // Handle session result
         match session_result {

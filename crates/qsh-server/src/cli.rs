@@ -139,6 +139,22 @@ pub struct Cli {
     )]
     pub session_linger_secs: u64,
 
+    // === TransportSender (Mosh-style output batching) ===
+    /// Minimum delay before sending output (milliseconds).
+    /// Mosh uses 8ms for server, allowing efficient output coalescing.
+    #[arg(long = "send-mindelay", default_value = "8", value_name = "MS")]
+    pub send_mindelay_ms: u64,
+
+    /// Minimum send interval (milliseconds).
+    /// Mosh uses 20ms as the floor for adaptive timing.
+    #[arg(long = "send-interval-min", default_value = "20", value_name = "MS")]
+    pub send_interval_min_ms: u64,
+
+    /// Maximum send interval (milliseconds).
+    /// Mosh uses 250ms as the ceiling for adaptive timing.
+    #[arg(long = "send-interval-max", default_value = "250", value_name = "MS")]
+    pub send_interval_max_ms: u64,
+
     // Standalone mode options (feature-gated)
     /// Run in standalone mode with SSH key authentication
     #[cfg(feature = "standalone")]
@@ -194,6 +210,17 @@ impl Cli {
     pub fn session_linger_duration(&self) -> Duration {
         Duration::from_secs(self.session_linger_secs)
     }
+
+    /// Create SenderConfig from CLI options (Mosh-style output batching).
+    pub fn sender_config(&self) -> qsh_core::transport::SenderConfig {
+        qsh_core::transport::SenderConfig {
+            send_mindelay: Duration::from_millis(self.send_mindelay_ms),
+            send_interval_min: Duration::from_millis(self.send_interval_min_ms),
+            send_interval_max: Duration::from_millis(self.send_interval_max_ms),
+            // ACK delay/interval are not exposed via CLI (use Mosh defaults)
+            ..qsh_core::transport::SenderConfig::server()
+        }
+    }
 }
 
 fn parse_port_range(s: &str) -> Result<(u16, u16), String> {
@@ -244,6 +271,9 @@ impl Default for Cli {
             #[cfg(feature = "tunnel")]
             allow_tunnel: false,
             session_linger_secs: 172_800,
+            send_mindelay_ms: 8,           // Mosh server default
+            send_interval_min_ms: 20,      // Mosh SEND_INTERVAL_MIN
+            send_interval_max_ms: 250,     // Mosh SEND_INTERVAL_MAX
             #[cfg(feature = "standalone")]
             standalone: false,
             #[cfg(feature = "standalone")]

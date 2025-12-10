@@ -23,6 +23,10 @@
 compile_error!("Only one QUIC backend can be enabled at a time. Enable either `quiche-backend` or `s2n-quic-backend`, not both.");
 
 pub mod config;
+pub mod sender;
+
+// Re-export sender types
+pub use sender::{SenderConfig, TransportSender};
 
 #[cfg(feature = "quiche-backend")]
 mod quiche;

@@ -172,6 +172,41 @@ impl TerminalChannel {
         Ok(seq)
     }
 
+    /// Reserve a sequence number without sending.
+    ///
+    /// Used with TransportSender for Mosh-style keystroke batching:
+    /// 1. Reserve sequence before prediction runs
+    /// 2. Push bytes to TransportSender
+    /// 3. When TransportSender flushes, call `queue_input_with_seq`
+    pub fn reserve_sequence(&self) -> u64 {
+        self.inner.next_seq.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Send input with a pre-assigned sequence number (non-blocking).
+    ///
+    /// Used with TransportSender for batched sends where sequence was
+    /// pre-assigned via `reserve_sequence()`.
+    pub fn queue_input_with_seq(&self, data: &[u8], seq: u64, predictable: bool) -> Result<()> {
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return Err(Error::ConnectionClosed);
+        }
+
+        let msg = Message::ChannelDataMsg(ChannelData {
+            channel_id: self.inner.channel_id,
+            payload: ChannelPayload::TerminalInput(TerminalInputData {
+                sequence: seq,
+                data: data.to_vec(),
+                predictable,
+            }),
+        });
+
+        self.inner.input_tx.send(msg).map_err(|_| Error::Transport {
+            message: "input channel closed".to_string(),
+        })?;
+
+        Ok(())
+    }
+
     /// Send input to the terminal (blocking).
     pub async fn send_input(&self, data: &[u8], predictable: bool) -> Result<u64> {
         if self.inner.closed.load(Ordering::SeqCst) {

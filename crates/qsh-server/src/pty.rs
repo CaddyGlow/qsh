@@ -19,7 +19,7 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::{ForkResult, Pid, close, dup2, execvp, fork, setsid};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use qsh_core::error::{Error, Result};
 use std::time::{Duration, Instant};
@@ -437,7 +437,7 @@ impl PtyRelay {
             loop {
                 match pty_output.read(&mut buf).await {
                     Ok(Some(n)) => {
-                        debug!(len = n, data = ?&buf[..n.min(32)], "PTY output read");
+                        trace!(len = n, data = ?&buf[..n.min(32)], "PTY output read");
                         if output_tx.send(buf[..n].to_vec()).await.is_err() {
                             warn!("Output channel closed");
                             break;

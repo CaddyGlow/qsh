@@ -253,7 +253,7 @@ impl Default for StdinReader {
     }
 }
 
-/// Async stdout writer.
+/// Async stdout writer with retry handling for WouldBlock.
 pub struct StdoutWriter {
     stdout: tokio::io::Stdout,
 }
@@ -266,10 +266,62 @@ impl StdoutWriter {
         }
     }
 
-    /// Write data to stdout.
+    /// Write data to stdout with retry on WouldBlock.
+    ///
+    /// Handles EAGAIN/WouldBlock by yielding and retrying up to a limit.
+    /// This can happen when the terminal buffer is full (e.g., during fast output).
     pub async fn write(&mut self, data: &[u8]) -> Result<()> {
-        self.stdout.write_all(data).await.map_err(Error::Io)?;
-        self.stdout.flush().await.map_err(Error::Io)?;
+        use tokio::io::AsyncWriteExt;
+
+        let mut written = 0;
+        let mut retries = 0;
+        const MAX_RETRIES: u32 = 10;
+        const RETRY_DELAY_US: u64 = 100; // 100 microseconds
+
+        while written < data.len() {
+            match self.stdout.write(&data[written..]).await {
+                Ok(0) => {
+                    // No progress - shouldn't happen but treat as error
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "stdout write returned 0 bytes",
+                    )));
+                }
+                Ok(n) => {
+                    written += n;
+                    retries = 0; // Reset retry counter on success
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    retries += 1;
+                    if retries > MAX_RETRIES {
+                        // Give up after too many retries - terminal too slow
+                        tracing::trace!(
+                            written,
+                            total = data.len(),
+                            "stdout WouldBlock after max retries, partial write"
+                        );
+                        break;
+                    }
+                    // Short yield to let terminal catch up
+                    tokio::time::sleep(std::time::Duration::from_micros(RETRY_DELAY_US)).await;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    // Interrupted by signal, just retry immediately
+                    continue;
+                }
+                Err(e) => {
+                    return Err(Error::Io(e));
+                }
+            }
+        }
+
+        // Best effort flush - don't fail on WouldBlock
+        if let Err(e) = self.stdout.flush().await {
+            if e.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(Error::Io(e));
+            }
+        }
+
         Ok(())
     }
 }
