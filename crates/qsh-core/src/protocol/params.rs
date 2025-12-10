@@ -28,6 +28,18 @@ impl Default for TermSize {
     }
 }
 
+/// Terminal output mode for PTY data transmission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum OutputMode {
+    /// Send raw PTY bytes immediately (no batching).
+    #[default]
+    Direct,
+    /// Generate ANSI escape sequences from terminal state diffs (mosh-style).
+    Mosh,
+    /// Send binary StateDiff structs.
+    StateDiff,
+}
+
 /// Parameters for opening a terminal channel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TerminalParams {
@@ -55,6 +67,9 @@ pub struct TerminalParams {
     /// For reconnection: last confirmed input sequence.
     #[serde(default)]
     pub last_input_seq: u64,
+    /// Terminal output mode.
+    #[serde(default)]
+    pub output_mode: OutputMode,
 }
 
 fn default_allocate_pty() -> bool {
@@ -72,6 +87,7 @@ impl Default for TerminalParams {
             allocate_pty: true,
             last_generation: 0,
             last_input_seq: 0,
+            output_mode: OutputMode::default(),
         }
     }
 }

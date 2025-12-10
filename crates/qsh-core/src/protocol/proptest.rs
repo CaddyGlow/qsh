@@ -12,8 +12,8 @@ use proptest::prelude::*;
 
 use crate::protocol::{
     Capabilities, ChannelData, ChannelId, ChannelOpenPayload, ChannelParams, ChannelPayload, Codec,
-    HelloPayload, Message, ResizePayload, ShutdownPayload, ShutdownReason, StateAckPayload,
-    TermSize, TerminalInputData, TerminalParams,
+    HelloPayload, Message, OutputMode, ResizePayload, ShutdownPayload, ShutdownReason,
+    StateAckPayload, TermSize, TerminalInputData, TerminalParams,
 };
 
 #[cfg(feature = "standalone")]
@@ -104,6 +104,14 @@ prop_compose! {
     }
 }
 
+fn arb_output_mode() -> impl Strategy<Value = OutputMode> {
+    prop_oneof![
+        Just(OutputMode::Direct),
+        Just(OutputMode::Mosh),
+        Just(OutputMode::StateDiff),
+    ]
+}
+
 prop_compose! {
     fn arb_terminal_params()(
         term_size in arb_term_size(),
@@ -113,6 +121,7 @@ prop_compose! {
         allocate_pty in any::<bool>(),
         last_generation in any::<u64>(),
         last_input_seq in any::<u64>(),
+        output_mode in arb_output_mode(),
     ) -> TerminalParams {
         TerminalParams {
             term_size,
@@ -123,6 +132,7 @@ prop_compose! {
             allocate_pty,
             last_generation,
             last_input_seq,
+            output_mode,
         }
     }
 }

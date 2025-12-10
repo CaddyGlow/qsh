@@ -128,6 +128,11 @@ impl Cell {
             && self.bg == Color::Default
             && self.attrs.is_default()
     }
+
+    /// Check if this cell is empty (space or default).
+    pub fn is_empty(&self) -> bool {
+        self.ch == ' ' || self.is_default()
+    }
 }
 
 // =============================================================================
@@ -278,6 +283,17 @@ impl Screen {
             for cell in &mut self.cells[start..end] {
                 *cell = Cell::default();
             }
+        }
+    }
+
+    /// Get a row of cells as a slice.
+    pub fn row(&self, row: u16) -> Option<&[Cell]> {
+        if row < self.rows {
+            let start = self.index(0, row);
+            let end = start + self.cols as usize;
+            Some(&self.cells[start..end])
+        } else {
+            None
         }
     }
 
@@ -471,6 +487,16 @@ impl TerminalState {
         } else {
             &mut self.primary
         }
+    }
+
+    /// Get the width (columns) of the terminal.
+    pub fn cols(&self) -> u16 {
+        self.screen().cols()
+    }
+
+    /// Get the height (rows) of the terminal.
+    pub fn rows(&self) -> u16 {
+        self.screen().rows()
     }
 
     /// Get screen dimensions.
