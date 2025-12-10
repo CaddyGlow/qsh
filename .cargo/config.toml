@@ -3,12 +3,23 @@
 
 # Linux musl targets (static linking)
 # Note: zstd-sys and other C deps need _FORTIFY_SOURCE disabled for musl
+# [target.x86_64-unknown-linux-musl]
+# rustflags = [
+#   "-C",
+#   "target-feature=+crt-static",
+#   # "-C",
+#   # "link-arg=--ld-path=/home/rick/.cargo/bin/wild",
+# ]
+[build]
+target = "x86_64-unknown-linux-musl"
+
 [target.x86_64-unknown-linux-musl]
+# linker = "clang"
 rustflags = [
   "-C",
   "target-feature=+crt-static",
-  # "-C",
-  # "link-arg=--ld-path=/home/rick/.cargo/bin/wild",
+  "-C",
+  "relocation-model=static",
 ]
 
 
@@ -25,7 +36,7 @@ CFLAGS_aarch64_unknown_linux_musl = "-U_FORTIFY_SOURCE"
 
 
 [target.x86_64-unknown-linux-gnu]
-# linker = "gcc"
+linker = "clang"
 # rustflags = ["-C", "link-arg=--ld-path=/home/rick/.cargo/bin/wild"]
 
 # Windows targets (static linking)
@@ -51,11 +62,12 @@ rustflags = ["-C", "link-arg=-static"]
 
 [target.i686-linux-android]
 
-[build]
-# Uncomment to set a default target
-# target = "x86_64-unknown-linux-musl"
 
 [profile.release]
 lto = true
 codegen-units = 1
 strip = true
+
+[profile.dev]
+debug = 0
+strip = "debuginfo"
