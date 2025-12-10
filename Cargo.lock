@@ -3121,6 +3121,7 @@ name = "qsh-core"
 version = "0.1.0"
 dependencies = [
  "assert_matches",
+ "aws-lc-rs",
  "base64",
  "bincode",
  "bytes",
@@ -3132,7 +3133,6 @@ dependencies = [
  "quiche",
  "rand 0.9.2",
  "rcgen",
- "ring",
  "rpassword",
  "rustls-pemfile",
  "s2n-quic",
@@ -3161,6 +3161,7 @@ name = "qsh-server"
 version = "0.1.0"
 dependencies = [
  "assert_matches",
+ "aws-lc-rs",
  "base64",
  "bytes",
  "clap",
@@ -3175,7 +3176,6 @@ dependencies = [
  "quiche",
  "rand 0.9.2",
  "rcgen",
- "ring",
  "rustls-pemfile",
  "s2n-quic",
  "serde",
@@ -3387,8 +3387,8 @@ version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5fae430c6b28f1ad601274e78b7dffa0546de0b73b4cd32f46723c0c2a16f7a5"
 dependencies = [
+ "aws-lc-rs",
  "pem",
- "ring",
  "rustls-pki-types",
  "time",
  "yasna",

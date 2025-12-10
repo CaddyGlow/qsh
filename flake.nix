@@ -104,6 +104,7 @@
           glib
           clang
           cmake
+          mold
         ];
 
         # Linux-specific cross-compilation toolchains
@@ -175,7 +176,7 @@
             export CC_i686_linux_android="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/${ndkPrebuiltDir}/bin/i686-linux-android34-clang"
             export AR_i686_linux_android="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/${ndkPrebuiltDir}/bin/llvm-ar"
 
-            # Musl target compiler/linkers for C deps (e.g. zstd-sys, ring, quiche/boringssl)
+            # Musl target compiler/linkers for C deps (e.g. zstd-sys, aws-lc-rs, quiche/boringssl)
             export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="${pkgs.pkgsCross.musl64.stdenv.cc}/bin/x86_64-unknown-linux-musl-gcc"
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="${pkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc}/bin/aarch64-unknown-linux-musl-gcc"
             export CC_x86_64_unknown_linux_musl="${pkgs.pkgsCross.musl64.stdenv.cc}/bin/x86_64-unknown-linux-musl-gcc"
@@ -190,6 +191,13 @@
             export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_AR="${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-ar"
             export CARGO_TARGET_I686_PC_WINDOWS_GNU_AR="${pkgs.pkgsCross.mingw32.stdenv.cc}/bin/i686-w64-mingw32-ar"
           ''}
+
+          export CC="clang"
+          export RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+          export CARGO_INCREMENTAL="0"
+          export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
+          export LD_LIBRARY_PATH="${pkgs.zlib}/lib:${pkgs.stdenv.cc.cc.lib}/lib:${pkgs.openssl.out}/lib"
+          export OPENSSL_NO_VENDOR="1"
 
           echo "qsh development environment loaded (${system})"
           echo ""

@@ -14,6 +14,8 @@ repository = "https://github.com/anthropics/qsh"
 tokio = { version = "1.40", features = ["full"] }
 
 # QUIC/TLS (backends - select via feature flags in consuming crates)
+# quiche uses vendored BoringSSL (requires cmake/go at build time, but no system deps)
+# Note: Default feature is boringssl-vendored which builds BoringSSL from source
 tokio-quiche = "0.12"
 quiche = "0.24"
 s2n-quic = { version = "1.69", features = ["s2n-quic-tls"] }
@@ -48,11 +50,11 @@ thiserror = "2.0"
 # Bytes/buffers
 bytes = "1.7"
 
-# Crypto
-rcgen = "0.14"
+# Crypto (pure Rust, no external deps)
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 rand = "0.9"
 base64 = "0.22"
-ring = "0.17"
+aws-lc-rs = "1.11"
 rustls-pemfile = "2.2"
 
 # SSH keys (for standalone auth feature)
