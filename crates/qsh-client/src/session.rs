@@ -2,28 +2,20 @@
 //!
 //! Provides abstractions for managing connection state across reconnections:
 //! - `SessionContext`: Cached connection info for transparent reconnection
-//! - `TerminalSessionState`: Terminal-specific state for recovery
-//! - `ConnectionState`: Current connection status
+//! - `TerminalSessionState`: Terminal-specific state for recovery (re-exported from qsh-core)
+//! - `ConnectionState`: Current connection status (re-exported from qsh-core)
 
 use std::net::SocketAddr;
 
 use qsh_core::protocol::SessionId;
 
+// Re-export shared session types from qsh-core
+pub use qsh_core::session::{ConnectionState, TerminalSessionState};
+
 #[cfg(feature = "standalone")]
 use crate::standalone::DirectAuthenticator;
 
 use crate::ConnectionConfig;
-
-/// Connection state for reconnection handling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectionState {
-    /// Connected and operational.
-    Connected,
-    /// Attempting to reconnect after disconnect.
-    Reconnecting,
-    /// Permanently disconnected (fatal error or user cancelled).
-    Disconnected,
-}
 
 /// Cached connection info for reconnection.
 ///
@@ -98,30 +90,6 @@ impl SessionContext {
             cert_hash: self.cert_hash.clone(),
             ..self.config.clone()
         }
-    }
-}
-
-/// Terminal-specific state for recovery after reconnection.
-///
-/// Used to request state diff from server based on last known state.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TerminalSessionState {
-    /// Last confirmed terminal generation from server.
-    pub last_generation: u64,
-    /// Last confirmed input sequence from server.
-    pub last_input_seq: u64,
-}
-
-impl TerminalSessionState {
-    /// Create a new terminal session state.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Update state from server confirmation.
-    pub fn update(&mut self, generation: u64, input_seq: u64) {
-        self.last_generation = generation;
-        self.last_input_seq = input_seq;
     }
 }
 

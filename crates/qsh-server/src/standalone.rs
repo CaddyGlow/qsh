@@ -199,6 +199,8 @@ where
     S: tokio::io::AsyncWrite + Unpin,
     R: tokio::io::AsyncRead + Unpin,
 {
+    use qsh_core::auth::handshake::write_message;
+
     // Generate and send challenge
     let challenge = match authenticator.generate_challenge() {
         Ok(c) => c,
@@ -212,20 +214,9 @@ where
     };
 
     let challenge_msg = Message::AuthChallenge(challenge.clone());
-    let encoded = match Codec::encode(&challenge_msg) {
-        Ok(e) => e,
-        Err(e) => {
-            error!(error = %e, "failed to encode challenge");
-            return AuthResult::Failure {
-                code: AuthErrorCode::InternalError,
-                internal_message: format!("encoding failed: {}", e),
-            };
-        }
-    };
 
-    // Send challenge
-    use tokio::io::AsyncWriteExt;
-    if let Err(e) = send.write_all(&encoded).await {
+    // Send challenge using shared utility
+    if let Err(e) = write_message(send, &challenge_msg).await {
         return AuthResult::Failure {
             code: AuthErrorCode::ProtocolError,
             internal_message: format!("failed to send challenge: {}", e),
@@ -266,47 +257,7 @@ async fn read_auth_response<R>(recv: &mut R) -> Result<AuthResponsePayload>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    use bytes::BytesMut;
-    use tokio::io::AsyncReadExt;
-
-    let mut buf = BytesMut::with_capacity(4096);
-
-    // Read length prefix
-    let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf)
-        .await
-        .map_err(|e| Error::Io(e))?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-
-    if len > qsh_core::constants::MAX_MESSAGE_SIZE {
-        return Err(Error::Protocol {
-            message: "message too large".into(),
-        });
-    }
-
-    // Read message body
-    buf.resize(len, 0);
-    recv.read_exact(&mut buf).await.map_err(|e| Error::Io(e))?;
-
-    // Prepend length for decoding
-    let mut full_buf = BytesMut::with_capacity(4 + len);
-    full_buf.extend_from_slice(&len_buf);
-    full_buf.extend_from_slice(&buf);
-
-    // Decode message
-    let msg = Codec::decode(&mut full_buf)?.ok_or_else(|| Error::Protocol {
-        message: "incomplete message".into(),
-    })?;
-
-    match msg {
-        Message::AuthResponse(resp) => Ok(resp),
-        _ => Err(Error::Protocol {
-            message: format!(
-                "expected AuthResponse, got {:?}",
-                std::mem::discriminant(&msg)
-            ),
-        }),
-    }
+    qsh_core::auth::handshake::read_auth_response(recv).await
 }
 
 /// Send an AuthFailure message.
@@ -314,7 +265,7 @@ pub async fn send_auth_failure<S>(send: &mut S, code: AuthErrorCode, _message: &
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
-    use tokio::io::AsyncWriteExt;
+    use qsh_core::auth::handshake::write_message;
 
     // Always use generic message for non-timeout failures
     let client_message = match code {
@@ -327,10 +278,7 @@ where
         message: client_message,
     });
 
-    let encoded = Codec::encode(&failure)?;
-    send.write_all(&encoded).await.map_err(|e| Error::Io(e))?;
-
-    Ok(())
+    write_message(send, &failure).await
 }
 
 #[cfg(test)]

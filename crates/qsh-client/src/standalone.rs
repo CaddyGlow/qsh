@@ -362,33 +362,10 @@ where
     S: tokio::io::AsyncWrite + Unpin,
     R: tokio::io::AsyncRead + Unpin,
 {
-    use bytes::BytesMut;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use qsh_core::auth::handshake::{read_message, write_message, AuthMessageResult};
 
-    // Read AuthChallenge
-    let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf)
-        .await
-        .map_err(|e| Error::Io(e))?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-
-    if len > qsh_core::constants::MAX_MESSAGE_SIZE {
-        return Err(Error::Protocol {
-            message: "message too large".into(),
-        });
-    }
-
-    let mut buf = vec![0u8; len];
-    recv.read_exact(&mut buf).await.map_err(|e| Error::Io(e))?;
-
-    // Prepend length for decoding
-    let mut full_buf = BytesMut::with_capacity(4 + len);
-    full_buf.extend_from_slice(&len_buf);
-    full_buf.extend_from_slice(&buf);
-
-    let msg = Codec::decode(&mut full_buf)?.ok_or_else(|| Error::Protocol {
-        message: "incomplete message".into(),
-    })?;
+    // Read AuthChallenge (may receive AuthFailure instead)
+    let msg = read_message(recv).await?;
 
     let challenge = match msg {
         Message::AuthChallenge(c) => c,
@@ -413,9 +390,7 @@ where
     // Generate and send response
     let response = authenticator.generate_response(&challenge).await?;
     let response_msg = Message::AuthResponse(response);
-    let encoded = Codec::encode(&response_msg)?;
-
-    send.write_all(&encoded).await.map_err(|e| Error::Io(e))?;
+    write_message(send, &response_msg).await?;
 
     // Check for AuthFailure response
     // Note: If successful, server will send Hello/HelloAck next

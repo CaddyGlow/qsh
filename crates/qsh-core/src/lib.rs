@@ -5,6 +5,7 @@
 //! - Terminal state representation and parsing
 //! - Transport abstractions
 //! - Session management types
+//! - Connection management abstractions
 //! - Port forwarding types
 //! - File transfer support
 //! - Logging and metrics
@@ -12,6 +13,7 @@
 //! - SSH key authentication for standalone mode (feature-gated)
 
 pub mod bootstrap;
+pub mod connection;
 pub mod constants;
 pub mod error;
 pub mod file;

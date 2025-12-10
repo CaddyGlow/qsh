@@ -129,11 +129,14 @@ impl ReconnectableConnection {
                             return Ok(conn);
                         }
                     }
-                    ConnectionState::Disconnected => {
+                    ConnectionState::Disconnected | ConnectionState::Terminated => {
                         return Err(Error::ConnectionClosed);
                     }
-                    ConnectionState::Reconnecting => {
+                    ConnectionState::Reconnecting | ConnectionState::Connecting => {
                         // Fall through to wait
+                    }
+                    ConnectionState::ShuttingDown => {
+                        return Err(Error::ConnectionClosed);
                     }
                 }
             }

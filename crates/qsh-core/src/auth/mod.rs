@@ -8,6 +8,7 @@
 
 mod agent;
 mod challenge;
+pub mod handshake;
 mod keys;
 mod known_hosts;
 
