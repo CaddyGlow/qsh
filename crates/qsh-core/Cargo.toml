@@ -35,6 +35,7 @@ vte = { workspace = true }
 unicode-width = { workspace = true }
 ipnet = { workspace = true }
 tun = { workspace = true, optional = true }
+async-trait = { workspace = true }
 terminfo = "0.9"
 # QUIC backends (optional - select via feature)
 tokio-quiche = { workspace = true, optional = true }

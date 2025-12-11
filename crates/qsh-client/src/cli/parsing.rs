@@ -2,9 +2,56 @@
 
 use std::borrow::Cow;
 
-use super::types::{Cli, PredictionMode};
+use super::types::{Cli, ConnectModeArg, PredictionMode};
 
 impl Cli {
+    /// Validate CLI arguments and auto-infer connect_mode where appropriate.
+    ///
+    /// Returns the effective connect mode to use, or an error if the flags are incompatible.
+    pub fn validate_and_infer_connect_mode(&self) -> Result<ConnectModeArg, String> {
+        // Bootstrap mode validation
+        if self.bootstrap {
+            // --bootstrap is incompatible with specifying a destination host
+            // (checked via clap conflicts_with, but we double-check here for clarity)
+            if self.destination.is_some() {
+                return Err(
+                    "--bootstrap cannot be used with a destination host\n\
+                     Hint: --bootstrap mode waits for incoming connections and doesn't connect out\n\
+                     Remove the destination argument or remove --bootstrap"
+                        .to_string(),
+                );
+            }
+
+            // Auto-infer: bootstrap always implies respond mode, regardless of explicit flag
+            // (The default is Initiate, so we override it here)
+            return Ok(ConnectModeArg::Respond);
+        }
+
+        // Normal mode (with destination) validation
+        if let Some(_host) = self.destination.as_ref() {
+            // Destination requires --connect-mode initiate (or we auto-infer it)
+            if self.connect_mode == ConnectModeArg::Respond {
+                return Err(
+                    "specifying a destination is incompatible with --connect-mode respond\n\
+                     Hint: use --connect-mode initiate when connecting to a remote host\n\
+                     Remove --connect-mode respond or use --connect-mode initiate"
+                        .to_string(),
+                );
+            }
+
+            // Auto-infer: destination implies initiate mode
+            return Ok(ConnectModeArg::Initiate);
+        }
+
+        // No bootstrap, no destination - this is invalid
+        Err(
+            "either --bootstrap or a destination host must be specified\n\
+             Usage: qsh [user@]host[:port]  (connect to remote host)\n\
+             Or:    qsh --bootstrap         (wait for incoming connection)"
+                .to_string(),
+        )
+    }
+
     /// Parse the destination into user and host components.
     pub fn parse_destination(&self) -> Option<(Option<&str>, &str)> {
         let dest = self.destination.as_ref()?;

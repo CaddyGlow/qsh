@@ -31,10 +31,12 @@ pub fn random_local_port() -> u16 {
     rand::rng().random_range(LOCAL_PORT_RANGE_LOW..=LOCAL_PORT_RANGE_HIGH)
 }
 
+use qsh_core::ConnectMode;
 use qsh_core::constants::{DEFAULT_MAX_FORWARDS, FORWARD_BUFFER_SIZE, IDLE_TIMEOUT};
 use qsh_core::error::{Error, Result};
+use qsh_core::handshake::{HandshakeConfig, handshake_initiate};
 use qsh_core::protocol::{
-    Capabilities, HelloPayload, Message, ResizePayload, SessionId, ShutdownPayload, ShutdownReason,
+    Capabilities, Message, ResizePayload, SessionId, ShutdownPayload, ShutdownReason,
     TermSize,
 };
 use qsh_core::transport::{
@@ -77,6 +79,8 @@ pub struct ConnectionConfig {
     /// Used for Mosh-style port hopping: if reconnection fails repeatedly,
     /// try a new local port in case the old one is blocked by NAT/firewall.
     pub local_port: Option<u16>,
+    /// Connect mode (initiate or respond).
+    pub connect_mode: ConnectMode,
 }
 
 impl Default for ConnectionConfig {
@@ -97,6 +101,28 @@ impl Default for ConnectionConfig {
             session_data: None,
             // Mosh-style: use random port from 60001-60999 range
             local_port: Some(random_local_port()),
+            connect_mode: ConnectMode::Initiate,
+        }
+    }
+}
+
+impl ConnectionConfig {
+    /// Convert ConnectionConfig to HandshakeConfig for the shared handshake helpers.
+    fn to_handshake_config(&self, resume_session: Option<SessionId>) -> HandshakeConfig {
+        HandshakeConfig {
+            connect_mode: self.connect_mode,
+            session_key: self.session_key,
+            capabilities: Capabilities {
+                predictive_echo: self.predictive_echo,
+                compression: false,
+                max_forwards: DEFAULT_MAX_FORWARDS,
+                tunnel: false,
+            },
+            term_size: self.term_size,
+            term_type: self.term_type.clone(),
+            env: self.env.clone(),
+            predictive_echo: self.predictive_echo,
+            resume_session,
         }
     }
 }
@@ -241,47 +267,14 @@ impl ChannelConnection {
             .open_stream(qsh_core::transport::StreamType::Control)
             .await?;
 
-        // Send Hello (channel model - no implicit terminal)
-        let hello = HelloPayload {
-            protocol_version: 1,
-            session_key: config.session_key,
-            client_nonce: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64,
-            capabilities: Capabilities {
-                predictive_echo: config.predictive_echo,
-                compression: false,
-                max_forwards: DEFAULT_MAX_FORWARDS,
-                tunnel: false,
-            },
-            resume_session,
-        };
+        // Perform handshake using shared helper
+        let handshake_config = config.to_handshake_config(resume_session);
+        let handshake_result = handshake_initiate(&mut control, &handshake_config).await?;
 
-        control.send(&Message::Hello(hello)).await?;
-        debug!(
-            resume = resume_session.is_some(),
-            "Sent Hello (channel model)"
-        );
-
-        // Wait for HelloAck
-        let hello_ack = match control.recv().await? {
-            Message::HelloAck(ack) => ack,
-            other => {
-                return Err(Error::Protocol {
-                    message: format!("expected HelloAck, got {:?}", other),
-                });
-            }
-        };
-
-        if !hello_ack.accepted {
-            return Err(Error::AuthenticationFailed);
-        }
-
-        let has_existing = !hello_ack.existing_channels.is_empty();
+        let has_existing = !handshake_result.existing_channels.is_empty();
         info!(
-            session_id = ?hello_ack.session_id,
-            existing_channels = hello_ack.existing_channels.len(),
+            session_id = ?handshake_result.session_id,
+            existing_channels = handshake_result.existing_channels.len(),
             "Channel model session established"
         );
 
@@ -292,7 +285,7 @@ impl ChannelConnection {
 
         // Restore existing channels if this is a session resume
         let mut channels = StdHashMap::new();
-        for existing in hello_ack.existing_channels {
+        for existing in handshake_result.existing_channels {
             use qsh_core::protocol::ExistingChannelType;
             match existing.channel_type {
                 ExistingChannelType::Terminal { state } => {
@@ -354,8 +347,8 @@ impl ChannelConnection {
             control: tokio::sync::Mutex::new(control),
             control_sender,
             config,
-            session_id: hello_ack.session_id,
-            server_caps: hello_ack.capabilities,
+            session_id: handshake_result.session_id,
+            server_caps: handshake_result.capabilities,
             channels: RwLock::new(channels),
             next_channel_id: AtomicU64::new(0),
             pending_global_requests: tokio::sync::Mutex::new(StdHashMap::new()),

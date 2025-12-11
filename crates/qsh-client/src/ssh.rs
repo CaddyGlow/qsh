@@ -15,7 +15,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tracing::{debug, info, warn};
 
-use qsh_core::bootstrap::{BootstrapResponse, ServerInfo};
+use qsh_core::bootstrap::{BootstrapOptions, BootstrapResponse, EndpointInfo};
 use qsh_core::error::{Error, Result};
 
 /// Handle to a bootstrap session that keeps the SSH process alive.
@@ -24,8 +24,8 @@ use qsh_core::error::{Error, Result};
 /// this handle is dropped, allowing the QUIC client to connect before the
 /// server exits.
 pub struct BootstrapHandle {
-    /// The server info parsed from bootstrap response.
-    pub server_info: ServerInfo,
+    /// The endpoint info parsed from bootstrap response.
+    pub endpoint_info: EndpointInfo,
     /// SSH process handle - kept alive until dropped.
     _ssh_process: Option<Child>,
     /// Russh session handle - kept alive until dropped.
@@ -50,14 +50,27 @@ pub struct SshConfig {
     pub identity_file: Option<PathBuf>,
     /// Skip host key verification (insecure).
     pub skip_host_key_check: bool,
-    /// Requested bootstrap QUIC port range.
-    pub port_range: Option<(u16, u16)>,
-    /// Additional args to pass to `qsh-server --bootstrap`.
-    pub server_args: Option<String>,
-    /// Environment variables to pass to `qsh-server --bootstrap`.
-    pub server_env: Vec<(String, String)>,
+    /// Bootstrap options (shared with qsh-server).
+    pub bootstrap_options: BootstrapOptions,
     /// SSH implementation to use for bootstrap.
     pub mode: BootstrapMode,
+}
+
+impl SshConfig {
+    /// Get the port range from bootstrap options.
+    pub fn port_range(&self) -> Option<(u16, u16)> {
+        self.bootstrap_options.port_range
+    }
+
+    /// Get the server args from bootstrap options.
+    pub fn server_args(&self) -> Option<&str> {
+        self.bootstrap_options.extra_args.as_deref()
+    }
+
+    /// Get the server environment variables from bootstrap options.
+    pub fn server_env(&self) -> &[(String, String)] {
+        &self.bootstrap_options.extra_env
+    }
 }
 
 impl Default for SshConfig {
@@ -66,9 +79,10 @@ impl Default for SshConfig {
             connect_timeout: Duration::from_secs(30),
             identity_file: None,
             skip_host_key_check: false,
-            port_range: None,
-            server_args: None,
-            server_env: Vec::new(),
+            bootstrap_options: BootstrapOptions {
+                timeout: Duration::from_secs(30),
+                ..BootstrapOptions::default()
+            },
             mode: BootstrapMode::SshCli,
         }
     }
@@ -124,8 +138,8 @@ pub async fn bootstrap(
     };
 
     info!(
-        address = %handle.server_info.address,
-        port = handle.server_info.port,
+        address = %handle.endpoint_info.address,
+        port = handle.endpoint_info.port,
         mode = ?config.mode,
         "Bootstrap successful"
     );
@@ -165,17 +179,17 @@ async fn bootstrap_via_ssh_cli(
     }
 
     cmd.arg(remote);
-    if !config.server_env.is_empty() {
+    if !config.server_env().is_empty() {
         cmd.arg("env");
-        for (k, v) in &config.server_env {
+        for (k, v) in config.server_env() {
             cmd.arg(format!("{}={}", k, v));
         }
     }
     cmd.arg("qsh-server").arg("--bootstrap");
-    if let Some((start, end)) = config.port_range {
+    if let Some((start, end)) = config.port_range() {
         cmd.arg("--port-range").arg(format!("{}-{}", start, end));
     }
-    if let Some(args) = &config.server_args {
+    if let Some(args) = config.server_args() {
         let extra = shell_words::split(args).map_err(|e| Error::Transport {
             message: format!("invalid bootstrap server args: {}", e),
         })?;
@@ -263,11 +277,11 @@ async fn bootstrap_via_ssh_cli(
     debug!(response = %line.trim(), "Bootstrap response received");
 
     // Parse the JSON response
-    let server_info = parse_bootstrap_response(line.into_bytes())?;
+    let endpoint_info = parse_bootstrap_response(line.into_bytes())?;
 
     // Return handle that keeps SSH process alive
     Ok(BootstrapHandle {
-        server_info,
+        endpoint_info,
         _ssh_process: Some(child),
         _russh_session: None,
     })
@@ -348,16 +362,16 @@ async fn bootstrap_via_russh(
 
     // Execute qsh-server --bootstrap
     let mut bootstrap_cmd = "qsh-server --bootstrap".to_string();
-    if let Some((start, end)) = config.port_range {
+    if let Some((start, end)) = config.port_range() {
         bootstrap_cmd.push_str(&format!(" --port-range {}-{}", start, end));
     }
-    if let Some(args) = &config.server_args {
+    if let Some(args) = config.server_args() {
         bootstrap_cmd.push(' ');
         bootstrap_cmd.push_str(args);
     }
-    if !config.server_env.is_empty() {
+    if !config.server_env().is_empty() {
         let mut env_prefix = String::from("env");
-        for (k, v) in &config.server_env {
+        for (k, v) in config.server_env() {
             env_prefix.push(' ');
             env_prefix.push_str(&format!("{}={}", k, v));
         }
@@ -429,17 +443,17 @@ async fn bootstrap_via_russh(
     debug!(response = %String::from_utf8_lossy(&stdout).trim(), "Bootstrap response received");
 
     // Parse the JSON response
-    let server_info = parse_bootstrap_response(stdout)?;
+    let endpoint_info = parse_bootstrap_response(stdout)?;
 
     // Return handle that keeps russh session alive
     Ok(BootstrapHandle {
-        server_info,
+        endpoint_info,
         _ssh_process: None,
         _russh_session: Some(session),
     })
 }
 
-fn parse_bootstrap_response(output: Vec<u8>) -> Result<ServerInfo> {
+fn parse_bootstrap_response(output: Vec<u8>) -> Result<EndpointInfo> {
     let json = String::from_utf8(output).map_err(|e| Error::Protocol {
         message: format!("invalid UTF-8 in bootstrap response: {}", e),
     })?;
@@ -447,9 +461,9 @@ fn parse_bootstrap_response(output: Vec<u8>) -> Result<ServerInfo> {
     debug!(response = %json, "Bootstrap response received");
 
     let response = BootstrapResponse::parse(&json)?;
-    let server_info = response.get_server_info()?.clone();
+    let endpoint_info = response.get_endpoint_info()?.clone();
 
-    Ok(server_info)
+    Ok(endpoint_info)
 }
 
 /// Load a private key and authenticate with it.
@@ -547,7 +561,10 @@ mod tests {
         assert_eq!(config.connect_timeout, Duration::from_secs(30));
         assert!(config.identity_file.is_none());
         assert!(!config.skip_host_key_check);
-        assert!(config.port_range.is_none());
+        assert!(config.port_range().is_none());
+        assert!(config.server_args().is_none());
+        assert!(config.server_env().is_empty());
+        assert_eq!(config.bootstrap_options.timeout, Duration::from_secs(30));
         assert!(matches!(config.mode, BootstrapMode::SshCli));
     }
 

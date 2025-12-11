@@ -59,6 +59,25 @@ pub enum SshBootstrapMode {
     Russh,
 }
 
+/// Connect mode argument for CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum ConnectModeArg {
+    /// Initiate connection: actively connect to a listening peer (default)
+    #[default]
+    Initiate,
+    /// Respond mode: listen for and accept connections from an initiating peer
+    Respond,
+}
+
+impl From<ConnectModeArg> for qsh_core::ConnectMode {
+    fn from(arg: ConnectModeArg) -> Self {
+        match arg {
+            ConnectModeArg::Initiate => qsh_core::ConnectMode::Initiate,
+            ConnectModeArg::Respond => qsh_core::ConnectMode::Respond,
+        }
+    }
+}
+
 /// Prediction mode for local echo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum PredictionMode {
@@ -108,7 +127,7 @@ impl FromStr for TunnelArg {
 )]
 pub struct Cli {
     /// Remote host (user@host or host)
-    #[arg(required_unless_present = "version")]
+    #[arg(required_unless_present_any = ["bootstrap"])]
     pub destination: Option<String>,
 
     /// Command to execute on remote host (optional)
@@ -315,6 +334,10 @@ pub struct Cli {
     #[arg(long = "connect-timeout", default_value = "5", value_name = "SECONDS")]
     pub connect_timeout_secs: u64,
 
+    /// Connection mode: 'initiate' to connect to peer (default), 'respond' to listen for peer (used with --bootstrap)
+    #[arg(long = "connect-mode", default_value = "initiate", value_enum)]
+    pub connect_mode: ConnectModeArg,
+
     // Direct/standalone mode options (feature-gated)
     /// Connect directly to server (skip SSH bootstrap)
     #[cfg(feature = "standalone")]
@@ -345,6 +368,18 @@ pub struct Cli {
     #[cfg(feature = "standalone")]
     #[arg(long = "no-agent")]
     pub no_agent: bool,
+
+    /// Run as bootstrap responder: generate session key, bind QUIC listener, output JSON connection info, and wait for one connection (invoked by remote qsh-server in reverse mode)
+    #[arg(long = "bootstrap", conflicts_with = "destination")]
+    pub bootstrap: bool,
+
+    /// Bootstrap mode timeout in seconds (default: 30)
+    #[arg(long = "bootstrap-timeout", default_value = "30", value_name = "SECONDS")]
+    pub bootstrap_timeout_secs: u64,
+
+    /// Bootstrap mode bind IP (default: 0.0.0.0)
+    #[arg(long = "bootstrap-bind-ip", default_value = "0.0.0.0", value_name = "IP")]
+    pub bootstrap_bind_ip: String,
 }
 
 impl Cli {

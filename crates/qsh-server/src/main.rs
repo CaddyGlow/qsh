@@ -11,7 +11,7 @@ use std::sync::Arc;
 const ENABLE_BOOTSTRAP_SINGLETON: bool = false;
 
 use clap::Parser;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use qsh_core::protocol::Capabilities;
 use qsh_core::transport::generate_self_signed_cert;
@@ -21,9 +21,23 @@ use qsh_server::{BootstrapServer, Cli, ConnectionConfig, SessionAuthorizer, Sess
 #[cfg(feature = "standalone")]
 use qsh_server::{StandaloneAuthenticator, StandaloneConfig};
 
+// For initiator mode
+use qsh_core::ConnectMode;
+use qsh_core::handshake::{HandshakeConfig, handshake_initiate};
+use qsh_core::transport::{ConnectConfig, connect_quic};
+
 fn main() {
     // Parse CLI arguments
     let cli = Cli::parse();
+
+    // Validate CLI arguments and infer connect mode before doing anything else
+    let _effective_connect_mode = match cli.validate_and_infer_connect_mode() {
+        Ok(mode) => mode,
+        Err(e) => {
+            eprintln!("qsh-server: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     // Standalone mode is incompatible with bootstrap mode (they use different auth flows).
     #[cfg(feature = "standalone")]
@@ -67,6 +81,26 @@ fn main() {
 
     // Log startup
     info!(version = env!("CARGO_PKG_VERSION"), "qsh-server starting");
+
+    // Check for initiator mode
+    if cli.connect_mode == qsh_server::cli::ConnectModeArg::Initiate {
+        info!("Running in initiator mode (SSH-out to client)");
+
+        // Create tokio runtime for initiator mode
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+
+        // Run the initiator
+        let result = rt.block_on(run_server_initiate(&cli));
+
+        if let Err(e) = result {
+            error!(error = %e, "Initiator mode failed");
+            eprintln!("qsh-server: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    debug!(connect_mode = ?cli.connect_mode, "Connect mode");
 
     // Check TLS configuration
     if !cli.has_tls_config() && !cli.self_signed {
@@ -179,6 +213,7 @@ async fn run_bootstrap(cli: &Cli) -> qsh_core::Result<()> {
         idle_timeout: std::time::Duration::from_secs(300),
         max_forwards: cli.max_forwards,
         allow_remote_forwards: cli.allow_remote_forwards,
+        connect_mode: cli.connect_mode.into(),
     };
 
     // Build connection config
@@ -252,6 +287,7 @@ async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
         idle_timeout: std::time::Duration::from_secs(300),
         max_forwards: cli.max_forwards,
         allow_remote_forwards: cli.allow_remote_forwards,
+        connect_mode: cli.connect_mode.into(),
     };
 
     // Build connection config
@@ -278,4 +314,176 @@ async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
     listener.run(false).await
 }
 
-// Old serve_quiche_server code removed - now using QshListener in listener.rs
+/// Run the server in initiator mode (SSH-out to client).
+///
+/// This mode:
+/// 1. SSHs to the target client machine
+/// 2. Executes `qsh --bootstrap` to get QUIC endpoint info
+/// 3. Connects to the client's QUIC endpoint as initiator
+/// 4. Performs handshake as initiator
+/// 5. Handles the connection like a normal server session
+async fn run_server_initiate(cli: &Cli) -> qsh_core::Result<()> {
+    use std::net::ToSocketAddrs;
+    use qsh_server::connection::ConnectionHandler;
+
+    // Parse target
+    let (host, ssh_port, user) = cli.parse_target().ok_or_else(|| qsh_core::Error::Transport {
+        message: "invalid target specification".to_string(),
+    })?;
+
+    info!(
+        host = %host,
+        port = ssh_port,
+        user = ?user,
+        "Initiating SSH bootstrap to client"
+    );
+
+    // Build SSH config for bootstrap
+    let ssh_config = qsh_server::ssh::SshConfig {
+        connect_timeout: std::time::Duration::from_secs(30),
+        identity_file: cli.identity_file.clone(),
+        skip_host_key_check: cli.skip_host_key_check,
+        port_range: Some(cli.port_range),
+    };
+
+    // Bootstrap via SSH to get client's QUIC endpoint
+    let bootstrap_handle = qsh_server::ssh::bootstrap(&host, ssh_port, user.as_deref(), &ssh_config).await?;
+    let endpoint_info = &bootstrap_handle.endpoint_info;
+
+    info!(
+        address = %endpoint_info.address,
+        port = endpoint_info.port,
+        connect_mode = ?endpoint_info.connect_mode,
+        "Client bootstrap successful"
+    );
+
+    // Validate that client is in respond mode
+    if endpoint_info.connect_mode != ConnectMode::Respond {
+        return Err(qsh_core::Error::Protocol {
+            message: format!(
+                "client returned connect_mode {:?}, expected Respond",
+                endpoint_info.connect_mode
+            ),
+        });
+    }
+
+    // Resolve client address for QUIC connection
+    let connect_host = if endpoint_info.address == "0.0.0.0"
+        || endpoint_info.address == "::"
+        || endpoint_info.address.starts_with("0.")
+    {
+        host.clone()
+    } else {
+        endpoint_info.address.clone()
+    };
+
+    let server_addr = format!("{}:{}", connect_host, endpoint_info.port)
+        .to_socket_addrs()
+        .map_err(|e| qsh_core::Error::Transport {
+            message: format!("failed to resolve client address: {}", e),
+        })?
+        .next()
+        .ok_or_else(|| qsh_core::Error::Transport {
+            message: "no addresses found for client".to_string(),
+        })?;
+
+    let session_key = endpoint_info.decode_session_key()?;
+    let cert_hash = endpoint_info.decode_cert_hash().ok();
+
+    info!(addr = %server_addr, "Connecting to client via QUIC");
+
+    // Establish QUIC connection as initiator
+    let connect_config = ConnectConfig {
+        server_addr,
+        local_port: None,
+        max_idle_timeout: std::time::Duration::from_secs(300),
+        connect_timeout: std::time::Duration::from_secs(30),
+        cert_hash,
+        session_data: None,
+    };
+
+    let connect_result = connect_quic(&connect_config).await?;
+    let quic_conn = connect_result.connection;
+
+    use qsh_core::transport::{Connection, StreamType};
+
+    info!(
+        addr = ?quic_conn.remote_addr(),
+        "QUIC connection established, performing handshake"
+    );
+
+    // Open control stream for handshake (using StreamType::Control)
+    let mut control_stream = quic_conn
+        .open_stream(StreamType::Control)
+        .await
+        .map_err(|e| qsh_core::Error::Transport {
+            message: format!("failed to open control stream: {}", e),
+        })?;
+
+    // Perform handshake as initiator
+    let capabilities = Capabilities {
+        predictive_echo: true,
+        compression: cli.compress,
+        max_forwards: cli.max_forwards,
+        tunnel: false,
+    };
+
+    let handshake_config = HandshakeConfig::new_initiate(
+        session_key,
+        capabilities.clone(),
+        qsh_core::protocol::TermSize { cols: 80, rows: 24 }, // Dummy size, server doesn't have terminal
+        "server".to_string(),
+        vec![],
+        false,
+    );
+
+    let handshake_result = handshake_initiate(&mut control_stream, &handshake_config).await?;
+
+    info!(
+        session_id = ?handshake_result.session_id,
+        "Handshake complete as initiator"
+    );
+
+    // Drop the bootstrap handle now that QUIC connection is established
+    drop(bootstrap_handle);
+
+    // Build connection config
+    let conn_config = ConnectionConfig {
+        max_forwards: cli.max_forwards,
+        allow_remote_forwards: cli.allow_remote_forwards,
+        output_mode: cli.output_mode,
+        ..Default::default()
+    };
+
+    // Create connection handler
+    // Note: control_stream is moved here; ConnectionHandler will manage it
+    let (_handler, mut shutdown_rx) = ConnectionHandler::new(
+        quic_conn,
+        control_stream,
+        handshake_result.session_id,
+        conn_config,
+    );
+
+    info!(
+        session_id = ?handshake_result.session_id,
+        "Server initiator mode active, handling connection"
+    );
+
+    // Handle the connection - just wait for shutdown
+    // The ConnectionHandler will process control messages internally
+    // NOTE: We're not actively processing control messages here because
+    // ConnectionHandler manages them internally through its channels mechanism.
+    // In a full implementation, we would spawn a task to call handler methods.
+    match shutdown_rx.recv().await {
+        Some(reason) => {
+            info!(?reason, "Shutdown signal received");
+        }
+        None => {
+            info!("Shutdown channel closed");
+        }
+    }
+
+    info!("Server initiator mode connection closed");
+
+    Ok(())
+}

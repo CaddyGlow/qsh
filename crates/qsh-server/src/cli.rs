@@ -32,6 +32,25 @@ impl From<CliLogFormat> for qsh_core::LogFormat {
     }
 }
 
+/// Connect mode argument for CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum ConnectModeArg {
+    /// Initiate connection: SSH to client and connect to its QUIC listener (reverse mode)
+    Initiate,
+    /// Respond mode: listen for and accept QUIC connections from clients (default)
+    #[default]
+    Respond,
+}
+
+impl From<ConnectModeArg> for qsh_core::ConnectMode {
+    fn from(arg: ConnectModeArg) -> Self {
+        match arg {
+            ConnectModeArg::Initiate => qsh_core::ConnectMode::Initiate,
+            ConnectModeArg::Respond => qsh_core::ConnectMode::Respond,
+        }
+    }
+}
+
 /// qsh server - QUIC endpoint for qsh connections.
 #[derive(Debug, Parser)]
 #[command(
@@ -160,6 +179,27 @@ pub struct Cli {
     #[arg(long = "send-interval-max", default_value = "250", value_name = "MS")]
     pub send_interval_max_ms: u64,
 
+    /// Connection mode: 'respond' to listen for clients (default), 'initiate' to SSH out and connect to client (reverse mode)
+    #[arg(long = "connect-mode", default_value = "respond", value_enum)]
+    pub connect_mode: ConnectModeArg,
+
+    // Initiator mode options (when --connect-mode initiate)
+    /// Target client for initiator mode in format `[user@]host[:port]`. Required when --connect-mode=initiate
+    #[arg(long = "target", value_name = "DESTINATION")]
+    pub target: Option<String>,
+
+    /// SSH port for initiator mode
+    #[arg(long = "ssh-port", default_value = "22", value_name = "PORT")]
+    pub ssh_port: u16,
+
+    /// SSH identity file for initiator mode
+    #[arg(short = 'i', long = "identity", value_name = "FILE")]
+    pub identity_file: Option<PathBuf>,
+
+    /// Skip SSH host key verification (insecure, for initiator mode)
+    #[arg(long = "skip-host-key-check")]
+    pub skip_host_key_check: bool,
+
     // Standalone mode options (feature-gated)
     /// Run in standalone mode with SSH key authentication
     #[cfg(feature = "standalone")]
@@ -178,6 +218,67 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// Validate CLI arguments and auto-infer connect_mode where appropriate.
+    ///
+    /// Returns the effective connect mode to use, or an error if the flags are incompatible.
+    pub fn validate_and_infer_connect_mode(&self) -> Result<ConnectModeArg, String> {
+        // Bootstrap mode validation
+        if self.bootstrap {
+            // --bootstrap is incompatible with --connect-mode initiate
+            if self.connect_mode == ConnectModeArg::Initiate {
+                return Err(
+                    "--bootstrap cannot be used with --connect-mode initiate\n\
+                     Hint: --bootstrap mode accepts incoming connections (respond mode)\n\
+                     Remove --connect-mode initiate or remove --bootstrap"
+                        .to_string(),
+                );
+            }
+
+            // --bootstrap is incompatible with --target
+            if self.target.is_some() {
+                return Err(
+                    "--bootstrap cannot be used with --target\n\
+                     Hint: --bootstrap mode accepts incoming connections, it doesn't initiate them\n\
+                     Remove --target or remove --bootstrap"
+                        .to_string(),
+                );
+            }
+
+            // Auto-infer: bootstrap implies respond mode
+            return Ok(ConnectModeArg::Respond);
+        }
+
+        // Initiate mode validation
+        if self.connect_mode == ConnectModeArg::Initiate {
+            // --connect-mode initiate requires --target
+            if self.target.is_none() {
+                return Err(
+                    "--connect-mode initiate requires --target\n\
+                     Hint: specify which client to connect to\n\
+                     Example: qsh-server --connect-mode initiate --target user@client-host"
+                        .to_string(),
+                );
+            }
+
+            // Auto-infer success: initiate mode with target
+            return Ok(ConnectModeArg::Initiate);
+        }
+
+        // Respond mode (default) validation
+        if self.connect_mode == ConnectModeArg::Respond {
+            // Auto-infer: --target implies initiate mode
+            if self.target.is_some() {
+                return Ok(ConnectModeArg::Initiate);
+            }
+
+            // Respond mode is valid
+            return Ok(ConnectModeArg::Respond);
+        }
+
+        // Default to respond mode if nothing specified
+        Ok(ConnectModeArg::Respond)
+    }
+
     /// Get the socket address to bind to.
     pub fn socket_addr(&self) -> SocketAddr {
         SocketAddr::new(self.bind_addr, self.port)
@@ -225,6 +326,35 @@ impl Cli {
             // ACK delay/interval are not exposed via CLI (use Mosh defaults)
             ..qsh_core::transport::SenderConfig::server()
         }
+    }
+
+    /// Parse target destination for initiator mode.
+    ///
+    /// Returns (host, port, user) from target string like `[user@]host[:port]`.
+    /// Falls back to ssh_port if port not specified in target.
+    pub fn parse_target(&self) -> Option<(String, u16, Option<String>)> {
+        let target = self.target.as_ref()?;
+
+        // Split user@host
+        let (user, host_port) = if let Some(idx) = target.rfind('@') {
+            let user = target[..idx].to_string();
+            let host_port = &target[idx + 1..];
+            (Some(user), host_port)
+        } else {
+            (None, target.as_str())
+        };
+
+        // Split host:port
+        let (host, port) = if let Some(idx) = host_port.rfind(':') {
+            let host = host_port[..idx].to_string();
+            let port_str = &host_port[idx + 1..];
+            let port = port_str.parse().unwrap_or(self.ssh_port);
+            (host, port)
+        } else {
+            (host_port.to_string(), self.ssh_port)
+        };
+
+        Some((host, port, user))
     }
 }
 
@@ -280,6 +410,11 @@ impl Default for Cli {
             send_mindelay_ms: 8,       // Mosh server default
             send_interval_min_ms: 20,  // Mosh SEND_INTERVAL_MIN
             send_interval_max_ms: 250, // Mosh SEND_INTERVAL_MAX
+            connect_mode: ConnectModeArg::Respond,
+            target: None,
+            ssh_port: 22,
+            identity_file: None,
+            skip_host_key_check: false,
             #[cfg(feature = "standalone")]
             standalone: false,
             #[cfg(feature = "standalone")]
@@ -320,6 +455,7 @@ mod tests {
         assert!(!cli.compress);
         assert!(!cli.ipv6);
         assert_eq!(cli.session_linger_secs, DEFAULT_SESSION_LINGER_SECS);
+        assert_eq!(cli.connect_mode, ConnectModeArg::Respond);
     }
 
     #[test]
@@ -421,5 +557,38 @@ mod tests {
     fn parse_allow_remote_forwards() {
         let cli = Cli::try_parse_from(["qsh-server", "--allow-remote-forwards"]).unwrap();
         assert!(cli.allow_remote_forwards);
+    }
+
+    #[test]
+    fn parse_connect_mode_default_respond() {
+        let cli = Cli::try_parse_from(["qsh-server"]).unwrap();
+        assert_eq!(cli.connect_mode, ConnectModeArg::Respond);
+    }
+
+    #[test]
+    fn parse_connect_mode_respond() {
+        let cli = Cli::try_parse_from(["qsh-server", "--connect-mode", "respond"]).unwrap();
+        assert_eq!(cli.connect_mode, ConnectModeArg::Respond);
+    }
+
+    #[test]
+    fn parse_connect_mode_initiate() {
+        let cli = Cli::try_parse_from(["qsh-server", "--connect-mode", "initiate"]).unwrap();
+        assert_eq!(cli.connect_mode, ConnectModeArg::Initiate);
+    }
+
+    #[test]
+    fn parse_connect_mode_invalid() {
+        let result = Cli::try_parse_from(["qsh-server", "--connect-mode", "invalid"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn connect_mode_converts_to_core_type() {
+        let initiate: qsh_core::ConnectMode = ConnectModeArg::Initiate.into();
+        assert_eq!(initiate, qsh_core::ConnectMode::Initiate);
+
+        let respond: qsh_core::ConnectMode = ConnectModeArg::Respond.into();
+        assert_eq!(respond, qsh_core::ConnectMode::Respond);
     }
 }

@@ -25,7 +25,7 @@ use crate::session::SessionAuthorizer;
 use libc;
 use nix::sys::stat::Mode;
 use nix::unistd::mkfifo;
-use qsh_core::bootstrap::{BootstrapResponse, ServerInfo};
+use qsh_core::bootstrap::{BootstrapResponse, EndpointInfo};
 use qsh_core::constants::SESSION_KEY_LEN;
 use qsh_core::error::{Error, Result};
 use qsh_core::transport::{cert_hash, generate_self_signed_cert};
@@ -172,9 +172,9 @@ impl BootstrapServer {
             .map(|s| s.to_string())
             .unwrap_or_else(|| self.bind_addr.ip().to_string());
 
-        let server_info = ServerInfo::new(address, self.port(), session_key, &self.cert_hash_bytes);
+        let endpoint_info = EndpointInfo::new(address, self.port(), session_key, &self.cert_hash_bytes);
 
-        BootstrapResponse::ok(server_info)
+        BootstrapResponse::ok(endpoint_info)
     }
 
     /// Output the bootstrap response to stdout.

@@ -20,6 +20,7 @@ use qsh_core::error::Result;
 use qsh_core::protocol::SessionId;
 use qsh_core::terminal::TerminalState;
 use qsh_core::transport::{Connection, QuicConnection, QuicSender, QuicStream, StreamPair};
+use qsh_core::ConnectMode;
 
 use crate::channel::ChannelHandle;
 
@@ -175,12 +176,16 @@ impl ConnectionHandler {
 /// This tracks session state for reconnection support:
 /// - Session ID (opaque identifier)
 /// - Session key (for authentication)
+/// - Connect mode (must stay consistent across reconnections)
 /// - Terminal states that can be resumed
 pub struct ConnectionSession {
     /// Session ID.
     pub session_id: SessionId,
     /// Session key (32 bytes, for authentication).
     pub session_key: [u8; 32],
+    /// Connect mode established during initial connection.
+    /// This must remain consistent across reconnections.
+    pub connect_mode: ConnectMode,
     /// When this session was created.
     pub created_at: SystemTime,
     /// Last activity timestamp.
@@ -195,10 +200,11 @@ pub struct ConnectionSession {
 
 impl ConnectionSession {
     /// Create a new session.
-    pub fn new(session_key: [u8; 32], client_addr: SocketAddr) -> Self {
+    pub fn new(session_key: [u8; 32], client_addr: SocketAddr, connect_mode: ConnectMode) -> Self {
         Self {
             session_id: SessionId::new(),
             session_key,
+            connect_mode,
             created_at: SystemTime::now(),
             last_active_at: Mutex::new(SystemTime::now()),
             client_addr: Mutex::new(client_addr),

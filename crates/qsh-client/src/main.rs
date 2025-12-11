@@ -36,6 +36,15 @@ fn main() {
     // Parse CLI arguments
     let cli = Cli::parse();
 
+    // Validate CLI arguments and infer connect mode before doing anything else
+    let _effective_connect_mode = match cli.validate_and_infer_connect_mode() {
+        Ok(mode) => mode,
+        Err(e) => {
+            eprintln!("qsh: {}", e);
+            std::process::exit(1);
+        }
+    };
+
     // Initialize logging
     let log_format = cli.log_format.into();
     if let Err(e) = qsh_core::init_logging(cli.verbose, cli.log_file.as_deref(), log_format) {
@@ -45,6 +54,22 @@ fn main() {
 
     // Log startup
     info!(version = env!("CARGO_PKG_VERSION"), "qsh client starting");
+
+    // Check for bootstrap mode
+    if cli.bootstrap {
+        // Run in bootstrap/responder mode
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        let result = rt.block_on(async { run_bootstrap_mode(&cli).await });
+
+        match result {
+            Ok(exit_code) => std::process::exit(exit_code),
+            Err(e) => {
+                error!(error = %e, "Bootstrap mode failed");
+                eprintln!("qsh: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
 
     // Extract connection info
     let Some(host) = cli.host() else {
@@ -82,6 +107,104 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+/// Run client in bootstrap/responder mode.
+///
+/// This is invoked by a remote qsh-server via SSH. The client:
+/// 1. Creates a BootstrapEndpoint (generates session key, cert, binds port)
+/// 2. Prints bootstrap JSON to stdout (with connect_mode = Respond)
+/// 3. Creates a QUIC acceptor and waits for a single connection
+/// 4. Performs handshake as responder
+/// 5. Transitions to normal terminal session mode
+async fn run_bootstrap_mode(cli: &Cli) -> qsh_core::Result<i32> {
+    use std::net::IpAddr;
+    use qsh_core::bootstrap::{BootstrapEndpoint, BootstrapOptions};
+    use qsh_core::ConnectMode;
+    use qsh_core::transport::{ListenerConfig, QuicAcceptor};
+
+    info!("Starting bootstrap/responder mode");
+
+    // Parse bind IP
+    let bind_ip: IpAddr = cli
+        .bootstrap_bind_ip
+        .parse()
+        .map_err(|e| qsh_core::Error::Transport {
+            message: format!("invalid bind IP '{}': {}", cli.bootstrap_bind_ip, e),
+        })?;
+
+    // Create bootstrap options
+    let mut bootstrap_options = BootstrapOptions::default();
+    bootstrap_options.port_range = cli.bootstrap_port_range;
+    bootstrap_options.timeout = Duration::from_secs(cli.bootstrap_timeout_secs);
+
+    // Create bootstrap endpoint
+    let endpoint = BootstrapEndpoint::new(bind_ip, &bootstrap_options).await?;
+    info!(addr = %endpoint.bind_addr, "Bootstrap endpoint created");
+
+    // Print bootstrap response to stdout (with connect_mode = Respond)
+    endpoint.print_response(ConnectMode::Respond)?;
+    info!("Bootstrap response sent");
+
+    // Create QUIC acceptor with the endpoint's certificate and key
+    let listener_config = ListenerConfig {
+        cert_pem: endpoint.cert_pem.clone(),
+        key_pem: endpoint.key_pem.clone(),
+        idle_timeout: cli.max_idle_timeout(),
+        ticket_key: None,
+    };
+
+    let mut acceptor = QuicAcceptor::bind(endpoint.bind_addr, listener_config).await?;
+    info!(local_addr = %acceptor.local_addr(), "QUIC acceptor bound, waiting for connection");
+
+    // Accept a single connection with timeout
+    let timeout = Duration::from_secs(cli.bootstrap_timeout_secs);
+    let (quic_conn, peer_addr) = tokio::time::timeout(timeout, acceptor.accept())
+        .await
+        .map_err(|_| qsh_core::Error::Transport {
+            message: format!("bootstrap timeout after {}s", cli.bootstrap_timeout_secs),
+        })??;
+
+    info!(peer = %peer_addr, "Accepted QUIC connection from initiator");
+
+    // Build connection config for responder mode
+    let config = ConnectionConfig {
+        server_addr: peer_addr, // Not really used in responder mode
+        session_key: endpoint.session_key,
+        cert_hash: None,
+        term_size: get_term_size(),
+        term_type: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
+        env: collect_terminal_env(),
+        predictive_echo: !cli.no_prediction,
+        connect_timeout: Duration::from_secs(5),
+        zero_rtt_available: false,
+        keep_alive_interval: cli.keep_alive_interval(),
+        max_idle_timeout: cli.max_idle_timeout(),
+        session_data: None,
+        local_port: None,
+        connect_mode: ConnectMode::Respond,
+    };
+
+    // Complete qsh protocol handshake
+    let conn = ChannelConnection::from_quic(quic_conn, config.clone()).await?;
+    info!(
+        rtt = ?conn.rtt().await,
+        session_id = ?conn.session_id(),
+        "Bootstrap handshake complete, transitioning to session mode"
+    );
+
+    // Create session context for reconnection support
+    let context = SessionContext::new(config, conn.session_id());
+
+    // Create reconnectable connection wrapper
+    let reconnectable = std::sync::Arc::new(ReconnectableConnection::new(conn, context));
+
+    // Cache session data for 0-RTT reconnection
+    reconnectable.store_session_data().await;
+
+    // Build and run unified session (handles both terminal and forwards)
+    let session = Session::from_cli(reconnectable, cli, None)?;
+    session.run().await
 }
 
 #[cfg(feature = "standalone")]
@@ -137,6 +260,7 @@ async fn run_client_standalone(cli: &Cli, host: &str, user: Option<&str>) -> qsh
         max_idle_timeout: cli.max_idle_timeout(),
         session_data: None,
         local_port: Some(random_local_port()),
+        connect_mode: cli.connect_mode.into(),
     };
 
     info!(addr = %conn_config.server_addr, local_port = ?conn_config.local_port, "Connecting directly to server");
@@ -203,17 +327,21 @@ async fn run_client_ssh_bootstrap(
     });
 
     // Build SSH config from CLI options
+    let mut bootstrap_options = qsh_core::bootstrap::BootstrapOptions::default();
+    bootstrap_options.port_range = cli.bootstrap_port_range;
+    bootstrap_options.extra_env = cli.parse_bootstrap_server_env()?;
+    bootstrap_options.extra_args = if server_args.is_empty() {
+        None
+    } else {
+        Some(server_args)
+    };
+    bootstrap_options.timeout = std::time::Duration::from_secs(30);
+
     let ssh_config = SshConfig {
         connect_timeout: std::time::Duration::from_secs(30),
         identity_file: cli.identity.first().cloned(),
         skip_host_key_check: false,
-        port_range: cli.bootstrap_port_range,
-        server_env: cli.parse_bootstrap_server_env()?,
-        server_args: if server_args.is_empty() {
-            None
-        } else {
-            Some(server_args)
-        },
+        bootstrap_options,
         mode: match cli.ssh_bootstrap_mode {
             SshBootstrapMode::Ssh => BootstrapMode::SshCli,
             SshBootstrapMode::Russh => BootstrapMode::Russh,
@@ -222,19 +350,19 @@ async fn run_client_ssh_bootstrap(
 
     // Bootstrap returns a handle that keeps the SSH process alive
     let bootstrap_handle = bootstrap(host, cli.port, user, &ssh_config).await?;
-    let server_info = &bootstrap_handle.server_info;
+    let endpoint_info = &bootstrap_handle.endpoint_info;
 
     // Use bootstrap info to connect
-    let connect_host = if server_info.address == "0.0.0.0"
-        || server_info.address == "::"
-        || server_info.address.starts_with("0.")
+    let connect_host = if endpoint_info.address == "0.0.0.0"
+        || endpoint_info.address == "::"
+        || endpoint_info.address.starts_with("0.")
     {
         host.to_string()
     } else {
-        server_info.address.clone()
+        endpoint_info.address.clone()
     };
 
-    let addr = format!("{}:{}", connect_host, server_info.port)
+    let addr = format!("{}:{}", connect_host, endpoint_info.port)
         .to_socket_addrs()
         .map_err(|e| qsh_core::Error::Transport {
             message: format!("failed to resolve server address: {}", e),
@@ -244,8 +372,8 @@ async fn run_client_ssh_bootstrap(
             message: "no addresses found for server".to_string(),
         })?;
 
-    let session_key = server_info.decode_session_key()?;
-    let cert_hash = server_info.decode_cert_hash().ok();
+    let session_key = endpoint_info.decode_session_key()?;
+    let cert_hash = endpoint_info.decode_cert_hash().ok();
 
     let config = ConnectionConfig {
         server_addr: addr,
@@ -261,6 +389,7 @@ async fn run_client_ssh_bootstrap(
         max_idle_timeout: cli.max_idle_timeout(),
         session_data: None,
         local_port: Some(random_local_port()), // Mosh-style port range
+        connect_mode: cli.connect_mode.into(),
     };
 
     // Connect using the channel model (no implicit terminal)

@@ -1198,6 +1198,7 @@ async fn connect(
         max_idle_timeout: std::time::Duration::from_secs(15),
         session_data: None,
         local_port: Some(random_local_port()),
+        connect_mode: qsh_core::ConnectMode::Initiate,
     };
 
     info!(addr = %config.server_addr, "Connecting to server");
@@ -1235,26 +1236,24 @@ async fn connect(
         connect_timeout: std::time::Duration::from_secs(30),
         identity_file: cli.identity.first().cloned(),
         skip_host_key_check: false,
-        port_range: None,
-        server_args: None,
-        server_env: Vec::new(),
+        bootstrap_options: qsh_core::bootstrap::BootstrapOptions::default(),
         mode: BootstrapMode::SshCli,
     };
 
     let handle = bootstrap(host, cli.port, user, &ssh_config).await?;
-    let server_info = &handle.server_info;
+    let endpoint_info = &handle.endpoint_info;
 
     // Use bootstrap info to connect
-    let connect_host = if server_info.address == "0.0.0.0"
-        || server_info.address == "::"
-        || server_info.address.starts_with("0.")
+    let connect_host = if endpoint_info.address == "0.0.0.0"
+        || endpoint_info.address == "::"
+        || endpoint_info.address.starts_with("0.")
     {
         host.to_string()
     } else {
-        server_info.address.clone()
+        endpoint_info.address.clone()
     };
 
-    let addr = format!("{}:{}", connect_host, server_info.port)
+    let addr = format!("{}:{}", connect_host, endpoint_info.port)
         .to_socket_addrs()
         .map_err(|e| qsh_core::Error::Transport {
             message: format!("failed to resolve server address: {}", e),
@@ -1264,8 +1263,8 @@ async fn connect(
             message: "no addresses found for server".to_string(),
         })?;
 
-    let session_key = server_info.decode_session_key()?;
-    let cert_hash = server_info.decode_cert_hash().ok();
+    let session_key = endpoint_info.decode_session_key()?;
+    let cert_hash = endpoint_info.decode_cert_hash().ok();
 
     let config = qsh_client::ConnectionConfig {
         server_addr: addr,
@@ -1281,6 +1280,7 @@ async fn connect(
         max_idle_timeout: std::time::Duration::from_secs(15),
         session_data: None,
         local_port: Some(random_local_port()),
+        connect_mode: endpoint_info.connect_mode,
     };
 
     // Connect using the channel model

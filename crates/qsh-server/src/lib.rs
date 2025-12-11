@@ -21,6 +21,7 @@ pub mod listener;
 pub mod pty;
 pub mod registry;
 pub mod session;
+pub mod ssh;
 
 #[cfg(feature = "standalone")]
 pub mod standalone;

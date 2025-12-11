@@ -150,11 +150,12 @@ impl ConnectionRegistry {
     /// If the session exists but is detached, this returns the existing session
     /// for reconnection.
     ///
-    /// If no session exists, this creates a new one.
+    /// If no session exists, this creates a new one with the provided connect_mode.
     pub async fn get_or_create_session(
         &self,
         session_key: [u8; SESSION_KEY_LEN],
         client_addr: std::net::SocketAddr,
+        connect_mode: qsh_core::ConnectMode,
     ) -> Result<ConnectionSessionGuard> {
         let mut guard = self.sessions.lock().await;
 
@@ -178,8 +179,8 @@ impl ConnectionRegistry {
             });
         }
 
-        // Create new session
-        let session = Arc::new(ConnectionSession::new(session_key, client_addr));
+        // Create new session with the provided connect_mode
+        let session = Arc::new(ConnectionSession::new(session_key, client_addr, connect_mode));
         guard.insert(session_key, Arc::clone(&session));
 
         // Notify session count changed

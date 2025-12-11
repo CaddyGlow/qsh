@@ -3159,6 +3159,7 @@ name = "qsh-core"
 version = "0.1.0"
 dependencies = [
  "assert_matches",
+ "async-trait",
  "aws-lc-rs",
  "base64",
  "bincode",

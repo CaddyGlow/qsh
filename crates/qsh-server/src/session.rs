@@ -10,8 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
+use qsh_core::ConnectMode;
 use qsh_core::constants::{DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_FORWARDS, SESSION_KEY_LEN};
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{Capabilities, HelloAckPayload, HelloPayload, Message, SessionId};
@@ -31,6 +32,8 @@ pub struct SessionConfig {
     pub max_forwards: u16,
     /// Allow remote forwards.
     pub allow_remote_forwards: bool,
+    /// Connect mode (initiate or respond).
+    pub connect_mode: ConnectMode,
 }
 
 impl Default for SessionConfig {
@@ -45,6 +48,7 @@ impl Default for SessionConfig {
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
             max_forwards: DEFAULT_MAX_FORWARDS,
             allow_remote_forwards: false,
+            connect_mode: ConnectMode::Respond,
         }
     }
 }
@@ -262,6 +266,27 @@ impl PendingSession {
                 .get_session_for_resume(resume_id, &self.hello.session_key)
                 .await
             {
+                // Validate connect_mode consistency
+                if session_guard.session.connect_mode != self.config.connect_mode {
+                    let stored_mode = session_guard.session.connect_mode;
+                    let requested_mode = self.config.connect_mode;
+                    warn!(
+                        session_id = ?resume_id,
+                        stored_mode = ?stored_mode,
+                        requested_mode = ?requested_mode,
+                        "Session resume rejected: connect_mode mismatch"
+                    );
+                    let reject_message = format!(
+                        "connect_mode mismatch: session was established with {:?}, but reconnection attempted with {:?}",
+                        stored_mode,
+                        requested_mode
+                    );
+                    self.reject(reject_message).await?;
+                    return Err(Error::Protocol {
+                        message: "connect_mode mismatch on session resume".to_string(),
+                    });
+                }
+
                 // Resume successful - reuse the session ID
                 let session_id = session_guard.session.session_id;
 
@@ -347,9 +372,9 @@ impl PendingSession {
             }
         }
 
-        // Create new session
+        // Create new session with the configured connect_mode
         let session_guard = registry
-            .get_or_create_session(self.hello.session_key, client_addr)
+            .get_or_create_session(self.hello.session_key, client_addr, self.config.connect_mode)
             .await?;
         let session_id = session_guard.session.session_id;
 

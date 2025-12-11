@@ -286,6 +286,7 @@ mod tests {
 
     #[test]
     fn default_values() {
+        use crate::cli::ConnectModeArg;
         let cli = Cli::try_parse_from(["qsh", "example.com"]).unwrap();
         assert_eq!(cli.port, 22);
         assert_eq!(cli.ssh_bootstrap_mode, SshBootstrapMode::Ssh);
@@ -300,6 +301,7 @@ mod tests {
         assert_eq!(cli.overlay_key, "ctrl+shift+o");
         assert_eq!(cli.escape_key, "ctrl+^");
         assert_eq!(cli.notification_style, NotificationStyle::Minimal);
+        assert_eq!(cli.connect_mode, ConnectModeArg::Initiate);
         assert!(!cli.no_overlay);
         assert!(!cli.force_pty);
         assert!(!cli.disable_pty);
@@ -637,5 +639,47 @@ mod tests {
         .unwrap();
         let opts = cli.transfer_options();
         assert!(opts.skip_if_unchanged);
+    }
+
+    // =========================================================================
+    // Connect Mode Tests
+    // =========================================================================
+
+    #[test]
+    fn parse_connect_mode_default_initiate() {
+        use crate::cli::ConnectModeArg;
+        let cli = Cli::try_parse_from(["qsh", "example.com"]).unwrap();
+        assert_eq!(cli.connect_mode, ConnectModeArg::Initiate);
+    }
+
+    #[test]
+    fn parse_connect_mode_initiate() {
+        use crate::cli::ConnectModeArg;
+        let cli = Cli::try_parse_from(["qsh", "--connect-mode", "initiate", "example.com"]).unwrap();
+        assert_eq!(cli.connect_mode, ConnectModeArg::Initiate);
+    }
+
+    #[test]
+    fn parse_connect_mode_respond() {
+        use crate::cli::ConnectModeArg;
+        let cli = Cli::try_parse_from(["qsh", "--connect-mode", "respond", "example.com"]).unwrap();
+        assert_eq!(cli.connect_mode, ConnectModeArg::Respond);
+    }
+
+    #[test]
+    fn parse_connect_mode_invalid() {
+        let result = Cli::try_parse_from(["qsh", "--connect-mode", "invalid", "example.com"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn connect_mode_converts_to_core_type() {
+        use crate::cli::ConnectModeArg;
+
+        let initiate: qsh_core::ConnectMode = ConnectModeArg::Initiate.into();
+        assert_eq!(initiate, qsh_core::ConnectMode::Initiate);
+
+        let respond: qsh_core::ConnectMode = ConnectModeArg::Respond.into();
+        assert_eq!(respond, qsh_core::ConnectMode::Respond);
     }
 }

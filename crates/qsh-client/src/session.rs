@@ -115,6 +115,7 @@ mod tests {
             max_idle_timeout: std::time::Duration::from_secs(30),
             session_data: None,
             local_port: None,
+            connect_mode: qsh_core::ConnectMode::Initiate,
         }
     }
 
