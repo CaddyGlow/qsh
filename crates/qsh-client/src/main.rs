@@ -68,10 +68,10 @@ fn main() {
     }
 
     // Check for attach mode
-    if let Some(ref pipe_path) = cli.attach {
+    if cli.attach.is_some() {
         // Run in attach mode - connect to existing bootstrap session
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-        let result = rt.block_on(async { run_attach_mode(pipe_path).await });
+        let result = rt.block_on(async { run_attach_mode(cli.attach.as_deref()).await });
 
         match result {
             Ok(exit_code) => std::process::exit(exit_code),
@@ -357,6 +357,8 @@ async fn run_bootstrap_mode(cli: &Cli) -> qsh_core::Result<i32> {
                         if let Err(e) = terminal.send_input(&attach_buf[..n], false).await {
                             warn!(error = %e, "Failed to send to terminal channel");
                             break;
+                        } else {
+                            debug!(len = n, "Forwarded attach input to terminal");
                         }
                     }
                     Err(e) => {
@@ -427,16 +429,21 @@ async fn run_bootstrap_mode(cli: &Cli) -> qsh_core::Result<i32> {
 ///
 /// Connects to an existing bootstrap session via named pipe.
 /// Provides stdin/stdout/stderr access to the remote shell.
-async fn run_attach_mode(pipe_path: &str) -> qsh_core::Result<i32> {
+async fn run_attach_mode(pipe_path: Option<&str>) -> qsh_core::Result<i32> {
     use std::path::Path;
-    use qsh_client::attach::connect_attach;
+    use qsh_client::attach::{connect_attach, find_latest_pipe};
     use qsh_client::terminal::RawModeGuard;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    info!(pipe = %pipe_path, "Attaching to bootstrap session");
+    let resolved_path = match pipe_path {
+        Some(p) if !p.is_empty() => Path::new(p).to_path_buf(),
+        _ => find_latest_pipe()?,
+    };
+
+    info!(pipe = %resolved_path.display(), "Attaching to bootstrap session");
 
     // Connect to the pipe
-    let mut pipe = connect_attach(Path::new(pipe_path)).await?;
+    let mut pipe = connect_attach(&resolved_path).await?;
     info!("Connected to bootstrap session");
 
     // Put terminal in raw mode
@@ -462,10 +469,12 @@ async fn run_attach_mode(pipe_path: &str) -> qsh_core::Result<i32> {
                         break;
                     }
                     Ok(n) => {
+                        debug!(len = n, "Attach stdin read");
                         if let Err(e) = pipe.write_all(&stdin_buf[..n]).await {
                             warn!(error = %e, "Failed to write to pipe");
                             break;
                         }
+                        let _ = pipe.flush().await;
                     }
                     Err(e) => {
                         warn!(error = %e, "Failed to read from stdin");
@@ -770,4 +779,3 @@ fn format_user_host(user: Option<&str>, host: &str) -> String {
         None => host.to_string(),
     }
 }
-

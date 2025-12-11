@@ -323,16 +323,16 @@ impl ChannelConnection {
                             ),
                         })?;
 
-                    // Accept output stream from server
-                    let (stream_type, output_stream) = quic.accept_stream().await?;
-                    if !matches!(stream_type, StreamType::ChannelOut(id) if id == existing.channel_id)
-                    {
-                        warn!(
-                            expected = %existing.channel_id,
-                            got = ?stream_type,
-                            "Unexpected stream type during channel restore"
-                        );
-                    }
+                    // Accept output stream from server (any direction)
+                    let (_stream_type, output_stream) = loop {
+                        let (ty, stream) = quic.accept_stream().await?;
+                        match ty {
+                            StreamType::ChannelOut(id) if id == existing.channel_id => break (ty, stream),
+                            StreamType::ChannelIn(id) if id == existing.channel_id => break (ty, stream),
+                            StreamType::ChannelBidi(id) if id == existing.channel_id => break (ty, stream),
+                            other => debug!(?other, "Ignoring stream while restoring terminal output"),
+                        }
+                    };
 
                     // Create restored terminal channel
                     let terminal = TerminalChannel::restore(
@@ -490,14 +490,19 @@ impl ChannelConnection {
             .open_stream(StreamType::ChannelIn(channel_id))
             .await?;
 
-        // Accept output stream from server
+        // Accept output stream from server.
+        // In reverse-initiate flows the server may send ChannelIn (direction flipped),
+        // so accept either ChannelOut or ChannelIn for this channel.
         let output_stream = loop {
             let (ty, stream) = self.quic.accept_stream().await?;
-            if matches!(ty, StreamType::ChannelOut(id) if id == channel_id) {
-                break stream;
+            match ty {
+                StreamType::ChannelOut(id) if id == channel_id => break stream,
+                StreamType::ChannelIn(id) if id == channel_id => break stream,
+                StreamType::ChannelBidi(id) if id == channel_id => break stream,
+                other => {
+                    debug!(?other, "Ignoring stream while waiting for terminal output");
+                }
             }
-            // Other streams may arrive - handle them or ignore
-            debug!(?ty, "Ignoring stream while waiting for terminal output");
         };
 
         let initial_state = match accept_data {

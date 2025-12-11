@@ -313,7 +313,7 @@ impl TerminalChannel {
             return Err(Error::ConnectionClosed);
         }
 
-        debug!(
+        info!(
             channel_id = %self.inner.channel_id,
             seq = input.sequence,
             len = input.data.len(),

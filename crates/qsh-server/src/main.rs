@@ -360,6 +360,17 @@ async fn run_server_initiate(cli: &Cli) -> qsh_core::Result<()> {
         "Client bootstrap successful"
     );
 
+    // Surface attach pipe hint (reverse/attach workflow) to the operator.
+    if let Some(ref pipe) = endpoint_info.attach_pipe {
+        info!(
+            attach_pipe = pipe.as_str(),
+            "Client exposed attach pipe; run `ssh{}{} -t qsh --attach {}` from the target host",
+            user.as_ref().map(|u| format!(" {}@", u)).unwrap_or_default(),
+            host,
+            pipe
+        );
+    }
+
     // Validate that client is in respond mode
     if endpoint_info.connect_mode != ConnectMode::Respond {
         return Err(qsh_core::Error::Protocol {
@@ -446,9 +457,8 @@ async fn run_server_initiate(cli: &Cli) -> qsh_core::Result<()> {
         session_id = ?handshake_result.session_id,
         "Handshake complete as initiator"
     );
-
-    // Drop the bootstrap handle now that QUIC connection is established
-    drop(bootstrap_handle);
+    // Keep the bootstrap SSH session alive for the lifetime of this connection so
+    // the remote `qsh --bootstrap` process (and its attach pipe) stay available.
 
     // Build connection config
     let conn_config = ConnectionConfig {
@@ -471,6 +481,31 @@ async fn run_server_initiate(cli: &Cli) -> qsh_core::Result<()> {
         session_id = ?handshake_result.session_id,
         "Server initiator mode active, handling connection"
     );
+
+    // Spawn stream acceptor (mirrors listener.rs) so we consume ChannelOut/ChannelBidi
+    // streams sent by the responder. Without this, the responder sees resets on its
+    // output streams and the terminal never shows up.
+    let quic_for_accept = handler.quic().await;
+    let accept_handler = handler.clone();
+    let accept_task = tokio::spawn(async move {
+        loop {
+            match quic_for_accept.accept_stream().await {
+                Ok((stream_type, stream)) => {
+                    let h = accept_handler.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = h.handle_incoming_stream(stream_type, stream).await {
+                            warn!(error = %e, "Failed to handle incoming stream");
+                        }
+                    });
+                }
+                Err(Error::ConnectionClosed) => break,
+                Err(e) => {
+                    warn!(error = %e, "Failed to accept stream");
+                    break;
+                }
+            }
+        }
+    });
 
     // Heartbeat timer to keep connection alive (server sends heartbeats in initiator mode)
     let mut heartbeat_timer = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -576,6 +611,8 @@ async fn run_server_initiate(cli: &Cli) -> qsh_core::Result<()> {
             }
         }
     }
+
+    accept_task.abort();
 
     // Cleanup
     handler.shutdown().await;

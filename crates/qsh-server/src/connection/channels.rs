@@ -646,32 +646,50 @@ impl ConnectionHandler {
     ) -> Result<()> {
         use qsh_core::transport::StreamType;
 
-        match stream_type {
-            StreamType::ChannelIn(channel_id) | StreamType::ChannelBidi(channel_id) => {
-                // Clone the handle to release the lock before the potentially long-running
-                // handle_incoming_stream call (which loops forever reading input).
-                let handle = {
-                    let channels = self.channels.read().await;
-                    channels.get(&channel_id).cloned()
-                };
-                if let Some(handle) = handle {
-                    handle.handle_incoming_stream(stream).await
-                } else {
-                    warn!(channel_id = %channel_id, "Stream for unknown channel");
-                    Err(Error::Protocol {
-                        message: format!("unknown channel: {}", channel_id),
-                    })
+        let mapped = match stream_type {
+            // Some transports/roles invert ChannelOut/ChannelIn; accept Out as input, too.
+            StreamType::ChannelOut(id) => Some((StreamType::ChannelIn(id), id)),
+            StreamType::ChannelIn(id) | StreamType::ChannelBidi(id) => Some((stream_type, id)),
+            _ => None,
+        };
+
+        if let Some((effective_type, channel_id)) = mapped {
+            match effective_type {
+                StreamType::ChannelIn(_id) | StreamType::ChannelBidi(_id) => {
+                    // Clone the handle to release the lock before the potentially long-running
+                    // handle_incoming_stream call (which loops forever reading input).
+                    let handle = {
+                        let channels = self.channels.read().await;
+                        channels.get(&channel_id).cloned()
+                    };
+                    if let Some(handle) = handle {
+                        info!(channel_id = %channel_id, stream_type = ?effective_type, "Dispatching incoming channel stream");
+                        handle.handle_incoming_stream(stream).await
+                    } else {
+                        warn!(channel_id = %channel_id, "Stream for unknown channel");
+                        Err(Error::Protocol {
+                            message: format!("unknown channel: {}", channel_id),
+                        })
+                    }
                 }
+                _ => unreachable!(),
             }
-            StreamType::ChannelOut(channel_id) => {
-                // Server doesn't expect to receive output streams from client
-                warn!(channel_id = %channel_id, "Unexpected ChannelOut stream from client");
-                Ok(())
-            }
-            StreamType::Control => {
-                // Control stream is handled separately
-                warn!("Unexpected additional control stream");
-                Ok(())
+        } else {
+            match stream_type {
+                StreamType::ChannelOut(channel_id) => {
+                    // Unexpected in normal flows, but harmless
+                    warn!(channel_id = %channel_id, "Unexpected ChannelOut stream from client");
+                    Ok(())
+                }
+                StreamType::ChannelIn(channel_id) | StreamType::ChannelBidi(channel_id) => {
+                    warn!(channel_id = %channel_id, "Unexpected channel stream without mapping");
+                    Ok(())
+                }
+                StreamType::Control => {
+                    // Control stream is handled separately
+                    warn!("Unexpected additional control stream");
+                    Ok(())
+                }
             }
         }
     }

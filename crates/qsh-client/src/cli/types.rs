@@ -383,7 +383,13 @@ pub struct Cli {
 
     /// Attach to a bootstrap session via named pipe.
     /// The pipe path is output in the bootstrap JSON response.
-    #[arg(long = "attach", value_name = "PIPE", conflicts_with_all = ["destination", "bootstrap"])]
+    #[arg(
+        long = "attach",
+        value_name = "PIPE",
+        num_args = 0..=1,
+        default_missing_value = "",
+        conflicts_with_all = ["destination", "bootstrap"]
+    )]
     pub attach: Option<String>,
 }
 
