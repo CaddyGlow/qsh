@@ -201,10 +201,7 @@ mod tests {
 
         // Write a fake length that's too large
         let fake_len = (MAX_MESSAGE_SIZE + 1) as u32;
-        client
-            .write_all(&fake_len.to_le_bytes())
-            .await
-            .unwrap();
+        client.write_all(&fake_len.to_le_bytes()).await.unwrap();
 
         let result = read_message(&mut server).await;
         assert!(matches!(result, Err(Error::Protocol { .. })));

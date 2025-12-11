@@ -20,11 +20,13 @@
 
 // Compile-time check: only one backend can be enabled
 #[cfg(all(feature = "quiche-backend", feature = "s2n-quic-backend"))]
-compile_error!("Only one QUIC backend can be enabled at a time. Enable either `quiche-backend` or `s2n-quic-backend`, not both.");
+compile_error!(
+    "Only one QUIC backend can be enabled at a time. Enable either `quiche-backend` or `s2n-quic-backend`, not both."
+);
 
+pub mod common;
 pub mod config;
 pub mod sender;
-pub mod common;
 
 // Re-export sender types
 pub use sender::{SenderConfig, TransportSender};
@@ -45,12 +47,10 @@ pub use config::{EndpointRole, TlsCredentials, TransportConfigBuilder};
 // quiche backend exports (default)
 #[cfg(feature = "quiche-backend")]
 pub use quiche::{
-    QuicheConnection, QuicheSender, QuicheStream,
-    QuicheStreamReader, QuicheStreamWriter,
-    classify_io_error, enable_error_queue,
-    client_config, server_config, server_config_with_ticket_key, generate_self_signed_cert,
-    load_certs_from_pem, load_key_from_pem, cert_hash,
-    build_config,
+    QuicheConnection, QuicheSender, QuicheStream, QuicheStreamReader, QuicheStreamWriter,
+    build_config, cert_hash, classify_io_error, client_config, enable_error_queue,
+    generate_self_signed_cert, load_certs_from_pem, load_key_from_pem, server_config,
+    server_config_with_ticket_key,
 };
 
 // Re-export with generic names for backend-agnostic code (quiche)
@@ -64,12 +64,10 @@ pub use quiche::QuicheStream as QuicStream;
 // s2n-quic backend exports (alternative)
 #[cfg(feature = "s2n-quic-backend")]
 pub use s2n::{
-    S2nConnection, S2nSender, S2nStream,
-    S2nStreamReader, S2nStreamWriter,
-    classify_io_error, enable_error_queue,
-    client_config, server_config, server_config_with_ticket_key, generate_self_signed_cert,
-    load_certs_from_pem, load_key_from_pem, cert_hash,
-    build_client_config, build_server_config,
+    S2nConnection, S2nSender, S2nStream, S2nStreamReader, S2nStreamWriter, build_client_config,
+    build_server_config, cert_hash, classify_io_error, client_config, enable_error_queue,
+    generate_self_signed_cert, load_certs_from_pem, load_key_from_pem, server_config,
+    server_config_with_ticket_key,
 };
 
 // Re-export with generic names for backend-agnostic code (s2n-quic)

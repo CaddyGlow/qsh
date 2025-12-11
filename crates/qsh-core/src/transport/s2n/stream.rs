@@ -4,8 +4,8 @@
 //! bidirectional and unidirectional variants, along with AsyncRead/AsyncWrite
 //! adapters for tokio compatibility.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::{Buf, BytesMut};
 use s2n_quic::stream::{BidirectionalStream, ReceiveStream, SendStream};
@@ -14,8 +14,8 @@ use tokio::sync::Mutex;
 use crate::error::{Error, Result};
 use crate::protocol::{Codec, Message};
 
-use super::sender::S2nSender;
 use super::StreamPair;
+use super::sender::S2nSender;
 
 // =============================================================================
 // Stream Direction
@@ -120,11 +120,9 @@ impl S2nStream {
     /// Get a cloneable sender handle for spawning background send tasks.
     pub fn sender(&self) -> Option<S2nSender> {
         match self.inner.direction {
-            StreamDirection::Bidirectional | StreamDirection::SendOnly => {
-                Some(S2nSender {
-                    inner: Arc::clone(&self.inner),
-                })
-            }
+            StreamDirection::Bidirectional | StreamDirection::SendOnly => Some(S2nSender {
+                inner: Arc::clone(&self.inner),
+            }),
             StreamDirection::RecvOnly => None,
         }
     }
@@ -201,14 +199,23 @@ impl S2nStream {
                 match Arc::try_unwrap(self.inner) {
                     Ok(inner) => {
                         // For bidirectional streams, we already have split halves
-                        let send = inner.send.ok_or_else(|| Error::Transport {
-                            message: "no send stream available".to_string(),
-                        })?.into_inner();
-                        let recv = inner.recv.ok_or_else(|| Error::Transport {
-                            message: "no recv stream available".to_string(),
-                        })?.into_inner();
+                        let send = inner
+                            .send
+                            .ok_or_else(|| Error::Transport {
+                                message: "no send stream available".to_string(),
+                            })?
+                            .into_inner();
+                        let recv = inner
+                            .recv
+                            .ok_or_else(|| Error::Transport {
+                                message: "no recv stream available".to_string(),
+                            })?
+                            .into_inner();
                         let recv_buf = inner.recv_buf.into_inner();
-                        Ok((S2nStreamWriter::new(send), S2nStreamReader::new(recv, Some(recv_buf))))
+                        Ok((
+                            S2nStreamWriter::new(send),
+                            S2nStreamReader::new(recv, Some(recv_buf)),
+                        ))
                     }
                     Err(_) => Err(Error::Transport {
                         message: "cannot split stream while sender handles exist".to_string(),
@@ -239,9 +246,12 @@ impl StreamPair for S2nStream {
             let data = data?;
             if let Some(ref send) = inner.send {
                 let mut stream = send.lock().await;
-                stream.write_all(&data).await.map_err(|e| Error::Transport {
-                    message: format!("stream send failed: {}", e),
-                })?;
+                stream
+                    .write_all(&data)
+                    .await
+                    .map_err(|e| Error::Transport {
+                        message: format!("stream send failed: {}", e),
+                    })?;
                 stream.flush().await.map_err(|e| Error::Transport {
                     message: format!("stream flush failed: {}", e),
                 })?;
@@ -272,9 +282,12 @@ impl StreamPair for S2nStream {
                 let mut chunk = [0u8; 4096];
                 let n = if let Some(ref recv) = inner.recv {
                     let mut stream = recv.lock().await;
-                    stream.read(&mut chunk).await.map_err(|e| Error::Transport {
-                        message: format!("stream recv failed: {}", e),
-                    })?
+                    stream
+                        .read(&mut chunk)
+                        .await
+                        .map_err(|e| Error::Transport {
+                            message: format!("stream recv failed: {}", e),
+                        })?
                 } else {
                     return Err(Error::ConnectionClosed);
                 };

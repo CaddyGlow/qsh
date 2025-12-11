@@ -27,10 +27,7 @@ pub enum ForwardType {
         target_port: u16,
     },
     /// Forwarded TCP/IP (-R remote forward): server listens, client connects to target.
-    Forwarded {
-        bound_host: String,
-        bound_port: u16,
-    },
+    Forwarded { bound_host: String, bound_port: u16 },
     /// Dynamic SOCKS5 forward (-D).
     Dynamic {
         target_host: String,
@@ -171,7 +168,9 @@ impl ForwardChannel {
         let channel = Self { inner };
 
         // Start relay immediately since we have both the TCP stream and QUIC stream
-        channel.start_relay_immediate(tcp_stream, quic_stream, shutdown_rx).await;
+        channel
+            .start_relay_immediate(tcp_stream, quic_stream, shutdown_rx)
+            .await;
 
         Ok(channel)
     }
@@ -310,7 +309,9 @@ impl ForwardChannel {
         let (mut target_read, mut target_write) = target_stream.into_split();
 
         // Task: target -> QUIC (returns the sender so we can finish it)
-        let quic_sender = quic_stream.sender().expect("forward stream must support sending");
+        let quic_sender = quic_stream
+            .sender()
+            .expect("forward stream must support sending");
         let quic_sender_for_finish = quic_sender.clone();
         let target_to_quic = {
             let channel_id = channel_id;

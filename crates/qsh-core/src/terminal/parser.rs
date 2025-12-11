@@ -146,6 +146,18 @@ impl Perform for Performer<'_> {
                 state.cursor.row = row.saturating_sub(1).min(max_row);
                 state.cursor.col = col.saturating_sub(1).min(max_col);
             }
+            // Horizontal Position Absolute (CHA/HPA) - CSI Ps G or `
+            ('G', []) | ('`', []) => {
+                let col = if param0 == 0 { 1 } else { param0 };
+                let max_col = state.screen().cols().saturating_sub(1);
+                state.cursor.col = col.saturating_sub(1).min(max_col);
+            }
+            // Vertical Position Absolute (VPA) - CSI Ps d
+            ('d', []) => {
+                let row = if param0 == 0 { 1 } else { param0 };
+                let max_row = state.screen().rows().saturating_sub(1);
+                state.cursor.row = row.saturating_sub(1).min(max_row);
+            }
             // Erase Display (ED)
             ('J', []) => {
                 let cursor = state.cursor;
@@ -565,6 +577,16 @@ mod tests {
         parser.process(b"\x1b[5;10H");
         assert_eq!(parser.state().cursor.row, 4);
         assert_eq!(parser.state().cursor.col, 9);
+
+        // VPA sets absolute row, preserves column
+        parser.process(b"\x1b[12d");
+        assert_eq!(parser.state().cursor.row, 11);
+        assert_eq!(parser.state().cursor.col, 9);
+
+        // CHA/HPA sets absolute column, preserves row
+        parser.process(b"\x1b[3G");
+        assert_eq!(parser.state().cursor.row, 11);
+        assert_eq!(parser.state().cursor.col, 2);
     }
 
     #[test]

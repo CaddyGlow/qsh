@@ -118,11 +118,8 @@ pub async fn connect_quic(config: &ConnectConfig) -> Result<ConnectResult<Quiche
         }
 
         // Receive response
-        let recv_result = tokio::time::timeout(
-            Duration::from_millis(100),
-            socket.recv_from(&mut buf),
-        )
-        .await;
+        let recv_result =
+            tokio::time::timeout(Duration::from_millis(100), socket.recv_from(&mut buf)).await;
 
         match recv_result {
             Ok(Ok((len, from))) => {

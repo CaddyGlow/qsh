@@ -8,25 +8,24 @@
 use super::common;
 
 // Sub-modules
-mod stream;
+mod client;
+mod config;
 mod connection;
 mod sender;
-mod config;
-mod client;
 mod server;
+mod stream;
 
 // Re-export public types
-pub use stream::{QuicheStream, QuicheStreamReader, QuicheStreamWriter};
+pub use client::connect_quic;
+pub use config::{build_config, client_config, server_config, server_config_with_ticket_key};
 pub use connection::{QuicheConnection, QuicheConnectionInner};
 pub use sender::QuicheSender;
-pub use config::{client_config, server_config, server_config_with_ticket_key, build_config};
-pub use client::connect_quic;
 pub use server::QuicheAcceptor;
+pub use stream::{QuicheStream, QuicheStreamReader, QuicheStreamWriter};
 
 // Re-export common utilities for convenience
 pub use common::{
-    cert_hash, generate_self_signed_cert, load_certs_from_pem, load_key_from_pem,
-    classify_io_error, enable_error_queue,
-    channel_stream_header, channel_bidi_header,
-    CHANNEL_STREAM_MAGIC, CHANNEL_BIDI_MAGIC,
+    CHANNEL_BIDI_MAGIC, CHANNEL_STREAM_MAGIC, cert_hash, channel_bidi_header,
+    channel_stream_header, classify_io_error, enable_error_queue, generate_self_signed_cert,
+    load_certs_from_pem, load_key_from_pem,
 };

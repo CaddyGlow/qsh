@@ -371,12 +371,12 @@ mod tests {
         assert_eq!(predictions.len(), 2);
 
         // Check that predictions exist at correct positions
-        let has_h_at_0_0 = predictions.iter().any(|((col, row), p)| {
-            *col == 0 && *row == 0 && p.char == 'h'
-        });
-        let has_i_at_1_0 = predictions.iter().any(|((col, row), p)| {
-            *col == 1 && *row == 0 && p.char == 'i'
-        });
+        let has_h_at_0_0 = predictions
+            .iter()
+            .any(|((col, row), p)| *col == 0 && *row == 0 && p.char == 'h');
+        let has_i_at_1_0 = predictions
+            .iter()
+            .any(|((col, row), p)| *col == 1 && *row == 0 && p.char == 'i');
         assert!(has_h_at_0_0);
         assert!(has_i_at_1_0);
     }
@@ -446,7 +446,9 @@ mod tests {
 
         // Create terminal state with matching character
         let mut state = TerminalState::new(80, 24);
-        state.screen_mut().set(0, 0, qsh_core::terminal::Cell::new('X'));
+        state
+            .screen_mut()
+            .set(0, 0, qsh_core::terminal::Cell::new('X'));
         state.cursor.col = 1;
         state.cursor.row = 0;
 
@@ -469,7 +471,9 @@ mod tests {
 
         // But server has 'Y' - this is a misprediction
         let mut state = TerminalState::new(80, 24);
-        state.screen_mut().set(0, 0, qsh_core::terminal::Cell::new('Y'));
+        state
+            .screen_mut()
+            .set(0, 0, qsh_core::terminal::Cell::new('Y'));
         state.cursor.col = 1;
         state.cursor.row = 0;
 

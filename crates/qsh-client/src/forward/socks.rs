@@ -55,9 +55,11 @@ impl Socks5Proxy {
 
     /// Start the proxy, accepting connections until shutdown.
     pub async fn start(self) -> Result<ProxyHandle> {
-        let listener = TcpListener::bind(self.bind_addr).await.map_err(|e| Error::Forward {
-            message: format!("failed to bind to {}: {}", self.bind_addr, e),
-        })?;
+        let listener = TcpListener::bind(self.bind_addr)
+            .await
+            .map_err(|e| Error::Forward {
+                message: format!("failed to bind to {}: {}", self.bind_addr, e),
+            })?;
 
         let actual_addr = listener.local_addr().map_err(|e| Error::Forward {
             message: format!("failed to get local address: {}", e),
@@ -199,7 +201,10 @@ impl Socks5Proxy {
 
         // Close the channel properly to release server resources
         let channel_id = channel.channel_id();
-        if let Err(e) = connection.close_channel(channel_id, ChannelCloseReason::Normal).await {
+        if let Err(e) = connection
+            .close_channel(channel_id, ChannelCloseReason::Normal)
+            .await
+        {
             warn!(channel_id = %channel_id, error = %e, "Failed to close channel");
         }
         debug!(channel_id = %channel_id, "SOCKS5 connection completed");
@@ -211,9 +216,12 @@ impl Socks5Proxy {
     async fn socks5_handshake(stream: &mut TcpStream) -> Result<(String, u16)> {
         // Read version and auth method count
         let mut header = [0u8; 2];
-        stream.read_exact(&mut header).await.map_err(|e| Error::Protocol {
-            message: format!("failed to read SOCKS5 header: {}", e),
-        })?;
+        stream
+            .read_exact(&mut header)
+            .await
+            .map_err(|e| Error::Protocol {
+                message: format!("failed to read SOCKS5 header: {}", e),
+            })?;
 
         if header[0] != SOCKS5_VERSION {
             return Err(Error::Protocol {
@@ -223,9 +231,12 @@ impl Socks5Proxy {
 
         let nmethods = header[1] as usize;
         let mut methods = vec![0u8; nmethods];
-        stream.read_exact(&mut methods).await.map_err(|e| Error::Protocol {
-            message: format!("failed to read auth methods: {}", e),
-        })?;
+        stream
+            .read_exact(&mut methods)
+            .await
+            .map_err(|e| Error::Protocol {
+                message: format!("failed to read auth methods: {}", e),
+            })?;
 
         // We only support no-auth
         if !methods.contains(&SOCKS5_NO_AUTH) {
@@ -237,15 +248,21 @@ impl Socks5Proxy {
         }
 
         // Send auth method selection (no auth)
-        stream.write_all(&[SOCKS5_VERSION, SOCKS5_NO_AUTH]).await.map_err(|e| Error::Protocol {
-            message: format!("failed to send auth response: {}", e),
-        })?;
+        stream
+            .write_all(&[SOCKS5_VERSION, SOCKS5_NO_AUTH])
+            .await
+            .map_err(|e| Error::Protocol {
+                message: format!("failed to send auth response: {}", e),
+            })?;
 
         // Read connection request
         let mut request = [0u8; 4];
-        stream.read_exact(&mut request).await.map_err(|e| Error::Protocol {
-            message: format!("failed to read request: {}", e),
-        })?;
+        stream
+            .read_exact(&mut request)
+            .await
+            .map_err(|e| Error::Protocol {
+                message: format!("failed to read request: {}", e),
+            })?;
 
         if request[0] != SOCKS5_VERSION {
             return Err(Error::Protocol {
@@ -265,53 +282,74 @@ impl Socks5Proxy {
         let (target_host, target_port) = match atyp {
             SOCKS5_ATYP_IPV4 => {
                 let mut addr = [0u8; 4];
-                stream.read_exact(&mut addr).await.map_err(|e| Error::Protocol {
-                    message: format!("failed to read IPv4 address: {}", e),
-                })?;
+                stream
+                    .read_exact(&mut addr)
+                    .await
+                    .map_err(|e| Error::Protocol {
+                        message: format!("failed to read IPv4 address: {}", e),
+                    })?;
                 let ip = Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]);
 
                 let mut port_bytes = [0u8; 2];
-                stream.read_exact(&mut port_bytes).await.map_err(|e| Error::Protocol {
-                    message: format!("failed to read port: {}", e),
-                })?;
+                stream
+                    .read_exact(&mut port_bytes)
+                    .await
+                    .map_err(|e| Error::Protocol {
+                        message: format!("failed to read port: {}", e),
+                    })?;
                 let port = u16::from_be_bytes(port_bytes);
 
                 (ip.to_string(), port)
             }
             SOCKS5_ATYP_DOMAIN => {
                 let mut len = [0u8; 1];
-                stream.read_exact(&mut len).await.map_err(|e| Error::Protocol {
-                    message: format!("failed to read domain length: {}", e),
-                })?;
+                stream
+                    .read_exact(&mut len)
+                    .await
+                    .map_err(|e| Error::Protocol {
+                        message: format!("failed to read domain length: {}", e),
+                    })?;
 
                 let mut domain = vec![0u8; len[0] as usize];
-                stream.read_exact(&mut domain).await.map_err(|e| Error::Protocol {
-                    message: format!("failed to read domain: {}", e),
-                })?;
+                stream
+                    .read_exact(&mut domain)
+                    .await
+                    .map_err(|e| Error::Protocol {
+                        message: format!("failed to read domain: {}", e),
+                    })?;
 
                 let host = String::from_utf8(domain).map_err(|e| Error::Protocol {
                     message: format!("invalid domain encoding: {}", e),
                 })?;
 
                 let mut port_bytes = [0u8; 2];
-                stream.read_exact(&mut port_bytes).await.map_err(|e| Error::Protocol {
-                    message: format!("failed to read port: {}", e),
-                })?;
+                stream
+                    .read_exact(&mut port_bytes)
+                    .await
+                    .map_err(|e| Error::Protocol {
+                        message: format!("failed to read port: {}", e),
+                    })?;
                 let port = u16::from_be_bytes(port_bytes);
 
                 (host, port)
             }
             SOCKS5_ATYP_IPV6 => {
                 let mut addr = [0u8; 16];
-                stream.read_exact(&mut addr).await.map_err(|e| Error::Protocol {
-                    message: format!("failed to read IPv6 address: {}", e),
-                })?;
+                stream
+                    .read_exact(&mut addr)
+                    .await
+                    .map_err(|e| Error::Protocol {
+                        message: format!("failed to read IPv6 address: {}", e),
+                    })?;
                 let ip = Ipv6Addr::from(addr);
 
                 let mut port_bytes = [0u8; 2];
-                stream.read_exact(&mut port_bytes).await.map_err(|e| Error::Protocol {
-                    message: format!("failed to read port: {}", e),
-                })?;
+                stream
+                    .read_exact(&mut port_bytes)
+                    .await
+                    .map_err(|e| Error::Protocol {
+                        message: format!("failed to read port: {}", e),
+                    })?;
                 let port = u16::from_be_bytes(port_bytes);
 
                 (ip.to_string(), port)
@@ -336,12 +374,19 @@ impl Socks5Proxy {
             reply,
             0x00, // reserved
             SOCKS5_ATYP_IPV4,
-            0, 0, 0, 0, // 0.0.0.0
-            0, 0, // port 0
+            0,
+            0,
+            0,
+            0, // 0.0.0.0
+            0,
+            0, // port 0
         ];
-        stream.write_all(&response).await.map_err(|e| Error::Protocol {
-            message: format!("failed to send reply: {}", e),
-        })?;
+        stream
+            .write_all(&response)
+            .await
+            .map_err(|e| Error::Protocol {
+                message: format!("failed to send reply: {}", e),
+            })?;
         Ok(())
     }
 
@@ -355,9 +400,7 @@ impl Socks5Proxy {
 
             // Permission/auth errors -> connection not allowed
             Error::AuthenticationFailed => SOCKS5_REP_CONN_NOT_ALLOWED,
-            Error::Channel { message } if message.contains("denied") => {
-                SOCKS5_REP_CONN_NOT_ALLOWED
-            }
+            Error::Channel { message } if message.contains("denied") => SOCKS5_REP_CONN_NOT_ALLOWED,
 
             // Everything else -> general failure
             _ => SOCKS5_REP_GENERAL_FAILURE,

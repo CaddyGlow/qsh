@@ -581,9 +581,9 @@ impl TerminalState {
         let mut output = String::with_capacity(self.screen().cells.len() * 2);
 
         // Reset terminal and clear screen
-        output.push_str("\x1b[2J");   // Clear entire screen
-        output.push_str("\x1b[H");    // Move cursor to home position
-        output.push_str("\x1b[0m");   // Reset all attributes
+        output.push_str("\x1b[2J"); // Clear entire screen
+        output.push_str("\x1b[H"); // Move cursor to home position
+        output.push_str("\x1b[0m"); // Reset all attributes
 
         let screen = self.screen();
         let mut last_fg = Color::Default;

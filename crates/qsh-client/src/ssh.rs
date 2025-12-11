@@ -54,6 +54,8 @@ pub struct SshConfig {
     pub port_range: Option<(u16, u16)>,
     /// Additional args to pass to `qsh-server --bootstrap`.
     pub server_args: Option<String>,
+    /// Environment variables to pass to `qsh-server --bootstrap`.
+    pub server_env: Vec<(String, String)>,
     /// SSH implementation to use for bootstrap.
     pub mode: BootstrapMode,
 }
@@ -66,6 +68,7 @@ impl Default for SshConfig {
             skip_host_key_check: false,
             port_range: None,
             server_args: None,
+            server_env: Vec::new(),
             mode: BootstrapMode::SshCli,
         }
     }
@@ -162,6 +165,12 @@ async fn bootstrap_via_ssh_cli(
     }
 
     cmd.arg(remote);
+    if !config.server_env.is_empty() {
+        cmd.arg("env");
+        for (k, v) in &config.server_env {
+            cmd.arg(format!("{}={}", k, v));
+        }
+    }
     cmd.arg("qsh-server").arg("--bootstrap");
     if let Some((start, end)) = config.port_range {
         cmd.arg("--port-range").arg(format!("{}-{}", start, end));
@@ -345,6 +354,14 @@ async fn bootstrap_via_russh(
     if let Some(args) = &config.server_args {
         bootstrap_cmd.push(' ');
         bootstrap_cmd.push_str(args);
+    }
+    if !config.server_env.is_empty() {
+        let mut env_prefix = String::from("env");
+        for (k, v) in &config.server_env {
+            env_prefix.push(' ');
+            env_prefix.push_str(&format!("{}={}", k, v));
+        }
+        bootstrap_cmd = format!("{} {}", env_prefix, bootstrap_cmd);
     }
 
     channel

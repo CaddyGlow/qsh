@@ -57,7 +57,8 @@ impl CursorPredictor {
 
     /// Clear confirmed cell predictions up to the given sequence.
     pub fn confirm_cells(&mut self, sequence: u64) {
-        self.cell_predictions.retain(|_, pred| pred.sequence > sequence);
+        self.cell_predictions
+            .retain(|_, pred| pred.sequence > sequence);
     }
 
     /// Reset cursor and cell predictions.
@@ -119,7 +120,8 @@ impl CursorPredictor {
                         epoch: self.prediction_epoch,
                         timestamp: Instant::now(),
                     };
-                    self.cell_predictions.insert((pred_col, pred_row), cell_pred);
+                    self.cell_predictions
+                        .insert((pred_col, pred_row), cell_pred);
 
                     // Also add to pending queue for legacy tracking
                     pending.push_back(Prediction {

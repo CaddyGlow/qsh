@@ -54,11 +54,9 @@ impl QuicheAcceptor {
         quiche_config.set_max_idle_timeout(config.idle_timeout.as_millis() as u64);
 
         // Bind UDP socket
-        let socket = UdpSocket::bind(addr)
-            .await
-            .map_err(|e| Error::Transport {
-                message: format!("failed to bind server: {}", e),
-            })?;
+        let socket = UdpSocket::bind(addr).await.map_err(|e| Error::Transport {
+            message: format!("failed to bind server: {}", e),
+        })?;
 
         let local_addr = socket.local_addr().map_err(|e| Error::Transport {
             message: format!("failed to get local address: {}", e),
@@ -119,7 +117,8 @@ impl QuicheAcceptor {
 
     /// Set the idle timeout for new connections.
     pub fn set_idle_timeout(&mut self, timeout: Duration) {
-        self.quiche_config.set_max_idle_timeout(timeout.as_millis() as u64);
+        self.quiche_config
+            .set_max_idle_timeout(timeout.as_millis() as u64);
     }
 
     /// Accept the next established QUIC connection.
@@ -172,7 +171,8 @@ impl QuicheAcceptor {
                             message: format!("failed to accept connection: {}", e),
                         })?;
 
-                        self.connections.insert(scid_vec.clone(), (conn, Some(from)));
+                        self.connections
+                            .insert(scid_vec.clone(), (conn, Some(from)));
                         scid_vec
                     } else {
                         // Unknown connection
@@ -241,7 +241,11 @@ impl QuicheAcceptor {
                     loop {
                         match conn.send(&mut self.send_buf) {
                             Ok((write, send_info)) => {
-                                if let Err(e) = self.socket.send_to(&self.send_buf[..write], send_info.to).await {
+                                if let Err(e) = self
+                                    .socket
+                                    .send_to(&self.send_buf[..write], send_info.to)
+                                    .await
+                                {
                                     debug!(error = %e, "send failed");
                                 }
                             }

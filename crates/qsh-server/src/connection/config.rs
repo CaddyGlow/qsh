@@ -6,6 +6,7 @@ use qsh_core::constants::{
     DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_LINGER_TIMEOUT_SECS, DEFAULT_MAX_CHANNELS,
     DEFAULT_MAX_FILE_TRANSFERS, DEFAULT_MAX_FORWARDS, DEFAULT_MAX_TERMINALS,
 };
+use qsh_core::protocol::OutputMode;
 
 /// Configuration for connection-level limits.
 #[derive(Debug, Clone)]
@@ -24,6 +25,8 @@ pub struct ConnectionConfig {
     pub linger_timeout: Duration,
     /// Idle timeout for channels.
     pub idle_timeout: Duration,
+    /// Terminal output mode.
+    pub output_mode: OutputMode,
 }
 
 impl Default for ConnectionConfig {
@@ -36,6 +39,7 @@ impl Default for ConnectionConfig {
             allow_remote_forwards: false,
             linger_timeout: Duration::from_secs(DEFAULT_LINGER_TIMEOUT_SECS),
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
+            output_mode: OutputMode::Direct,
         }
     }
 }
@@ -52,7 +56,13 @@ mod tests {
         assert_eq!(config.max_forwards, DEFAULT_MAX_FORWARDS);
         assert_eq!(config.max_file_transfers, DEFAULT_MAX_FILE_TRANSFERS);
         assert!(!config.allow_remote_forwards);
-        assert_eq!(config.linger_timeout, Duration::from_secs(DEFAULT_LINGER_TIMEOUT_SECS));
-        assert_eq!(config.idle_timeout, Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS));
+        assert_eq!(
+            config.linger_timeout,
+            Duration::from_secs(DEFAULT_LINGER_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            config.idle_timeout,
+            Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
+        );
     }
 }

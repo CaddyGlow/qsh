@@ -17,8 +17,8 @@ use tracing::debug;
 use crate::error::{Error, Result};
 use crate::protocol::ChannelId;
 
-use super::common::{channel_bidi_header, channel_stream_header, classify_io_error};
 use super::common::{CHANNEL_BIDI_MAGIC, CHANNEL_STREAM_MAGIC};
+use super::common::{channel_bidi_header, channel_stream_header, classify_io_error};
 use super::stream::{QuicheStream, QuicheStreamReader, QuicheStreamWriter};
 use crate::transport::{Connection, StreamPair, StreamType};
 
@@ -159,7 +159,10 @@ impl QuicheConnectionInner {
         loop {
             // Check our closed flag first (set by close_connection())
             if self.closed.load(Ordering::SeqCst) {
-                debug!(stream_id, "stream_recv: closed flag is set, returning ConnectionClosed");
+                debug!(
+                    stream_id,
+                    "stream_recv: closed flag is set, returning ConnectionClosed"
+                );
                 return Err(Error::ConnectionClosed);
             }
 
@@ -502,10 +505,7 @@ impl QuicheConnectionInner {
         );
 
         // Prefer the active path when computing RTT, fall back to the first path.
-        let selected = paths
-            .iter()
-            .find(|p| p.active)
-            .or_else(|| paths.first());
+        let selected = paths.iter().find(|p| p.active).or_else(|| paths.first());
 
         // Clamp SRTT so application-level RTT does not grow without bound.
         const RTT_CLAMP_MS: u64 = 1_000;

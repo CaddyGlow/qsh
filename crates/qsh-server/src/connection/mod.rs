@@ -72,11 +72,13 @@ pub struct ConnectionHandler {
     /// Session ID for this connection.
     session_id: SessionId,
     /// Pending global requests awaiting reply (request_id -> reply sender).
-    pending_global_requests: Mutex<HashMap<u32, oneshot::Sender<qsh_core::protocol::GlobalReplyResult>>>,
+    pending_global_requests:
+        Mutex<HashMap<u32, oneshot::Sender<qsh_core::protocol::GlobalReplyResult>>>,
     /// Next global request ID.
     next_global_request_id: std::sync::atomic::AtomicU32,
     /// Pending server-initiated channel opens awaiting accept/reject.
-    pending_channel_opens: Mutex<HashMap<qsh_core::protocol::ChannelId, oneshot::Sender<Result<()>>>>,
+    pending_channel_opens:
+        Mutex<HashMap<qsh_core::protocol::ChannelId, oneshot::Sender<Result<()>>>>,
     /// Remote forward listeners (bind_host:bind_port -> listener handle).
     remote_forward_listeners: Mutex<HashMap<(String, u16), RemoteForwardListener>>,
     /// Channel for signaling connection shutdown with reason.
@@ -97,7 +99,9 @@ impl ConnectionHandler {
 
         // Extract sender before wrapping stream - allows concurrent send/recv
         // The control stream is always bidirectional, so sender() should return Some
-        let control_sender = control.sender().expect("control stream must support sending");
+        let control_sender = control
+            .sender()
+            .expect("control stream must support sending");
 
         let handler = Arc::new(Self {
             quic: RwLock::new(Arc::new(quic)),
@@ -147,7 +151,12 @@ impl ConnectionHandler {
     pub async fn shutdown(&self) {
         use qsh_core::protocol::ChannelCloseReason;
 
-        let _ = self.shutdown_tx.lock().await.send(ShutdownReason::RegistryShutdown).await;
+        let _ = self
+            .shutdown_tx
+            .lock()
+            .await
+            .send(ShutdownReason::RegistryShutdown)
+            .await;
 
         // Shutdown all remote forward listeners
         self.shutdown_remote_forward_listeners().await;
@@ -231,7 +240,10 @@ impl ConnectionSession {
 
     /// Save terminal state for reconnection.
     pub async fn save_terminal_state(&self, channel_seq: u64, state: TerminalState) {
-        self.terminal_states.write().await.insert(channel_seq, state);
+        self.terminal_states
+            .write()
+            .await
+            .insert(channel_seq, state);
     }
 
     /// Get saved terminal state.

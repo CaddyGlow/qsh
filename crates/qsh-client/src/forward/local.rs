@@ -55,9 +55,11 @@ impl LocalForwarder {
     ///
     /// Returns a handle that can be used to stop the forwarder.
     pub async fn start(mut self) -> Result<ForwarderHandle> {
-        let listener = TcpListener::bind(self.bind_addr).await.map_err(|e| Error::Forward {
-            message: format!("failed to bind to {}: {}", self.bind_addr, e),
-        })?;
+        let listener = TcpListener::bind(self.bind_addr)
+            .await
+            .map_err(|e| Error::Forward {
+                message: format!("failed to bind to {}: {}", self.bind_addr, e),
+            })?;
 
         let actual_addr = listener.local_addr().map_err(|e| Error::Forward {
             message: format!("failed to get local address: {}", e),
@@ -196,7 +198,10 @@ impl LocalForwarder {
 
         // Close the channel properly to release server resources
         let channel_id = channel.channel_id();
-        if let Err(e) = connection.close_channel(channel_id, ChannelCloseReason::Normal).await {
+        if let Err(e) = connection
+            .close_channel(channel_id, ChannelCloseReason::Normal)
+            .await
+        {
             warn!(channel_id = %channel_id, error = %e, "Failed to close channel");
         }
 

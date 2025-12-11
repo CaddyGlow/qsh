@@ -14,9 +14,7 @@ use tracing::{debug, info};
 
 use qsh_core::constants::{DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_FORWARDS, SESSION_KEY_LEN};
 use qsh_core::error::{Error, Result};
-use qsh_core::protocol::{
-    Capabilities, HelloAckPayload, HelloPayload, Message, SessionId,
-};
+use qsh_core::protocol::{Capabilities, HelloAckPayload, HelloPayload, Message, SessionId};
 use qsh_core::transport::{Connection, QuicConnection, QuicStream, StreamPair, StreamType};
 use rand::Rng;
 
@@ -50,7 +48,6 @@ impl Default for SessionConfig {
         }
     }
 }
-
 
 /// Controls which session keys may attach.
 #[derive(Debug, Default)]
@@ -202,7 +199,10 @@ impl PendingSession {
     pub async fn accept_channel_model(
         mut self,
         conn_config: ConnectionConfig,
-    ) -> Result<(Arc<ConnectionHandler>, tokio::sync::mpsc::Receiver<ShutdownReason>)> {
+    ) -> Result<(
+        Arc<ConnectionHandler>,
+        tokio::sync::mpsc::Receiver<ShutdownReason>,
+    )> {
         let session_id = SessionId::new();
 
         // Send HelloAck (channels created separately via ChannelOpen)
@@ -243,7 +243,10 @@ impl PendingSession {
         mut self,
         conn_config: ConnectionConfig,
         registry: &crate::registry::ConnectionRegistry,
-    ) -> Result<(Arc<ConnectionHandler>, tokio::sync::mpsc::Receiver<ShutdownReason>)> {
+    ) -> Result<(
+        Arc<ConnectionHandler>,
+        tokio::sync::mpsc::Receiver<ShutdownReason>,
+    )> {
         let client_addr = self.quic.remote_addr();
 
         // Check if this is a session resume attempt
@@ -255,8 +258,9 @@ impl PendingSession {
             );
 
             // Look up existing session by ID
-            if let Some(session_guard) =
-                registry.get_session_for_resume(resume_id, &self.hello.session_key).await
+            if let Some(session_guard) = registry
+                .get_session_for_resume(resume_id, &self.hello.session_key)
+                .await
             {
                 // Resume successful - reuse the session ID
                 let session_id = session_guard.session.session_id;
@@ -278,8 +282,11 @@ impl PendingSession {
                     let existing_channels = handler.get_existing_channels().await;
 
                     // Update the handler's QUIC connection to the new one
-                    let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel::<ShutdownReason>(1);
-                    handler.reconnect(self.quic, self.control, shutdown_tx).await;
+                    let (shutdown_tx, shutdown_rx) =
+                        tokio::sync::mpsc::channel::<ShutdownReason>(1);
+                    handler
+                        .reconnect(self.quic, self.control, shutdown_tx)
+                        .await;
 
                     // Send HelloAck with existing session ID and channel info
                     let ack = HelloAckPayload {
@@ -325,7 +332,10 @@ impl PendingSession {
                     ConnectionHandler::new(self.quic, self.control, session_id, conn_config);
 
                 // Attach new handler to session
-                session_guard.session.attach(Arc::clone(&handler), client_addr).await;
+                session_guard
+                    .session
+                    .attach(Arc::clone(&handler), client_addr)
+                    .await;
 
                 return Ok((handler, shutdown_rx));
             } else {
@@ -367,7 +377,10 @@ impl PendingSession {
             ConnectionHandler::new(self.quic, self.control, session_id, conn_config);
 
         // Attach handler to session
-        session_guard.session.attach(Arc::clone(&handler), client_addr).await;
+        session_guard
+            .session
+            .attach(Arc::clone(&handler), client_addr)
+            .await;
 
         debug!(
             session_id = ?session_id,
@@ -378,7 +391,6 @@ impl PendingSession {
         Ok((handler, shutdown_rx))
     }
 }
-
 
 #[cfg(test)]
 mod tests {

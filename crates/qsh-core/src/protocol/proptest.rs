@@ -201,12 +201,13 @@ fn arb_message_base() -> impl Strategy<Value = Message> {
     prop_oneof![
         // Control messages
         arb_hello().prop_map(Message::Hello),
-        (arb_channel_id(), any::<u16>(), any::<u16>())
-            .prop_map(|(ch, cols, rows)| Message::Resize(ResizePayload {
+        (arb_channel_id(), any::<u16>(), any::<u16>()).prop_map(
+            |(ch, cols, rows)| Message::Resize(ResizePayload {
                 channel_id: Some(ch),
                 cols,
                 rows,
-            })),
+            })
+        ),
         (arb_shutdown_reason(), any::<Option<String>>())
             .prop_map(|(reason, message)| Message::Shutdown(ShutdownPayload { reason, message })),
         // Channel open

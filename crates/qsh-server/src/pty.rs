@@ -163,26 +163,17 @@ impl Pty {
                 // Using libc directly since we have raw fds after fork
                 if unsafe { libc::dup2(slave_fd, libc::STDIN_FILENO) } < 0 {
                     return Err(Error::Pty {
-                        message: format!(
-                            "dup2 stdin failed: {}",
-                            std::io::Error::last_os_error()
-                        ),
+                        message: format!("dup2 stdin failed: {}", std::io::Error::last_os_error()),
                     });
                 }
                 if unsafe { libc::dup2(slave_fd, libc::STDOUT_FILENO) } < 0 {
                     return Err(Error::Pty {
-                        message: format!(
-                            "dup2 stdout failed: {}",
-                            std::io::Error::last_os_error()
-                        ),
+                        message: format!("dup2 stdout failed: {}", std::io::Error::last_os_error()),
                     });
                 }
                 if unsafe { libc::dup2(slave_fd, libc::STDERR_FILENO) } < 0 {
                     return Err(Error::Pty {
-                        message: format!(
-                            "dup2 stderr failed: {}",
-                            std::io::Error::last_os_error()
-                        ),
+                        message: format!("dup2 stderr failed: {}", std::io::Error::last_os_error()),
                     });
                 }
 
@@ -522,7 +513,10 @@ mod tests {
         // This test may fail in CI without a proper TTY
         let result = Pty::spawn(80, 24, None, Some("echo hello"), &[]);
         if let Err(e) = &result {
-            eprintln!("PTY spawn with command failed (may be expected in CI): {}", e);
+            eprintln!(
+                "PTY spawn with command failed (may be expected in CI): {}",
+                e
+            );
         }
         // Clean up if successful
         if let Ok(pty) = result {

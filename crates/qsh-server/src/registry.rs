@@ -213,10 +213,7 @@ impl ConnectionRegistry {
 
         // Verify session key matches (prevents hijacking)
         if &stored_key != session_key {
-            warn!(
-                ?session_id,
-                "Session resume rejected: session key mismatch"
-            );
+            warn!(?session_id, "Session resume rejected: session key mismatch");
             return None;
         }
 
@@ -332,9 +329,11 @@ pub struct ConnectionSessionGuard {
 impl ConnectionSessionGuard {
     /// Request removal of this session.
     pub fn request_removal(&self) {
-        let _ = self.cleanup_tx.send(ConnectionRegistryCommand::RemoveSession(
-            self.session.session_key,
-        ));
+        let _ = self
+            .cleanup_tx
+            .send(ConnectionRegistryCommand::RemoveSession(
+                self.session.session_key,
+            ));
     }
 }
 

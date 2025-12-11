@@ -85,19 +85,23 @@ impl HeartbeatTracker {
         let now = Instant::now();
 
         // Add to pending list (prune old entries > 5s to prevent unbounded growth)
-        self.pending.retain(|(_, sent_at)| sent_at.elapsed().as_secs() < 5);
+        self.pending
+            .retain(|(_, sent_at)| sent_at.elapsed().as_secs() < 5);
         self.pending.push((seq, now));
 
         // Include reply if we have a recent peer timestamp
-        let (timestamp_reply, seq_reply) = if let (Some(peer_ts), Some(peer_seq), Some(received_at)) =
-            (self.last_peer_timestamp, self.last_peer_seq, self.last_peer_received_at)
-        {
-            // Correct for hold time (how long we held it before sending)
-            let hold_ms = received_at.elapsed().as_millis() as u16;
-            (peer_ts.wrapping_add(hold_ms), peer_seq)
-        } else {
-            (u16::MAX, 0) // No reply yet
-        };
+        let (timestamp_reply, seq_reply) =
+            if let (Some(peer_ts), Some(peer_seq), Some(received_at)) = (
+                self.last_peer_timestamp,
+                self.last_peer_seq,
+                self.last_peer_received_at,
+            ) {
+                // Correct for hold time (how long we held it before sending)
+                let hold_ms = received_at.elapsed().as_millis() as u16;
+                (peer_ts.wrapping_add(hold_ms), peer_seq)
+            } else {
+                (u16::MAX, 0) // No reply yet
+            };
 
         HeartbeatPayload {
             timestamp,
@@ -108,10 +112,7 @@ impl HeartbeatTracker {
     }
 
     /// Process a received heartbeat. Returns the measured RTT if available.
-    pub fn receive_heartbeat(
-        &mut self,
-        payload: &HeartbeatPayload,
-    ) -> Option<Duration> {
+    pub fn receive_heartbeat(&mut self, payload: &HeartbeatPayload) -> Option<Duration> {
         // Store peer's timestamp and seq for echoing back
         self.last_peer_timestamp = Some(payload.timestamp);
         self.last_peer_seq = Some(payload.seq);
@@ -120,7 +121,11 @@ impl HeartbeatTracker {
         // If this is a reply, find matching pending heartbeat by sequence number
         if payload.has_reply() && payload.seq_reply != 0 {
             // Find the pending heartbeat with matching sequence number
-            if let Some(idx) = self.pending.iter().position(|(seq, _)| *seq == payload.seq_reply) {
+            if let Some(idx) = self
+                .pending
+                .iter()
+                .position(|(seq, _)| *seq == payload.seq_reply)
+            {
                 let (seq, sent_at) = self.pending.remove(idx);
                 let rtt_ms = sent_at.elapsed().as_secs_f64() * 1000.0;
 

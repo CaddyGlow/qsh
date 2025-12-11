@@ -28,7 +28,7 @@ use nix::unistd::mkfifo;
 use qsh_core::bootstrap::{BootstrapResponse, ServerInfo};
 use qsh_core::constants::SESSION_KEY_LEN;
 use qsh_core::error::{Error, Result};
-use qsh_core::transport::{generate_self_signed_cert, cert_hash};
+use qsh_core::transport::{cert_hash, generate_self_signed_cert};
 
 /// Bootstrap server that handles single-connection bootstrap mode.
 pub struct BootstrapServer {
@@ -64,7 +64,10 @@ impl BootstrapServer {
         // Extract DER from PEM for hash computation
         let cert_der = extract_first_cert_der(&cert_pem)?;
         let cert_hash_bytes = cert_hash(&cert_der);
-        debug!(hash_len = cert_hash_bytes.len(), "Computed certificate hash");
+        debug!(
+            hash_len = cert_hash_bytes.len(),
+            "Computed certificate hash"
+        );
 
         // Find an available port and create socket
         // For quiche backend, we pre-bind the socket for sharing with QshListener

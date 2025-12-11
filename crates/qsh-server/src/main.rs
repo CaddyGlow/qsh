@@ -16,9 +16,7 @@ use tracing::{error, info, warn};
 use qsh_core::protocol::Capabilities;
 use qsh_core::transport::generate_self_signed_cert;
 use qsh_server::listener::{QshListener, ServerConfig};
-use qsh_server::{
-    BootstrapServer, Cli, ConnectionConfig, SessionAuthorizer, SessionConfig,
-};
+use qsh_server::{BootstrapServer, Cli, ConnectionConfig, SessionAuthorizer, SessionConfig};
 
 #[cfg(feature = "standalone")]
 use qsh_server::{StandaloneAuthenticator, StandaloneConfig};
@@ -152,12 +150,11 @@ async fn run_bootstrap(cli: &Cli) -> qsh_core::Result<()> {
     let _pipe_task;
     if ENABLE_BOOTSTRAP_SINGLETON {
         let pipe_path = qsh_server::bootstrap::bootstrap_pipe_path();
-        _pipe_guard = Some(
-            qsh_server::bootstrap::create_pipe(&pipe_path)
-                .map_err(|e| qsh_core::Error::Transport {
-                    message: format!("failed to create bootstrap pipe: {}", e),
-                })?,
-        );
+        _pipe_guard = Some(qsh_server::bootstrap::create_pipe(&pipe_path).map_err(|e| {
+            qsh_core::Error::Transport {
+                message: format!("failed to create bootstrap pipe: {}", e),
+            }
+        })?);
         _pipe_task = Some(qsh_server::bootstrap::spawn_pipe_listener(
             pipe_path,
             bootstrap.clone(),
@@ -188,6 +185,7 @@ async fn run_bootstrap(cli: &Cli) -> qsh_core::Result<()> {
     let conn_config = ConnectionConfig {
         max_forwards: cli.max_forwards,
         allow_remote_forwards: cli.allow_remote_forwards,
+        output_mode: cli.output_mode,
         ..Default::default()
     };
 
@@ -260,6 +258,7 @@ async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
     let conn_config = ConnectionConfig {
         max_forwards: cli.max_forwards,
         allow_remote_forwards: cli.allow_remote_forwards,
+        output_mode: cli.output_mode,
         ..Default::default()
     };
 

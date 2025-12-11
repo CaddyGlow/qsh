@@ -11,7 +11,9 @@ use tracing::debug;
 use crate::error::{Error, Result};
 
 use super::connection::S2nConnection;
-use super::stats::{ConnectionStats, HandshakeState, SessionTicketHandler, SessionTicketState, StatsSubscriber};
+use super::stats::{
+    ConnectionStats, HandshakeState, SessionTicketHandler, SessionTicketState, StatsSubscriber,
+};
 use super::{ConnectConfig, ConnectResult};
 
 /// Wait for a session ticket to be delivered, with timeout.
@@ -23,15 +25,14 @@ async fn wait_for_session_ticket(
         return Some(ticket);
     }
 
-    let _ = tokio::time::timeout(timeout, state.notify.notified()).await.ok()?;
+    let _ = tokio::time::timeout(timeout, state.notify.notified())
+        .await
+        .ok()?;
     state.ticket()
 }
 
 /// Wait for the resumption flag to be set, with timeout.
-async fn wait_for_resumption_flag(
-    state: &Arc<SessionTicketState>,
-    timeout: Duration,
-) -> bool {
+async fn wait_for_resumption_flag(state: &Arc<SessionTicketState>, timeout: Duration) -> bool {
     if state.is_resumed() {
         return true;
     }
@@ -108,9 +109,12 @@ pub async fn connect_quic(config: &ConnectConfig) -> Result<ConnectResult<S2nCon
     // SAFETY: This is used for bootstrap mode where certificates are verified via hash pinning
     // instead of traditional CA chains. The cert_hash is verified after the handshake completes.
     unsafe {
-        tls_builder.config_mut().disable_x509_verification().map_err(|e| Error::Transport {
-            message: format!("failed to disable x509 verification: {}", e),
-        })?;
+        tls_builder
+            .config_mut()
+            .disable_x509_verification()
+            .map_err(|e| Error::Transport {
+                message: format!("failed to disable x509 verification: {}", e),
+            })?;
     }
 
     let tls = tls_builder.build().map_err(|e| Error::Transport {
@@ -151,8 +155,7 @@ pub async fn connect_quic(config: &ConnectConfig) -> Result<ConnectResult<S2nCon
     })?;
 
     // Create connect handle
-    let connect = Connect::new(config.server_addr)
-        .with_server_name("qsh-server");
+    let connect = Connect::new(config.server_addr).with_server_name("qsh-server");
 
     // Connect with timeout
     let connection = tokio::time::timeout(config.connect_timeout, client.connect(connect))
@@ -176,7 +179,8 @@ pub async fn connect_quic(config: &ConnectConfig) -> Result<ConnectResult<S2nCon
         stats,
         handshake_state,
         Arc::clone(&session_state),
-    ).await?;
+    )
+    .await?;
 
     // Note: Certificate hash verification should be done at the application layer
     // s2n-quic doesn't expose the peer certificate chain directly
@@ -184,10 +188,8 @@ pub async fn connect_quic(config: &ConnectConfig) -> Result<ConnectResult<S2nCon
     // Wait briefly for session ticket delivery so callers can cache it for the
     // next reconnect. If a ticket hasn't arrived yet, the connection can still
     // export it later via `session_data()`.
-    let resumed =
-        wait_for_resumption_flag(&session_state, Duration::from_millis(500)).await;
-    let session_data =
-        wait_for_session_ticket(&session_state, Duration::from_millis(500)).await;
+    let resumed = wait_for_resumption_flag(&session_state, Duration::from_millis(500)).await;
+    let session_data = wait_for_session_ticket(&session_state, Duration::from_millis(500)).await;
 
     Ok(ConnectResult {
         connection: s2n_conn,

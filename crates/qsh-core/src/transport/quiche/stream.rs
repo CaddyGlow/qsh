@@ -212,7 +212,10 @@ impl StreamPair for QuicheStream {
                             trace!(stream_id = stream_id, msg = ?msg, "quiche stream recv (EOF)");
                             return Ok(msg);
                         }
-                        trace!(stream_id = stream_id, "quiche stream recv EOF (no more messages)");
+                        trace!(
+                            stream_id = stream_id,
+                            "quiche stream recv EOF (no more messages)"
+                        );
                         return Err(Error::ConnectionClosed);
                     }
                     Err(e) => {
@@ -315,7 +318,11 @@ pub struct QuicheStreamReader {
 
 impl QuicheStreamReader {
     /// Create a new stream reader.
-    pub(crate) fn new(conn: Arc<QuicheConnectionInner>, stream_id: u64, initial_buffer: Option<BytesMut>) -> Self {
+    pub(crate) fn new(
+        conn: Arc<QuicheConnectionInner>,
+        stream_id: u64,
+        initial_buffer: Option<BytesMut>,
+    ) -> Self {
         Self {
             conn,
             stream_id,
@@ -348,7 +355,10 @@ impl tokio::io::AsyncRead for QuicheStreamReader {
             let mut temp_buf = vec![0u8; capacity];
             match conn.stream_recv(stream_id, &mut temp_buf).await {
                 Ok(n) => Ok((temp_buf, n)),
-                Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
+                Err(e) => Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                )),
             }
         };
 

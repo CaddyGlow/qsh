@@ -2,9 +2,9 @@
 
 use std::time::{Duration, Instant};
 
+use super::NotificationEngine;
 use super::format::{format_escape_key, human_readable_duration, human_readable_duration_short};
 use super::state::{NotificationState, SERVER_LATE_THRESHOLD};
-use super::NotificationEngine;
 
 #[test]
 fn test_new_engine() {
@@ -120,30 +120,60 @@ fn test_network_error() {
 
 #[test]
 fn test_time_formatting_seconds() {
-    assert_eq!(human_readable_duration(Duration::from_secs(0)), "0 seconds ago");
-    assert_eq!(human_readable_duration(Duration::from_secs(30)), "30 seconds ago");
-    assert_eq!(human_readable_duration(Duration::from_secs(59)), "59 seconds ago");
+    assert_eq!(
+        human_readable_duration(Duration::from_secs(0)),
+        "0 seconds ago"
+    );
+    assert_eq!(
+        human_readable_duration(Duration::from_secs(30)),
+        "30 seconds ago"
+    );
+    assert_eq!(
+        human_readable_duration(Duration::from_secs(59)),
+        "59 seconds ago"
+    );
 }
 
 #[test]
 fn test_time_formatting_minutes() {
     assert_eq!(human_readable_duration(Duration::from_secs(60)), "1:00 ago");
     assert_eq!(human_readable_duration(Duration::from_secs(90)), "1:30 ago");
-    assert_eq!(human_readable_duration(Duration::from_secs(3599)), "59:59 ago");
+    assert_eq!(
+        human_readable_duration(Duration::from_secs(3599)),
+        "59:59 ago"
+    );
 }
 
 #[test]
 fn test_time_formatting_hours() {
-    assert_eq!(human_readable_duration(Duration::from_secs(3600)), "1:00:00 ago");
-    assert_eq!(human_readable_duration(Duration::from_secs(3661)), "1:01:01 ago");
-    assert_eq!(human_readable_duration(Duration::from_secs(7322)), "2:02:02 ago");
+    assert_eq!(
+        human_readable_duration(Duration::from_secs(3600)),
+        "1:00:00 ago"
+    );
+    assert_eq!(
+        human_readable_duration(Duration::from_secs(3661)),
+        "1:01:01 ago"
+    );
+    assert_eq!(
+        human_readable_duration(Duration::from_secs(7322)),
+        "2:02:02 ago"
+    );
 }
 
 #[test]
 fn test_time_formatting_short() {
-    assert_eq!(human_readable_duration_short(Duration::from_secs(30)), "30s");
-    assert_eq!(human_readable_duration_short(Duration::from_secs(90)), "1:30");
-    assert_eq!(human_readable_duration_short(Duration::from_secs(3661)), "1:01:01");
+    assert_eq!(
+        human_readable_duration_short(Duration::from_secs(30)),
+        "30s"
+    );
+    assert_eq!(
+        human_readable_duration_short(Duration::from_secs(90)),
+        "1:30"
+    );
+    assert_eq!(
+        human_readable_duration_short(Duration::from_secs(3661)),
+        "1:01:01"
+    );
 }
 
 #[test]

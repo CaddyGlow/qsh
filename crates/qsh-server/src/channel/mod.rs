@@ -5,13 +5,13 @@
 //! - `FileTransferChannel`: File upload/download operations
 //! - `ForwardChannel`: Port forwarding (direct-tcpip, forwarded-tcpip, dynamic)
 
-mod terminal;
 mod file_transfer;
 mod forward;
+mod terminal;
 
-pub use terminal::TerminalChannel;
 pub use file_transfer::FileTransferChannel;
 pub use forward::ForwardChannel;
+pub use terminal::TerminalChannel;
 
 use qsh_core::error::Result;
 use qsh_core::transport::QuicStream;

@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
-use qsh_client::{random_local_port, ChannelConnection, CpCli, FileChannel, FilePath};
+use qsh_client::{ChannelConnection, CpCli, FileChannel, FilePath, random_local_port};
 
 #[cfg(not(feature = "standalone"))]
 use qsh_client::{BootstrapMode, SshConfig, bootstrap};
@@ -80,9 +80,8 @@ fn main() {
     // Create tokio runtime
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
 
-    let result = rt.block_on(async {
-        run_transfer(&cli, &host, user.as_deref(), &source, &dest).await
-    });
+    let result =
+        rt.block_on(async { run_transfer(&cli, &host, user.as_deref(), &source, &dest).await });
 
     if let Err(e) = result {
         error!(error = %e, "Transfer failed");
@@ -136,7 +135,10 @@ async fn run_transfer(
 
     if is_directory && !options.recursive {
         return Err(qsh_core::Error::FileTransfer {
-            message: format!("{} is a directory (use -r for recursive)", local_path.display()),
+            message: format!(
+                "{} is a directory (use -r for recursive)",
+                local_path.display()
+            ),
         });
     }
 
@@ -205,7 +207,13 @@ async fn run_transfer(
     let result = if is_upload {
         do_upload(&file_channel, &local_path, &remote_path, &options).await
     } else {
-        do_download(&file_channel, &local_path, file_channel.metadata(), &options).await
+        do_download(
+            &file_channel,
+            &local_path,
+            file_channel.metadata(),
+            &options,
+        )
+        .await
     };
 
     // Close the channel and connection
@@ -263,22 +271,34 @@ async fn collect_files(base_path: &Path) -> qsh_core::Result<Vec<FileEntry>> {
     let mut stack = vec![base_path.to_path_buf()];
 
     while let Some(dir_path) = stack.pop() {
-        let mut entries = fs::read_dir(&dir_path).await.map_err(|e| qsh_core::Error::FileTransfer {
-            message: format!("failed to read directory {}: {}", dir_path.display(), e),
-        })?;
+        let mut entries =
+            fs::read_dir(&dir_path)
+                .await
+                .map_err(|e| qsh_core::Error::FileTransfer {
+                    message: format!("failed to read directory {}: {}", dir_path.display(), e),
+                })?;
 
-        while let Some(entry) = entries.next_entry().await.map_err(|e| qsh_core::Error::FileTransfer {
-            message: format!("failed to read entry: {}", e),
-        })? {
+        while let Some(entry) =
+            entries
+                .next_entry()
+                .await
+                .map_err(|e| qsh_core::Error::FileTransfer {
+                    message: format!("failed to read entry: {}", e),
+                })?
+        {
             let path = entry.path();
-            let metadata = entry.metadata().await.map_err(|e| qsh_core::Error::FileTransfer {
-                message: format!("failed to get metadata for {}: {}", path.display(), e),
-            })?;
+            let metadata = entry
+                .metadata()
+                .await
+                .map_err(|e| qsh_core::Error::FileTransfer {
+                    message: format!("failed to get metadata for {}: {}", path.display(), e),
+                })?;
 
             if metadata.is_dir() {
                 stack.push(path);
             } else if metadata.is_file() {
-                let relative_path = path.strip_prefix(base_path)
+                let relative_path = path
+                    .strip_prefix(base_path)
                     .map_err(|_| qsh_core::Error::FileTransfer {
                         message: "failed to compute relative path".to_string(),
                     })?
@@ -325,7 +345,9 @@ async fn do_recursive_upload(
     let overall_pb = mp.add(ProgressBar::new(total_bytes));
     overall_pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({percent}%) {msg}")
+            .template(
+                "{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({percent}%) {msg}",
+            )
             .unwrap()
             .progress_chars("=>-"),
     );
@@ -428,7 +450,10 @@ async fn do_recursive_upload(
 
     eprintln!(
         "\nTransferred {} files ({} bytes) in {:.2}s ({:.2} MB/s)",
-        transferred, bytes, elapsed.as_secs_f64(), speed
+        transferred,
+        bytes,
+        elapsed.as_secs_f64(),
+        speed
     );
     if skipped > 0 {
         eprintln!("Skipped {} files (already up to date)", skipped);
@@ -454,9 +479,11 @@ async fn do_upload(
     options: &TransferOptions,
 ) -> qsh_core::Result<TransferStats> {
     // Get local file metadata
-    let local_meta = fs::metadata(local_path).await.map_err(|e| qsh_core::Error::FileTransfer {
-        message: format!("failed to stat local file: {}", e),
-    })?;
+    let local_meta = fs::metadata(local_path)
+        .await
+        .map_err(|e| qsh_core::Error::FileTransfer {
+            message: format!("failed to stat local file: {}", e),
+        })?;
 
     if local_meta.is_dir() {
         return Err(qsh_core::Error::FileTransfer {
@@ -470,14 +497,22 @@ async fn do_upload(
     if let Some(server_meta) = channel.metadata() {
         if should_skip_transfer(&local_meta, server_meta, local_path).await? {
             // Send early completion
-            channel.send_complete(0, 0, FileTransferStatus::AlreadyUpToDate).await?;
-            return Ok(TransferStats { bytes: 0, skipped: true });
+            channel
+                .send_complete(0, 0, FileTransferStatus::AlreadyUpToDate)
+                .await?;
+            return Ok(TransferStats {
+                bytes: 0,
+                skipped: true,
+            });
         }
     }
 
     // Check if server provided block checksums for delta sync
     let use_delta = options.delta_algo != DeltaAlgo::None
-        && channel.metadata().map(|m| !m.blocks.is_empty()).unwrap_or(false);
+        && channel
+            .metadata()
+            .map(|m| !m.blocks.is_empty())
+            .unwrap_or(false);
 
     if use_delta {
         do_upload_delta(channel, local_path, remote_path, options, file_size).await
@@ -495,9 +530,11 @@ async fn do_upload_full(
     file_size: u64,
 ) -> qsh_core::Result<TransferStats> {
     // Open local file
-    let mut file = File::open(local_path).await.map_err(|e| qsh_core::Error::FileTransfer {
-        message: format!("failed to open local file: {}", e),
-    })?;
+    let mut file = File::open(local_path)
+        .await
+        .map_err(|e| qsh_core::Error::FileTransfer {
+            message: format!("failed to open local file: {}", e),
+        })?;
 
     // Setup compression if enabled and file isn't already compressed
     let local_path_str = local_path.to_string_lossy();
@@ -517,9 +554,12 @@ async fn do_upload_full(
 
     // Send file data
     loop {
-        let n = file.read(&mut buf).await.map_err(|e| qsh_core::Error::FileTransfer {
-            message: format!("failed to read local file: {}", e),
-        })?;
+        let n = file
+            .read(&mut buf)
+            .await
+            .map_err(|e| qsh_core::Error::FileTransfer {
+                message: format!("failed to read local file: {}", e),
+            })?;
 
         if n == 0 {
             break;
@@ -541,15 +581,17 @@ async fn do_upload_full(
             (data.to_vec(), false)
         };
 
-        channel.send_data_with_flags(
-            offset,
-            send_data,
-            DataFlags {
-                compressed: is_compressed,
-                final_block: is_final,
-                block_ref: false,
-            },
-        ).await?;
+        channel
+            .send_data_with_flags(
+                offset,
+                send_data,
+                DataFlags {
+                    compressed: is_compressed,
+                    final_block: is_final,
+                    block_ref: false,
+                },
+            )
+            .await?;
 
         offset += n as u64;
         pb.set_position(offset);
@@ -571,9 +613,11 @@ async fn do_upload_delta(
     options: &TransferOptions,
     file_size: u64,
 ) -> qsh_core::Result<TransferStats> {
-    let server_meta = channel.metadata().ok_or_else(|| qsh_core::Error::FileTransfer {
-        message: "delta upload requires server metadata".to_string(),
-    })?;
+    let server_meta = channel
+        .metadata()
+        .ok_or_else(|| qsh_core::Error::FileTransfer {
+            message: "delta upload requires server metadata".to_string(),
+        })?;
 
     info!(
         blocks = server_meta.blocks.len(),
@@ -586,27 +630,36 @@ async fn do_upload_delta(
 
     // Read local file into memory for delta encoding
     // TODO: For very large files, implement streaming delta
-    let local_data = fs::read(local_path).await.map_err(|e| qsh_core::Error::FileTransfer {
-        message: format!("failed to read local file: {}", e),
-    })?;
+    let local_data = fs::read(local_path)
+        .await
+        .map_err(|e| qsh_core::Error::FileTransfer {
+            message: format!("failed to read local file: {}", e),
+        })?;
 
     // Compute delta operations
     let ops = DeltaEncoder::encode(signature, &local_data);
 
     // Calculate how much data we'll send
-    let literal_bytes: usize = ops.iter().filter_map(|op| {
-        match op {
+    let literal_bytes: usize = ops
+        .iter()
+        .filter_map(|op| match op {
             DeltaOp::Literal { data } => Some(data.len()),
             _ => None,
-        }
-    }).sum();
-    let copy_count = ops.iter().filter(|op| matches!(op, DeltaOp::Copy { .. })).count();
+        })
+        .sum();
+    let copy_count = ops
+        .iter()
+        .filter(|op| matches!(op, DeltaOp::Copy { .. }))
+        .count();
 
     info!(
         ops = ops.len(),
         literal_bytes = literal_bytes,
         copy_ops = copy_count,
-        savings = format!("{:.1}%", (1.0 - literal_bytes as f64 / file_size as f64) * 100.0),
+        savings = format!(
+            "{:.1}%",
+            (1.0 - literal_bytes as f64 / file_size as f64) * 100.0
+        ),
         "Delta computed"
     );
 
@@ -636,22 +689,27 @@ async fn do_upload_delta(
         let is_final = i == ops.len() - 1;
 
         match op {
-            DeltaOp::Copy { source_offset, length } => {
+            DeltaOp::Copy {
+                source_offset,
+                length,
+            } => {
                 // Send a block reference - the server will copy from existing file
                 // Encode block ref as: source_offset (8 bytes) + length (8 bytes)
                 let mut ref_data = Vec::with_capacity(16);
                 ref_data.extend_from_slice(&source_offset.to_le_bytes());
                 ref_data.extend_from_slice(&length.to_le_bytes());
 
-                channel.send_data_with_flags(
-                    offset,
-                    ref_data,
-                    DataFlags {
-                        compressed: false,
-                        final_block: is_final,
-                        block_ref: true,
-                    },
-                ).await?;
+                channel
+                    .send_data_with_flags(
+                        offset,
+                        ref_data,
+                        DataFlags {
+                            compressed: false,
+                            final_block: is_final,
+                            block_ref: true,
+                        },
+                    )
+                    .await?;
 
                 offset += *length;
             }
@@ -667,15 +725,17 @@ async fn do_upload_delta(
                     (data.clone(), false)
                 };
 
-                channel.send_data_with_flags(
-                    offset,
-                    send_data,
-                    DataFlags {
-                        compressed: is_compressed,
-                        final_block: is_final,
-                        block_ref: false,
-                    },
-                ).await?;
+                channel
+                    .send_data_with_flags(
+                        offset,
+                        send_data,
+                        DataFlags {
+                            compressed: is_compressed,
+                            final_block: is_final,
+                            block_ref: false,
+                        },
+                    )
+                    .await?;
 
                 bytes_sent += data.len() as u64;
                 offset += data.len() as u64;
@@ -711,7 +771,10 @@ async fn wait_for_upload_complete(
                         ),
                     });
                 }
-                return Ok(TransferStats { bytes: total_bytes, skipped: false });
+                return Ok(TransferStats {
+                    bytes: total_bytes,
+                    skipped: false,
+                });
             }
             Message::ChannelDataMsg(ChannelData {
                 payload: ChannelPayload::FileAck(_),
@@ -747,16 +810,21 @@ async fn do_download(
     if let Some(meta) = server_meta {
         if let Ok(local_meta) = fs::metadata(local_path).await {
             if should_skip_download(&local_meta, meta, local_path).await? {
-                return Ok(TransferStats { bytes: 0, skipped: true });
+                return Ok(TransferStats {
+                    bytes: 0,
+                    skipped: true,
+                });
             }
         }
     }
 
     // Create parent directories
     if let Some(parent) = local_path.parent() {
-        fs::create_dir_all(parent).await.map_err(|e| qsh_core::Error::FileTransfer {
-            message: format!("failed to create directory: {}", e),
-        })?;
+        fs::create_dir_all(parent)
+            .await
+            .map_err(|e| qsh_core::Error::FileTransfer {
+                message: format!("failed to create directory: {}", e),
+            })?;
     }
 
     // Use .qscp.partial for partial downloads
@@ -774,16 +842,21 @@ async fn do_download(
                 );
 
                 // Read existing partial file to initialize hasher
-                let mut partial_file = File::open(&partial_path).await.map_err(|e| qsh_core::Error::FileTransfer {
-                    message: format!("failed to open partial file for hashing: {}", e),
-                })?;
+                let mut partial_file =
+                    File::open(&partial_path)
+                        .await
+                        .map_err(|e| qsh_core::Error::FileTransfer {
+                            message: format!("failed to open partial file for hashing: {}", e),
+                        })?;
                 let mut hasher = StreamingHasher::new();
                 let mut buf = vec![0u8; FILE_CHUNK_SIZE];
                 let mut remaining = resume_offset;
                 while remaining > 0 {
                     let to_read = (remaining as usize).min(FILE_CHUNK_SIZE);
-                    let n = partial_file.read(&mut buf[..to_read]).await.map_err(|e| qsh_core::Error::FileTransfer {
-                        message: format!("failed to read partial file: {}", e),
+                    let n = partial_file.read(&mut buf[..to_read]).await.map_err(|e| {
+                        qsh_core::Error::FileTransfer {
+                            message: format!("failed to read partial file: {}", e),
+                        }
                     })?;
                     if n == 0 {
                         break;
@@ -883,9 +956,11 @@ async fn do_download(
                     data.data
                 };
 
-                file.write_all(&write_data).await.map_err(|e| qsh_core::Error::FileTransfer {
-                    message: format!("failed to write: {}", e),
-                })?;
+                file.write_all(&write_data)
+                    .await
+                    .map_err(|e| qsh_core::Error::FileTransfer {
+                        message: format!("failed to write: {}", e),
+                    })?;
 
                 hasher.update(&write_data);
                 total_bytes = data.offset + write_data.len() as u64;
@@ -902,12 +977,16 @@ async fn do_download(
                 pb.finish_with_message("received");
 
                 // Flush and close
-                file.flush().await.map_err(|e| qsh_core::Error::FileTransfer {
-                    message: format!("failed to flush: {}", e),
-                })?;
-                file.sync_all().await.map_err(|e| qsh_core::Error::FileTransfer {
-                    message: format!("failed to sync: {}", e),
-                })?;
+                file.flush()
+                    .await
+                    .map_err(|e| qsh_core::Error::FileTransfer {
+                        message: format!("failed to flush: {}", e),
+                    })?;
+                file.sync_all()
+                    .await
+                    .map_err(|e| qsh_core::Error::FileTransfer {
+                        message: format!("failed to sync: {}", e),
+                    })?;
                 drop(file);
 
                 // Verify checksum
@@ -923,11 +1002,16 @@ async fn do_download(
                 }
 
                 // Rename partial to final
-                fs::rename(&partial_path, local_path).await.map_err(|e| qsh_core::Error::FileTransfer {
-                    message: format!("failed to rename partial file: {}", e),
+                fs::rename(&partial_path, local_path).await.map_err(|e| {
+                    qsh_core::Error::FileTransfer {
+                        message: format!("failed to rename partial file: {}", e),
+                    }
                 })?;
 
-                return Ok(TransferStats { bytes: total_bytes, skipped: false });
+                return Ok(TransferStats {
+                    bytes: total_bytes,
+                    skipped: false,
+                });
             }
             Message::ChannelDataMsg(ChannelData {
                 payload: ChannelPayload::FileError(err),
@@ -964,7 +1048,11 @@ async fn should_skip_transfer(
 
     let local_mtime = local_meta
         .modified()
-        .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
+        .map(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        })
         .unwrap_or(0);
 
     if local_mtime != server_meta.mtime {
@@ -994,7 +1082,11 @@ async fn should_skip_download(
 
     let local_mtime = local_meta
         .modified()
-        .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
+        .map(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        })
         .unwrap_or(0);
 
     if local_mtime != server_meta.mtime {
@@ -1012,17 +1104,22 @@ async fn should_skip_download(
 
 /// Compute xxHash64 for a local file.
 async fn compute_file_hash(path: &Path) -> qsh_core::Result<u64> {
-    let mut file = File::open(path).await.map_err(|e| qsh_core::Error::FileTransfer {
-        message: format!("failed to open file for hashing: {}", e),
-    })?;
+    let mut file = File::open(path)
+        .await
+        .map_err(|e| qsh_core::Error::FileTransfer {
+            message: format!("failed to open file for hashing: {}", e),
+        })?;
 
     let mut hasher = StreamingHasher::new();
     let mut buf = vec![0u8; FILE_CHUNK_SIZE];
 
     loop {
-        let n = file.read(&mut buf).await.map_err(|e| qsh_core::Error::FileTransfer {
-            message: format!("failed to read file for hashing: {}", e),
-        })?;
+        let n = file
+            .read(&mut buf)
+            .await
+            .map_err(|e| qsh_core::Error::FileTransfer {
+                message: format!("failed to read file for hashing: {}", e),
+            })?;
         if n == 0 {
             break;
         }
@@ -1109,12 +1206,13 @@ async fn connect(
     let quic_conn = establish_quic_connection(&config).await?;
 
     // Authenticate
-    let (mut send, mut recv) = quic_conn
-        .accept_bi()
-        .await
-        .map_err(|e| qsh_core::Error::Transport {
-            message: format!("failed to accept auth stream: {}", e),
-        })?;
+    let (mut send, mut recv) =
+        quic_conn
+            .accept_bi()
+            .await
+            .map_err(|e| qsh_core::Error::Transport {
+                message: format!("failed to accept auth stream: {}", e),
+            })?;
 
     standalone_authenticate(&mut authenticator, &mut send, &mut recv).await?;
     info!("Authentication succeeded");
@@ -1139,6 +1237,7 @@ async fn connect(
         skip_host_key_check: false,
         port_range: None,
         server_args: None,
+        server_env: Vec::new(),
         mode: BootstrapMode::SshCli,
     };
 

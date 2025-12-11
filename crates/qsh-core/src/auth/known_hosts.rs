@@ -10,8 +10,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 
-use base64::prelude::*;
 use aws_lc_rs::hmac;
+use base64::prelude::*;
 use ssh_key::public::PublicKey;
 use tracing::{debug, warn};
 

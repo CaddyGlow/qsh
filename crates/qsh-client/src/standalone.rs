@@ -362,7 +362,7 @@ where
     S: tokio::io::AsyncWrite + Unpin,
     R: tokio::io::AsyncRead + Unpin,
 {
-    use qsh_core::auth::handshake::{read_message, write_message, AuthMessageResult};
+    use qsh_core::auth::handshake::{AuthMessageResult, read_message, write_message};
 
     // Read AuthChallenge (may receive AuthFailure instead)
     let msg = read_message(recv).await?;

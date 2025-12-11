@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::fs::{self, File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -15,9 +15,9 @@ use qsh_core::error::{Error, Result};
 use qsh_core::file::checksum::{BlockHasher, StreamingHasher};
 use qsh_core::file::compress::{Compressor, Decompressor, is_compressed_extension};
 use qsh_core::protocol::{
-    BlockChecksum, ChannelData, ChannelId, ChannelPayload, DataFlags, DeltaAlgo,
-    FileAckData, FileCompleteData, FileDataData, FileErrorCode, FileTransferMetadata,
-    FileTransferParams, FileTransferStatus, Message, TransferDirection,
+    BlockChecksum, ChannelData, ChannelId, ChannelPayload, DataFlags, DeltaAlgo, FileAckData,
+    FileCompleteData, FileDataData, FileErrorCode, FileTransferMetadata, FileTransferParams,
+    FileTransferStatus, Message, TransferDirection,
 };
 use qsh_core::transport::{QuicConnection, QuicStream, StreamPair};
 
@@ -73,7 +73,14 @@ impl FileTransferChannel {
         let metadata = match params.direction {
             TransferDirection::Download => {
                 // Get metadata for the file to send
-                Some(Self::get_file_metadata(&path, params.options.skip_if_unchanged, DeltaAlgo::None).await?)
+                Some(
+                    Self::get_file_metadata(
+                        &path,
+                        params.options.skip_if_unchanged,
+                        DeltaAlgo::None,
+                    )
+                    .await?,
+                )
             }
             TransferDirection::Upload => {
                 // Get metadata for existing file (if any) for skip-if-unchanged or delta
@@ -82,7 +89,9 @@ impl FileTransferChannel {
                 if need_metadata {
                     let compute_hash = params.options.skip_if_unchanged;
                     let delta_algo = params.options.delta_algo;
-                    Self::get_file_metadata(&path, compute_hash, delta_algo).await.ok()
+                    Self::get_file_metadata(&path, compute_hash, delta_algo)
+                        .await
+                        .ok()
                 } else {
                     None
                 }
@@ -103,7 +112,11 @@ impl FileTransferChannel {
     }
 
     /// Get file metadata for a path.
-    async fn get_file_metadata(path: &PathBuf, compute_hash: bool, delta_algo: DeltaAlgo) -> Result<FileTransferMetadata> {
+    async fn get_file_metadata(
+        path: &PathBuf,
+        compute_hash: bool,
+        delta_algo: DeltaAlgo,
+    ) -> Result<FileTransferMetadata> {
         let meta = fs::metadata(path).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 Error::FileTransfer {
@@ -118,7 +131,11 @@ impl FileTransferChannel {
 
         let mtime = meta
             .modified()
-            .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
+            .map(|t| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            })
             .unwrap_or(0);
 
         #[cfg(unix)]
@@ -138,7 +155,9 @@ impl FileTransferChannel {
 
         // Compute block checksums for delta sync if requested
         let blocks = if delta_algo != DeltaAlgo::None && meta.is_file() && meta.len() > 0 {
-            Self::compute_block_checksums(path).await.unwrap_or_default()
+            Self::compute_block_checksums(path)
+                .await
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -231,9 +250,12 @@ impl FileTransferChannel {
 
         while remaining > 0 {
             let to_read = (remaining as usize).min(FILE_CHUNK_SIZE);
-            let n = file.read(&mut buf[..to_read]).await.map_err(|e| Error::FileTransfer {
-                message: format!("failed to read file for partial hashing: {}", e),
-            })?;
+            let n = file
+                .read(&mut buf[..to_read])
+                .await
+                .map_err(|e| Error::FileTransfer {
+                    message: format!("failed to read file for partial hashing: {}", e),
+                })?;
             if n == 0 {
                 break;
             }
@@ -294,7 +316,12 @@ impl FileTransferChannel {
 
         // Check if delta sync is enabled and we have blocks
         let use_delta = self.inner.params.options.delta_algo != DeltaAlgo::None
-            && self.inner.metadata.as_ref().map(|m| !m.blocks.is_empty()).unwrap_or(false);
+            && self
+                .inner
+                .metadata
+                .as_ref()
+                .map(|m| !m.blocks.is_empty())
+                .unwrap_or(false);
 
         info!(
             channel_id = %self.inner.channel_id,
@@ -306,9 +333,11 @@ impl FileTransferChannel {
 
         // Create parent directories if needed
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await.map_err(|e| Error::FileTransfer {
-                message: format!("failed to create directory: {}", e),
-            })?;
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| Error::FileTransfer {
+                    message: format!("failed to create directory: {}", e),
+                })?;
         }
 
         // Open existing file for delta sync (if it exists and delta is enabled)
@@ -326,7 +355,8 @@ impl FileTransferChannel {
             if let Ok(meta) = fs::metadata(&temp_path).await {
                 if meta.len() >= resume_offset {
                     // Hash the existing partial data
-                    let partial_hash = Self::compute_partial_hash(&temp_path, resume_offset).await?;
+                    let partial_hash =
+                        Self::compute_partial_hash(&temp_path, resume_offset).await?;
                     debug!(
                         channel_id = %self.inner.channel_id,
                         partial_hash = %format!("{:016x}", partial_hash),
@@ -349,16 +379,21 @@ impl FileTransferChannel {
                         })?;
 
                     // Initialize hasher with partial data
-                    let mut partial_file = File::open(&temp_path).await.map_err(|e| Error::FileTransfer {
-                        message: format!("failed to open temp file for hashing: {}", e),
-                    })?;
+                    let mut partial_file =
+                        File::open(&temp_path)
+                            .await
+                            .map_err(|e| Error::FileTransfer {
+                                message: format!("failed to open temp file for hashing: {}", e),
+                            })?;
                     let mut hasher = StreamingHasher::new();
                     let mut buf = vec![0u8; FILE_CHUNK_SIZE];
                     let mut remaining = resume_offset;
                     while remaining > 0 {
                         let to_read = (remaining as usize).min(FILE_CHUNK_SIZE);
-                        let n = partial_file.read(&mut buf[..to_read]).await.map_err(|e| Error::FileTransfer {
-                            message: format!("failed to read partial file: {}", e),
+                        let n = partial_file.read(&mut buf[..to_read]).await.map_err(|e| {
+                            Error::FileTransfer {
+                                message: format!("failed to read partial file: {}", e),
+                            }
                         })?;
                         if n == 0 {
                             break;
@@ -453,20 +488,25 @@ impl FileTransferChannel {
                         let length = u64::from_le_bytes(data.data[8..16].try_into().unwrap());
 
                         // Read from existing file
-                        let existing = existing_file.as_mut().ok_or_else(|| Error::FileTransfer {
-                            message: "block ref but no existing file".to_string(),
-                        })?;
+                        let existing =
+                            existing_file.as_mut().ok_or_else(|| Error::FileTransfer {
+                                message: "block ref but no existing file".to_string(),
+                            })?;
 
-                        existing.seek(std::io::SeekFrom::Start(source_offset))
+                        existing
+                            .seek(std::io::SeekFrom::Start(source_offset))
                             .await
                             .map_err(|e| Error::FileTransfer {
                                 message: format!("failed to seek in source file: {}", e),
                             })?;
 
                         let mut buf = vec![0u8; length as usize];
-                        existing.read_exact(&mut buf).await.map_err(|e| Error::FileTransfer {
-                            message: format!("failed to read from source file: {}", e),
-                        })?;
+                        existing
+                            .read_exact(&mut buf)
+                            .await
+                            .map_err(|e| Error::FileTransfer {
+                                message: format!("failed to read from source file: {}", e),
+                            })?;
 
                         debug!(
                             channel_id = %self.inner.channel_id,
@@ -498,7 +538,9 @@ impl FileTransferChannel {
 
                     hasher.update(&write_data);
                     total_bytes = data.offset + write_data.len() as u64;
-                    self.inner.bytes_transferred.store(total_bytes, Ordering::SeqCst);
+                    self.inner
+                        .bytes_transferred
+                        .store(total_bytes, Ordering::SeqCst);
 
                     // Send ack every 1MB
                     if total_bytes - last_ack_bytes >= 1024 * 1024 {
@@ -567,9 +609,11 @@ impl FileTransferChannel {
         let checksum = hasher.finish();
 
         // Rename temp to final
-        fs::rename(&temp_path, &path).await.map_err(|e| Error::FileTransfer {
-            message: format!("failed to rename temp file: {}", e),
-        })?;
+        fs::rename(&temp_path, &path)
+            .await
+            .map_err(|e| Error::FileTransfer {
+                message: format!("failed to rename temp file: {}", e),
+            })?;
 
         // Preserve mode if requested
         #[cfg(unix)]
@@ -624,9 +668,12 @@ impl FileTransferChannel {
             let mut remaining = start_offset;
             while remaining > 0 {
                 let to_read = (remaining as usize).min(FILE_CHUNK_SIZE);
-                let n = file.read(&mut buf[..to_read]).await.map_err(|e| Error::FileTransfer {
-                    message: format!("failed to read file for resume hash: {}", e),
-                })?;
+                let n = file
+                    .read(&mut buf[..to_read])
+                    .await
+                    .map_err(|e| Error::FileTransfer {
+                        message: format!("failed to read file for resume hash: {}", e),
+                    })?;
                 if n == 0 {
                     break;
                 }
@@ -642,8 +689,8 @@ impl FileTransferChannel {
         }
 
         // Determine if we should compress
-        let use_compression = self.inner.params.options.compress
-            && !is_compressed_extension(&self.inner.params.path);
+        let use_compression =
+            self.inner.params.options.compress && !is_compressed_extension(&self.inner.params.path);
         let compressor = if use_compression {
             Some(Compressor::with_default_level())
         } else {
@@ -706,8 +753,13 @@ impl FileTransferChannel {
         let checksum = hasher.finish();
 
         // Send completion
-        self.send_complete(stream, checksum, offset - start_offset, FileTransferStatus::Normal)
-            .await?;
+        self.send_complete(
+            stream,
+            checksum,
+            offset - start_offset,
+            FileTransferStatus::Normal,
+        )
+        .await?;
 
         info!(
             channel_id = %self.inner.channel_id,

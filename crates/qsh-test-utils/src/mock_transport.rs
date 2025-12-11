@@ -260,7 +260,11 @@ mod tests {
         let mut stream1 = MockStream::new(tx1, rx2);
         let mut stream2 = MockStream::new(tx2, rx1);
 
-        let msg = Message::Resize(ResizePayload { channel_id: None, cols: 80, rows: 24 });
+        let msg = Message::Resize(ResizePayload {
+            channel_id: None,
+            cols: 80,
+            rows: 24,
+        });
         stream1.send(&msg).await.unwrap();
 
         let received = stream2.recv().await.unwrap();
@@ -302,9 +306,13 @@ mod tests {
 
         // Should be able to communicate
         let tx = our_half.tx.clone();
-        tx.send(Message::Resize(ResizePayload { channel_id: None, cols: 90, rows: 30 }))
-            .await
-            .unwrap();
+        tx.send(Message::Resize(ResizePayload {
+            channel_id: None,
+            cols: 90,
+            rows: 30,
+        }))
+        .await
+        .unwrap();
         // Note: We'd need to properly wire up the peer half in real usage
     }
 

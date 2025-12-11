@@ -87,7 +87,10 @@ impl ReconnectableConnection {
     pub async fn store_session_data(&self) {
         if let Some(conn) = read_lock(&self.inner).as_ref() {
             if let Some(data) = conn.quic().session_data().await {
-                debug!(session_data_len = data.len(), "Storing session data for 0-RTT");
+                debug!(
+                    session_data_len = data.len(),
+                    "Storing session data for 0-RTT"
+                );
                 *write_lock(&self.session_data) = Some(data);
             }
         }
@@ -177,7 +180,10 @@ impl ReconnectableConnection {
             if let Some(conn) = read_lock(&self.inner).as_ref() {
                 let rtt = conn.rtt().await;
                 *write_lock(&self.last_rtt) = Some(rtt);
-                debug!(rtt_ms = rtt.as_millis(), "Stored RTT for reconnection delay");
+                debug!(
+                    rtt_ms = rtt.as_millis(),
+                    "Stored RTT for reconnection delay"
+                );
             }
         }
 
@@ -302,7 +308,10 @@ impl ReconnectableConnection {
 
                     // Update session data for next reconnection (do this after storing connection)
                     if let Some(data) = conn.quic().session_data().await {
-                        debug!(session_data_len = data.len(), "Updating session data for 0-RTT");
+                        debug!(
+                            session_data_len = data.len(),
+                            "Updating session data for 0-RTT"
+                        );
                         *write_lock(&self.session_data) = Some(data);
                     }
 
@@ -339,12 +348,10 @@ impl ReconnectableConnection {
 
                     // Mosh-style port hopping: try a new local port after repeated failures
                     if consecutive_failures >= PORT_HOP_AFTER_FAILURES {
-                        let new_port =
-                            rand::rng().random_range(PORT_RANGE_LOW..=PORT_RANGE_HIGH);
+                        let new_port = rand::rng().random_range(PORT_RANGE_LOW..=PORT_RANGE_HIGH);
                         info!(
                             new_port,
-                            consecutive_failures,
-                            "Port hopping: trying new local port"
+                            consecutive_failures, "Port hopping: trying new local port"
                         );
                         current_local_port = Some(new_port);
                         consecutive_failures = 0;

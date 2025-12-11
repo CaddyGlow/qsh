@@ -38,8 +38,7 @@ use qsh_core::protocol::{
     TermSize,
 };
 use qsh_core::transport::{
-    Connection, QuicConnection, QuicSender, QuicStream, StreamPair,
-    connect_quic, ConnectConfig,
+    ConnectConfig, Connection, QuicConnection, QuicSender, QuicStream, StreamPair, connect_quic,
 };
 
 /// Client connection configuration.
@@ -182,7 +181,8 @@ pub struct ChannelConnection {
     /// Next client-side channel ID.
     next_channel_id: AtomicU64,
     /// Pending global requests.
-    pending_global_requests: tokio::sync::Mutex<StdHashMap<u32, tokio::sync::oneshot::Sender<GlobalReplyResult>>>,
+    pending_global_requests:
+        tokio::sync::Mutex<StdHashMap<u32, tokio::sync::oneshot::Sender<GlobalReplyResult>>>,
     /// Next global request ID.
     next_global_request_id: std::sync::atomic::AtomicU32,
     /// Remote forward targets: (bind_host, bind_port) -> target info.
@@ -214,10 +214,7 @@ impl ChannelConnection {
     ///
     /// This is used for transparent reconnection after network interruption.
     /// The server will resume the existing session if it's still valid.
-    pub async fn reconnect(
-        config: ConnectionConfig,
-        session_id: SessionId,
-    ) -> Result<Self> {
+    pub async fn reconnect(config: ConnectionConfig, session_id: SessionId) -> Result<Self> {
         info!(addr = %config.server_addr, ?session_id, "Reconnecting (channel model)");
         let conn = establish_quic_connection(&config).await?;
         Self::from_quic_with_resume(conn, config, Some(session_id)).await
@@ -285,7 +282,9 @@ impl ChannelConnection {
         );
 
         // Extract sender before wrapping in Mutex (allows concurrent send/recv)
-        let control_sender = control.sender().expect("control stream must support sending");
+        let control_sender = control
+            .sender()
+            .expect("control stream must support sending");
 
         // Restore existing channels if this is a session resume
         let mut channels = StdHashMap::new();
@@ -303,12 +302,16 @@ impl ChannelConnection {
                         .open_stream(StreamType::ChannelIn(existing.channel_id))
                         .await
                         .map_err(|e| Error::Transport {
-                            message: format!("failed to open input stream for restored channel: {}", e),
+                            message: format!(
+                                "failed to open input stream for restored channel: {}",
+                                e
+                            ),
                         })?;
 
                     // Accept output stream from server
                     let (stream_type, output_stream) = quic.accept_stream().await?;
-                    if !matches!(stream_type, StreamType::ChannelOut(id) if id == existing.channel_id) {
+                    if !matches!(stream_type, StreamType::ChannelOut(id) if id == existing.channel_id)
+                    {
                         warn!(
                             expected = %existing.channel_id,
                             got = ?stream_type,
@@ -336,7 +339,10 @@ impl ChannelConnection {
         }
 
         if has_existing {
-            info!(restored_channels = channels.len(), "Session channels restored");
+            info!(
+                restored_channels = channels.len(),
+                "Session channels restored"
+            );
         }
 
         Ok(Self {
@@ -559,7 +565,10 @@ impl ChannelConnection {
             .next_global_request_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        let payload = GlobalRequestPayload { request_id, request };
+        let payload = GlobalRequestPayload {
+            request_id,
+            request,
+        };
 
         let mut control = self.control.lock().await;
         control.send(&Message::GlobalRequest(payload)).await?;
@@ -624,11 +633,7 @@ impl ChannelConnection {
         );
         info!(
             bind_host,
-            bind_port,
-            actual_port,
-            target_host,
-            target_port,
-            "Remote forward established"
+            bind_port, actual_port, target_host, target_port, "Remote forward established"
         );
         Ok(actual_port)
     }
@@ -763,7 +768,10 @@ impl ChannelConnection {
             if matches!(ty, StreamType::ChannelBidi(id) if id == channel_id) {
                 break stream;
             }
-            debug!(?ty, "Ignoring stream while waiting for forwarded channel bidi");
+            debug!(
+                ?ty,
+                "Ignoring stream while waiting for forwarded channel bidi"
+            );
         };
 
         // Spawn relay tasks directly - no need for ForwardChannel wrapper
@@ -774,11 +782,17 @@ impl ChannelConnection {
     }
 
     /// Spawn bidirectional relay tasks for a forwarded-tcpip channel.
-    fn spawn_forwarded_relay(channel_id: ChannelId, tcp_stream: TcpStream, quic_stream: QuicStream) {
+    fn spawn_forwarded_relay(
+        channel_id: ChannelId,
+        tcp_stream: TcpStream,
+        quic_stream: QuicStream,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
-        let quic_sender = quic_stream.sender().expect("forward stream must support sending");
+        let quic_sender = quic_stream
+            .sender()
+            .expect("forward stream must support sending");
 
         // Task: TCP -> QUIC
         tokio::spawn(async move {

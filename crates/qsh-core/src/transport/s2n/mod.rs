@@ -36,14 +36,13 @@ use super::common;
 
 // Re-export common utilities for convenience
 pub use common::{
-    cert_hash, generate_self_signed_cert, load_certs_from_pem, load_key_from_pem,
-    classify_io_error, enable_error_queue,
-    channel_stream_header, channel_bidi_header,
-    CHANNEL_STREAM_MAGIC, CHANNEL_BIDI_MAGIC,
+    CHANNEL_BIDI_MAGIC, CHANNEL_STREAM_MAGIC, cert_hash, channel_bidi_header,
+    channel_stream_header, classify_io_error, enable_error_queue, generate_self_signed_cert,
+    load_certs_from_pem, load_key_from_pem,
 };
 
 // Import parent traits
-use super::{Connection, ConnectConfig, ConnectResult, ListenerConfig, StreamPair, StreamType};
+use super::{ConnectConfig, ConnectResult, Connection, ListenerConfig, StreamPair, StreamType};
 
 // =============================================================================
 // Tests
@@ -51,9 +50,11 @@ use super::{Connection, ConnectConfig, ConnectResult, ListenerConfig, StreamPair
 
 #[cfg(test)]
 mod tests {
+    use super::common::{
+        CHANNEL_BIDI_MAGIC, CHANNEL_STREAM_MAGIC, channel_bidi_header, channel_stream_header,
+    };
     use super::*;
     use crate::protocol::ChannelId;
-    use super::common::{channel_bidi_header, channel_stream_header, CHANNEL_BIDI_MAGIC, CHANNEL_STREAM_MAGIC};
 
     #[test]
     fn channel_stream_header_roundtrip() {

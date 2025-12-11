@@ -359,8 +359,8 @@ mod tests {
 
     #[test]
     fn tls_credentials_with_ticket_key() {
-        let creds = TlsCredentials::new(b"cert".to_vec(), b"key".to_vec())
-            .with_ticket_key(vec![0x42; 48]);
+        let creds =
+            TlsCredentials::new(b"cert".to_vec(), b"key".to_vec()).with_ticket_key(vec![0x42; 48]);
         assert!(creds.ticket_key.is_some());
         assert_eq!(creds.ticket_key.unwrap().len(), 48);
     }

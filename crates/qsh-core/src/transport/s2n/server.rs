@@ -11,9 +11,9 @@ use tracing::{debug, info};
 
 use crate::error::{Error, Result};
 
+use super::ListenerConfig;
 use super::connection::S2nConnection;
 use super::stats::{ConnectionStats, HandshakeState, SessionTicketState};
-use super::ListenerConfig;
 
 /// Derive session ticket key material from an optional seed.
 fn derive_ticket_key_material(ticket_key: Option<&[u8]>) -> (Vec<u8>, Vec<u8>) {
@@ -52,13 +52,15 @@ impl S2nAcceptor {
         use s2n_quic::Server;
         use s2n_quic::provider::tls::s2n_tls;
 
-        let cert_pem_str = std::str::from_utf8(&config.cert_pem).map_err(|e| Error::CertificateError {
-            message: format!("invalid certificate PEM encoding: {}", e),
-        })?;
+        let cert_pem_str =
+            std::str::from_utf8(&config.cert_pem).map_err(|e| Error::CertificateError {
+                message: format!("invalid certificate PEM encoding: {}", e),
+            })?;
 
-        let key_pem_str = std::str::from_utf8(&config.key_pem).map_err(|e| Error::CertificateError {
-            message: format!("invalid key PEM encoding: {}", e),
-        })?;
+        let key_pem_str =
+            std::str::from_utf8(&config.key_pem).map_err(|e| Error::CertificateError {
+                message: format!("invalid key PEM encoding: {}", e),
+            })?;
 
         let (ticket_key_bytes, ticket_key_name) =
             derive_ticket_key_material(config.ticket_key.as_deref());

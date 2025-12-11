@@ -44,9 +44,11 @@ pub fn parse_local_forward(spec: &str) -> Result<(SocketAddr, String, u16)> {
         // bind_addr:port:host:hostport
         4 => {
             let bind_addr: SocketAddr =
-                format!("{}:{}", parts[0], parts[1]).parse().map_err(|_| Error::Forward {
-                    message: format!("invalid bind address: {}:{}", parts[0], parts[1]),
-                })?;
+                format!("{}:{}", parts[0], parts[1])
+                    .parse()
+                    .map_err(|_| Error::Forward {
+                        message: format!("invalid bind address: {}:{}", parts[0], parts[1]),
+                    })?;
             let target_host = parts[2].to_string();
             let target_port: u16 = parts[3].parse().map_err(|_| Error::Forward {
                 message: format!("invalid target port: {}", parts[3]),

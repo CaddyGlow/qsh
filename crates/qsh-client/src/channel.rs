@@ -81,7 +81,9 @@ impl TerminalChannel {
         initial_state: TerminalState,
     ) -> Self {
         let term_size = initial_state.size();
-        let input_sender = input_stream.sender().expect("input stream must support sending");
+        let input_sender = input_stream
+            .sender()
+            .expect("input stream must support sending");
 
         // Create input sender task
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Message>();
@@ -165,9 +167,12 @@ impl TerminalChannel {
             }),
         });
 
-        self.inner.input_tx.send(msg).map_err(|_| Error::Transport {
-            message: "input channel closed".to_string(),
-        })?;
+        self.inner
+            .input_tx
+            .send(msg)
+            .map_err(|_| Error::Transport {
+                message: "input channel closed".to_string(),
+            })?;
 
         Ok(seq)
     }
@@ -200,9 +205,12 @@ impl TerminalChannel {
             }),
         });
 
-        self.inner.input_tx.send(msg).map_err(|_| Error::Transport {
-            message: "input channel closed".to_string(),
-        })?;
+        self.inner
+            .input_tx
+            .send(msg)
+            .map_err(|_| Error::Transport {
+                message: "input channel closed".to_string(),
+            })?;
 
         Ok(())
     }
@@ -253,7 +261,10 @@ impl TerminalChannel {
                         return Ok(TerminalEvent::StateSync(update));
                     }
                     other => {
-                        warn!(?other, "Unexpected channel payload on terminal output stream");
+                        warn!(
+                            ?other,
+                            "Unexpected channel payload on terminal output stream"
+                        );
                     }
                 },
                 other => {
@@ -364,7 +375,8 @@ impl FileChannel {
 
     /// Send file data chunk.
     pub async fn send_data(&self, offset: u64, data: Vec<u8>) -> Result<()> {
-        self.send_data_with_flags(offset, data, DataFlags::default()).await
+        self.send_data_with_flags(offset, data, DataFlags::default())
+            .await
     }
 
     /// Send file data chunk with custom flags.
@@ -389,7 +401,9 @@ impl FileChannel {
         });
 
         self.inner.stream.lock().await.send(&msg).await?;
-        self.inner.bytes_transferred.fetch_add(len, Ordering::SeqCst);
+        self.inner
+            .bytes_transferred
+            .fetch_add(len, Ordering::SeqCst);
         Ok(())
     }
 
@@ -516,7 +530,9 @@ impl ForwardChannel {
         }
 
         let n = self.inner.stream.recv_raw(buf).await?;
-        self.inner.bytes_received.fetch_add(n as u64, Ordering::SeqCst);
+        self.inner
+            .bytes_received
+            .fetch_add(n as u64, Ordering::SeqCst);
         Ok(n)
     }
 

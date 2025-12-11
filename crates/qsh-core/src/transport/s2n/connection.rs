@@ -5,8 +5,8 @@
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use s2n_quic::stream::BidirectionalStream;
@@ -16,7 +16,9 @@ use tracing::debug;
 use crate::error::{Error, Result};
 use crate::protocol::ChannelId;
 
-use super::common::{channel_bidi_header, channel_stream_header, CHANNEL_BIDI_MAGIC, CHANNEL_STREAM_MAGIC};
+use super::common::{
+    CHANNEL_BIDI_MAGIC, CHANNEL_STREAM_MAGIC, channel_bidi_header, channel_stream_header,
+};
 use super::stats::{ConnectionStats, HandshakeState, SessionTicketState};
 use super::stream::{S2nStream, S2nStreamReader, S2nStreamWriter};
 use super::{Connection, StreamType};
@@ -63,9 +65,12 @@ impl S2nConnection {
         })?;
 
         // Open control stream (stream ID 0 equivalent)
-        let control_stream = conn.open_bidirectional_stream().await.map_err(|e| Error::Transport {
-            message: format!("failed to open control stream: {}", e),
-        })?;
+        let control_stream =
+            conn.open_bidirectional_stream()
+                .await
+                .map_err(|e| Error::Transport {
+                    message: format!("failed to open control stream: {}", e),
+                })?;
 
         handshake.mark_confirmed();
 
@@ -96,11 +101,15 @@ impl S2nConnection {
         })?;
 
         // For server, accept the control stream initiated by client
-        let control_stream = conn.accept_bidirectional_stream().await.map_err(|e| Error::Transport {
-            message: format!("failed to accept control stream: {}", e),
-        })?.ok_or_else(|| Error::Transport {
-            message: "connection closed before control stream".to_string(),
-        })?;
+        let control_stream = conn
+            .accept_bidirectional_stream()
+            .await
+            .map_err(|e| Error::Transport {
+                message: format!("failed to accept control stream: {}", e),
+            })?
+            .ok_or_else(|| Error::Transport {
+                message: "connection closed before control stream".to_string(),
+            })?;
 
         handshake.mark_confirmed();
 
@@ -178,9 +187,13 @@ impl S2nConnection {
         let mut conn = self.conn.lock().await;
 
         // Accept bidirectional stream
-        let stream = conn.accept_bidirectional_stream().await.map_err(|e| Error::Transport {
-            message: format!("failed to accept bidirectional stream: {}", e),
-        })?.ok_or_else(|| Error::ConnectionClosed)?;
+        let stream = conn
+            .accept_bidirectional_stream()
+            .await
+            .map_err(|e| Error::Transport {
+                message: format!("failed to accept bidirectional stream: {}", e),
+            })?
+            .ok_or_else(|| Error::ConnectionClosed)?;
 
         let (recv, send) = stream.split();
         Ok((S2nStreamWriter::new(send), S2nStreamReader::new(recv, None)))
@@ -207,17 +220,23 @@ impl Connection for S2nConnection {
                 let mut conn = self.conn.lock().await;
 
                 // Open new bidi stream
-                let mut stream = conn.open_bidirectional_stream().await.map_err(|e| Error::Transport {
-                    message: format!("failed to open bidirectional stream: {}", e),
-                })?;
+                let mut stream =
+                    conn.open_bidirectional_stream()
+                        .await
+                        .map_err(|e| Error::Transport {
+                            message: format!("failed to open bidirectional stream: {}", e),
+                        })?;
                 drop(conn);
 
                 // Write header
                 let header = channel_bidi_header(channel_id);
                 use tokio::io::AsyncWriteExt;
-                stream.write_all(&header).await.map_err(|e| Error::Transport {
-                    message: format!("failed to write stream header: {}", e),
-                })?;
+                stream
+                    .write_all(&header)
+                    .await
+                    .map_err(|e| Error::Transport {
+                        message: format!("failed to write stream header: {}", e),
+                    })?;
                 stream.flush().await.map_err(|e| Error::Transport {
                     message: format!("failed to flush stream header: {}", e),
                 })?;
@@ -228,17 +247,23 @@ impl Connection for S2nConnection {
                 let mut conn = self.conn.lock().await;
 
                 // Open new unidirectional stream
-                let mut stream = conn.open_send_stream().await.map_err(|e| Error::Transport {
-                    message: format!("failed to open unidirectional stream: {}", e),
-                })?;
+                let mut stream = conn
+                    .open_send_stream()
+                    .await
+                    .map_err(|e| Error::Transport {
+                        message: format!("failed to open unidirectional stream: {}", e),
+                    })?;
                 drop(conn);
 
                 // Write header
                 let header = channel_stream_header(channel_id);
                 use tokio::io::AsyncWriteExt;
-                stream.write_all(&header).await.map_err(|e| Error::Transport {
-                    message: format!("failed to write stream header: {}", e),
-                })?;
+                stream
+                    .write_all(&header)
+                    .await
+                    .map_err(|e| Error::Transport {
+                        message: format!("failed to write stream header: {}", e),
+                    })?;
                 stream.flush().await.map_err(|e| Error::Transport {
                     message: format!("failed to flush stream header: {}", e),
                 })?;
@@ -284,9 +309,12 @@ impl Connection for S2nConnection {
                         // Read stream header to determine type
                         let mut header = [0u8; 9];
                         use tokio::io::AsyncReadExt;
-                        stream.read_exact(&mut header).await.map_err(|e| Error::Transport {
-                            message: format!("failed to read stream header: {}", e),
-                        })?;
+                        stream
+                            .read_exact(&mut header)
+                            .await
+                            .map_err(|e| Error::Transport {
+                                message: format!("failed to read stream header: {}", e),
+                            })?;
 
                         let magic = header[0];
                         let encoded = u64::from_le_bytes(header[1..9].try_into().unwrap());
@@ -307,7 +335,7 @@ impl Connection for S2nConnection {
                     Ok(Err(e)) => {
                         return Err(Error::Transport {
                             message: format!("failed to accept stream: {}", e),
-                        })
+                        });
                     }
                     Err(_) => {
                         // Timeout - try receive stream next
@@ -318,19 +346,19 @@ impl Connection for S2nConnection {
             // Try to accept a unidirectional receive stream with a short timeout
             {
                 let mut conn = self.conn.lock().await;
-                match tokio::time::timeout(
-                    Duration::from_millis(10),
-                    conn.accept_receive_stream(),
-                )
-                .await
+                match tokio::time::timeout(Duration::from_millis(10), conn.accept_receive_stream())
+                    .await
                 {
                     Ok(Ok(Some(mut stream))) => {
                         // Read stream header to determine type
                         let mut header = [0u8; 9];
                         use tokio::io::AsyncReadExt;
-                        stream.read_exact(&mut header).await.map_err(|e| Error::Transport {
-                            message: format!("failed to read stream header: {}", e),
-                        })?;
+                        stream
+                            .read_exact(&mut header)
+                            .await
+                            .map_err(|e| Error::Transport {
+                                message: format!("failed to read stream header: {}", e),
+                            })?;
 
                         let magic = header[0];
                         let encoded = u64::from_le_bytes(header[1..9].try_into().unwrap());
@@ -358,7 +386,7 @@ impl Connection for S2nConnection {
                     Ok(Err(e)) => {
                         return Err(Error::Transport {
                             message: format!("failed to accept stream: {}", e),
-                        })
+                        });
                     }
                     Err(_) => {
                         // Timeout - loop again and check for bidi streams

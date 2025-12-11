@@ -42,9 +42,9 @@ pub use forward::{
     ForwarderHandle, LocalForwarder, ProxyHandle, RemoteForwarder, RemoteForwarderHandle,
     Socks5Proxy, parse_dynamic_forward, parse_local_forward, parse_remote_forward,
 };
-pub use ssh::{BootstrapHandle, BootstrapMode, SshConfig, bootstrap};
 pub use reconnectable::ReconnectableConnection;
 pub use session::{ConnectionState, SessionContext, TerminalSessionState};
+pub use ssh::{BootstrapHandle, BootstrapMode, SshConfig, bootstrap};
 pub use terminal::{RawModeGuard, StdinReader, StdoutWriter, get_terminal_size, restore_terminal};
 
 #[cfg(feature = "standalone")]

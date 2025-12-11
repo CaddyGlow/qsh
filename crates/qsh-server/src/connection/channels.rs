@@ -63,10 +63,7 @@ impl ConnectionHandler {
     }
 
     /// Handle a ChannelOpen request.
-    pub async fn handle_channel_open(
-        self: &Arc<Self>,
-        payload: ChannelOpenPayload,
-    ) -> Result<()> {
+    pub async fn handle_channel_open(self: &Arc<Self>, payload: ChannelOpenPayload) -> Result<()> {
         let channel_id = payload.channel_id;
         debug!(
             channel_id = %channel_id,
@@ -160,9 +157,7 @@ impl ConnectionHandler {
                 self.open_dynamic_forward_channel(channel_id, params).await
             }
             #[cfg(feature = "tunnel")]
-            ChannelParams::Tunnel(params) => {
-                self.open_tunnel_channel(channel_id, params).await
-            }
+            ChannelParams::Tunnel(params) => self.open_tunnel_channel(channel_id, params).await,
         }
     }
 
@@ -247,7 +242,10 @@ impl ConnectionHandler {
             None => {
                 // Legacy: resize applies to first terminal channel
                 let channels = self.channels.read().await;
-                if let Some((id, _)) = channels.iter().find(|(_, h)| matches!(h, ChannelHandle::Terminal(_))) {
+                if let Some((id, _)) = channels
+                    .iter()
+                    .find(|(_, h)| matches!(h, ChannelHandle::Terminal(_)))
+                {
                     *id
                 } else {
                     warn!("Resize without channel_id and no terminal channels");
@@ -273,7 +271,10 @@ impl ConnectionHandler {
             None => {
                 // Legacy: ack applies to first terminal channel
                 let channels = self.channels.read().await;
-                if let Some((id, _)) = channels.iter().find(|(_, h)| matches!(h, ChannelHandle::Terminal(_))) {
+                if let Some((id, _)) = channels
+                    .iter()
+                    .find(|(_, h)| matches!(h, ChannelHandle::Terminal(_)))
+                {
                     *id
                 } else {
                     return Ok(());
@@ -365,7 +366,11 @@ impl ConnectionHandler {
             info!("All channels closed, triggering session shutdown");
             // Close the QUIC connection to wake up any pending recv_control() call in the session loop
             self.quic.read().await.close_connection().await;
-            let _ = self.shutdown_tx.lock().await.try_send(super::ShutdownReason::AllChannelsClosed);
+            let _ = self
+                .shutdown_tx
+                .lock()
+                .await
+                .try_send(super::ShutdownReason::AllChannelsClosed);
         }
     }
 
@@ -394,9 +399,7 @@ impl ConnectionHandler {
     ///
     /// Returns channel info that can be sent to the client in HelloAck
     /// to restore channel state after reconnection.
-    pub async fn get_existing_channels(
-        &self,
-    ) -> Vec<qsh_core::protocol::ExistingChannel> {
+    pub async fn get_existing_channels(&self) -> Vec<qsh_core::protocol::ExistingChannel> {
         use qsh_core::protocol::{ExistingChannel, ExistingChannelType};
 
         let channels = self.channels.read().await;
@@ -469,14 +472,8 @@ impl ConnectionHandler {
 
         // Create terminal channel
         let quic = self.quic().await;
-        match TerminalChannel::new(
-            channel_id,
-            params,
-            quic,
-            Arc::clone(self),
-        )
-        .await
-        {
+        let output_mode = self.config.output_mode;
+        match TerminalChannel::new(channel_id, params, quic, Arc::clone(self), output_mode).await {
             Ok((channel, initial_state)) => {
                 // Register channel
                 {
@@ -485,11 +482,8 @@ impl ConnectionHandler {
                 }
 
                 // Send accept with initial state
-                self.send_channel_accept(
-                    channel_id,
-                    ChannelAcceptData::Terminal { initial_state },
-                )
-                .await
+                self.send_channel_accept(channel_id, ChannelAcceptData::Terminal { initial_state })
+                    .await
             }
             Err(e) => {
                 error!(channel_id = %channel_id, error = %e, "Failed to create terminal channel");
@@ -518,11 +512,8 @@ impl ConnectionHandler {
                     channels.insert(channel_id, ChannelHandle::FileTransfer(channel));
                 }
 
-                self.send_channel_accept(
-                    channel_id,
-                    ChannelAcceptData::FileTransfer { metadata },
-                )
-                .await
+                self.send_channel_accept(channel_id, ChannelAcceptData::FileTransfer { metadata })
+                    .await
             }
             Err(e) => {
                 let code = match &e {
@@ -590,9 +581,7 @@ impl ConnectionHandler {
         // Note: We don't send ChannelAccept here - for server-initiated channels,
         // the CLIENT sends ChannelAccept and we've already received it.
         let quic = self.quic().await;
-        let channel =
-            ForwardChannel::new_forwarded(channel_id, params, quic, tcp_stream)
-                .await?;
+        let channel = ForwardChannel::new_forwarded(channel_id, params, quic, tcp_stream).await?;
 
         let mut channels = self.channels.write().await;
         channels.insert(channel_id, ChannelHandle::Forward(channel));

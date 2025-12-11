@@ -173,25 +173,31 @@ mod tests {
 
     #[test]
     fn transient_errors() {
-        assert!(Error::Transport {
-            message: "connection lost".into()
-        }
-        .is_transient());
+        assert!(
+            Error::Transport {
+                message: "connection lost".into()
+            }
+            .is_transient()
+        );
         assert!(Error::ConnectionClosed.is_transient());
         assert!(Error::Timeout.is_transient());
-        assert!(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::ConnectionReset,
-            "reset"
-        ))
-        .is_transient());
+        assert!(
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset"
+            ))
+            .is_transient()
+        );
 
         // These should not be transient
         assert!(!Error::AuthenticationFailed.is_transient());
         assert!(!Error::SessionExpired.is_transient());
-        assert!(!Error::Protocol {
-            message: "bad".into()
-        }
-        .is_transient());
+        assert!(
+            !Error::Protocol {
+                message: "bad".into()
+            }
+            .is_transient()
+        );
     }
 
     #[test]
@@ -199,16 +205,20 @@ mod tests {
         assert!(Error::AuthenticationFailed.is_fatal());
         assert!(Error::SessionExpired.is_fatal());
         assert!(Error::SessionNotFound(42).is_fatal());
-        assert!(Error::Protocol {
-            message: "invalid".into()
-        }
-        .is_fatal());
+        assert!(
+            Error::Protocol {
+                message: "invalid".into()
+            }
+            .is_fatal()
+        );
 
         // These should not be fatal
-        assert!(!Error::Transport {
-            message: "lost".into()
-        }
-        .is_fatal());
+        assert!(
+            !Error::Transport {
+                message: "lost".into()
+            }
+            .is_fatal()
+        );
         assert!(!Error::ConnectionClosed.is_fatal());
         assert!(!Error::Timeout.is_fatal());
     }

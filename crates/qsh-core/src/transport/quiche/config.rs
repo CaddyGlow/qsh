@@ -155,7 +155,9 @@ pub fn server_config_with_ticket_key(
 /// Build a quiche::Config from a TransportConfigBuilder.
 ///
 /// This converts the library-agnostic configuration to a quiche-specific config.
-pub fn build_config(builder: &crate::transport::config::TransportConfigBuilder) -> Result<quiche::Config> {
+pub fn build_config(
+    builder: &crate::transport::config::TransportConfigBuilder,
+) -> Result<quiche::Config> {
     use crate::transport::config::EndpointRole;
 
     let mut config =

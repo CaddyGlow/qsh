@@ -29,7 +29,7 @@ impl Default for TermSize {
 }
 
 /// Terminal output mode for PTY data transmission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
 pub enum OutputMode {
     /// Send raw PTY bytes immediately (no batching).
     #[default]

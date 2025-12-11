@@ -15,8 +15,8 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-pub use render::NotificationStyle;
 use format::{format_escape_key, format_rtt};
+pub use render::NotificationStyle;
 use render::{NotificationMetrics, render, render_with_cursor};
 use state::NotificationState;
 
@@ -112,7 +112,8 @@ impl NotificationEngine {
             self.quiche_hit = true;
         } else if let (Some(srtt), Some(rttvar)) = (self.quiche_srtt, self.quiche_rttvar) {
             // Subsequent measurements: Jacobson/Karels algorithm (RFC 6298)
-            let new_rttvar = (1.0 - Self::QUICHE_BETA) * rttvar + Self::QUICHE_BETA * (srtt - rtt_ms).abs();
+            let new_rttvar =
+                (1.0 - Self::QUICHE_BETA) * rttvar + Self::QUICHE_BETA * (srtt - rtt_ms).abs();
             let new_srtt = (1.0 - Self::QUICHE_ALPHA) * srtt + Self::QUICHE_ALPHA * rtt_ms;
             self.quiche_srtt = Some(new_srtt);
             self.quiche_rttvar = Some(new_rttvar);
@@ -121,7 +122,8 @@ impl NotificationEngine {
 
     /// Get the smoothed quiche RTT.
     pub fn quiche_srtt(&self) -> Option<Duration> {
-        self.quiche_srtt.map(|ms| Duration::from_secs_f64(ms / 1000.0))
+        self.quiche_srtt
+            .map(|ms| Duration::from_secs_f64(ms / 1000.0))
     }
 
     /// Update packet loss for enhanced display.
@@ -150,7 +152,8 @@ impl NotificationEngine {
     /// * `permanent` - If false, message expires after 1 second
     /// * `show_quit` - Whether to show the quit keystroke hint
     pub fn set_notification_string(&mut self, msg: &str, permanent: bool, show_quit: bool) {
-        self.state.set_notification_string(msg, permanent, show_quit);
+        self.state
+            .set_notification_string(msg, permanent, show_quit);
     }
 
     /// Set a network error message (permanent, shows quit hint).
@@ -214,13 +217,18 @@ impl NotificationEngine {
             .unwrap_or_else(|| "-".to_string());
 
         // Show both RTTs: heartbeat (app) and quiche (transport)
-        let info = format!("RTT: {} (quic: {}) | loss: {} | {}", hb_rtt_str, quiche_rtt_str, loss_str, fps_str);
+        let info = format!(
+            "RTT: {} (quic: {}) | loss: {} | {}",
+            hb_rtt_str, quiche_rtt_str, loss_str, fps_str
+        );
         self.set_notification_string(&info, permanent, true);
     }
 
     /// Check if a transient info message is currently displayed.
     pub fn has_info_message(&self) -> bool {
-        self.state.message.is_some() && !self.state.message_is_network_error && self.state.message_expiration.is_some()
+        self.state.message.is_some()
+            && !self.state.message_is_network_error
+            && self.state.message_expiration.is_some()
     }
 
     /// Expire old messages.

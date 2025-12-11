@@ -60,7 +60,11 @@ pub fn client_config(_verify_peer: bool) -> Result<s2n_quic::client::Client> {
 }
 
 /// Create an s2n-quic server configuration with certificate and key (PEM format).
-pub fn server_config(cert_pem: &[u8], key_pem: &[u8], bind_addr: &str) -> Result<s2n_quic::server::Server> {
+pub fn server_config(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    bind_addr: &str,
+) -> Result<s2n_quic::server::Server> {
     server_config_with_ticket_key(cert_pem, key_pem, None, bind_addr)
 }
 
@@ -119,7 +123,9 @@ pub fn server_config_with_ticket_key(
 ///
 /// Note: s2n-quic uses a different configuration model than quiche.
 /// This function creates a client ready to connect.
-pub fn build_client_config(builder: &super::super::config::TransportConfigBuilder) -> Result<s2n_quic::client::Client> {
+pub fn build_client_config(
+    builder: &super::super::config::TransportConfigBuilder,
+) -> Result<s2n_quic::client::Client> {
     use s2n_quic::Client;
 
     // Configure TLS verification
@@ -155,9 +161,10 @@ pub fn build_server_config(
         message: "server config requires TLS credentials".to_string(),
     })?;
 
-    let cert_pem_str = std::str::from_utf8(&creds.cert_pem).map_err(|e| Error::CertificateError {
-        message: format!("invalid certificate PEM encoding: {}", e),
-    })?;
+    let cert_pem_str =
+        std::str::from_utf8(&creds.cert_pem).map_err(|e| Error::CertificateError {
+            message: format!("invalid certificate PEM encoding: {}", e),
+        })?;
 
     let key_pem_str = std::str::from_utf8(&creds.key_pem).map_err(|e| Error::CertificateError {
         message: format!("invalid key PEM encoding: {}", e),

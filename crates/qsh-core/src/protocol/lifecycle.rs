@@ -8,9 +8,9 @@
 use serde::{Deserialize, Serialize};
 
 use super::channel::ChannelId;
-use super::params::{ChannelParams, FileTransferMetadata};
 #[cfg(feature = "tunnel")]
 use super::params::IpNet;
+use super::params::{ChannelParams, FileTransferMetadata};
 use crate::terminal::TerminalState;
 
 // =============================================================================
@@ -195,7 +195,9 @@ impl std::fmt::Display for ChannelCloseReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ChannelCloseReason::Normal => write!(f, "normal"),
-            ChannelCloseReason::ProcessExited { exit_code: Some(code) } => {
+            ChannelCloseReason::ProcessExited {
+                exit_code: Some(code),
+            } => {
                 write!(f, "process exited ({})", code)
             }
             ChannelCloseReason::ProcessExited { exit_code: None } => {
@@ -279,9 +281,7 @@ mod tests {
         assert_eq!(
             format!(
                 "{}",
-                ChannelCloseReason::ProcessExited {
-                    exit_code: Some(0)
-                }
+                ChannelCloseReason::ProcessExited { exit_code: Some(0) }
             ),
             "process exited (0)"
         );

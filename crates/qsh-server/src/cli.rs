@@ -11,6 +11,7 @@ use qsh_core::constants::{
     DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_FORWARDS, DEFAULT_QUIC_PORT_RANGE,
     DEFAULT_SESSION_LINGER_SECS,
 };
+use qsh_core::protocol::OutputMode;
 
 /// Log output format for CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
@@ -140,6 +141,10 @@ pub struct Cli {
     pub session_linger_secs: u64,
 
     // === TransportSender (Mosh-style output batching) ===
+    /// Terminal output mode (direct/mosh/statediff)
+    #[arg(long = "mode", default_value = "direct", value_enum)]
+    pub output_mode: OutputMode,
+
     /// Minimum delay before sending output (milliseconds).
     /// Mosh uses 8ms for server, allowing efficient output coalescing.
     #[arg(long = "send-mindelay", default_value = "8", value_name = "MS")]
@@ -271,9 +276,10 @@ impl Default for Cli {
             #[cfg(feature = "tunnel")]
             allow_tunnel: false,
             session_linger_secs: 172_800,
-            send_mindelay_ms: 8,           // Mosh server default
-            send_interval_min_ms: 20,      // Mosh SEND_INTERVAL_MIN
-            send_interval_max_ms: 250,     // Mosh SEND_INTERVAL_MAX
+            output_mode: OutputMode::Direct,
+            send_mindelay_ms: 8,       // Mosh server default
+            send_interval_min_ms: 20,  // Mosh SEND_INTERVAL_MIN
+            send_interval_max_ms: 250, // Mosh SEND_INTERVAL_MAX
             #[cfg(feature = "standalone")]
             standalone: false,
             #[cfg(feature = "standalone")]

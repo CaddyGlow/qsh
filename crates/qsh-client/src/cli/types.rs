@@ -1,10 +1,11 @@
 //! CLI types and struct definitions.
 
+use std::path::PathBuf;
 #[cfg(feature = "tunnel")]
 use std::str::FromStr;
-use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, ValueEnum};
+use qsh_core::protocol::OutputMode;
 
 /// Log output format for CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
@@ -219,6 +220,14 @@ pub struct Cli {
     )]
     pub bootstrap_server_args: Option<String>,
 
+    /// Environment variables to pass to `qsh-server --bootstrap` (repeatable VAR=VALUE)
+    #[arg(
+        long = "bootstrap-server-env",
+        action = ArgAction::Append,
+        value_name = "VAR=VALUE"
+    )]
+    pub bootstrap_server_env: Vec<String>,
+
     /// Force predictive echo off (safer for password prompts)
     /// Shorthand for --prediction=off
     #[arg(long = "no-prediction", conflicts_with = "prediction_mode")]
@@ -258,6 +267,14 @@ pub struct Cli {
     /// Mosh uses 1ms for client, allowing very short coalescing windows.
     #[arg(long = "send-mindelay", default_value = "1", value_name = "MS")]
     pub send_mindelay_ms: u64,
+
+    /// Terminal output mode (direct/mosh/statediff)
+    #[arg(long = "mode", value_enum, conflicts_with = "no_batching")]
+    pub output_mode: Option<OutputMode>,
+
+    /// Disable output batching on server (deprecated - use --mode=direct)
+    #[arg(long = "no-batching", conflicts_with = "output_mode")]
+    pub no_batching: bool,
 
     /// Minimum send interval (milliseconds).
     /// Mosh uses 20ms as the floor for adaptive timing.
@@ -328,6 +345,42 @@ pub struct Cli {
     #[cfg(feature = "standalone")]
     #[arg(long = "no-agent")]
     pub no_agent: bool,
+}
+
+impl Cli {
+    /// Get the requested output mode, handling backward compatibility with --no-batching.
+    pub fn output_mode(&self) -> OutputMode {
+        if let Some(mode) = self.output_mode {
+            mode
+        } else if self.no_batching {
+            OutputMode::Direct
+        } else {
+            OutputMode::Direct // Default to direct mode
+        }
+    }
+
+    /// Parse bootstrap server env assignments (VAR=VALUE).
+    pub fn parse_bootstrap_server_env(&self) -> qsh_core::Result<Vec<(String, String)>> {
+        self.bootstrap_server_env
+            .iter()
+            .map(|s| parse_env_assignment(s))
+            .collect()
+    }
+}
+
+fn parse_env_assignment(s: &str) -> qsh_core::Result<(String, String)> {
+    if let Some((k, v)) = s.split_once('=') {
+        if k.is_empty() {
+            return Err(qsh_core::Error::Transport {
+                message: "env var key cannot be empty".to_string(),
+            });
+        }
+        Ok((k.to_string(), v.to_string()))
+    } else {
+        Err(qsh_core::Error::Transport {
+            message: format!("invalid env assignment (expected VAR=VALUE): {}", s),
+        })
+    }
 }
 
 // =============================================================================

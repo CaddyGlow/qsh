@@ -15,7 +15,7 @@ use tracing::{debug, error, info};
 use qsh_core::constants::IDLE_TIMEOUT;
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{HeartbeatPayload, Message};
-use qsh_core::transport::{Connection, QuicAcceptor, QuicConnection, ListenerConfig};
+use qsh_core::transport::{Connection, ListenerConfig, QuicAcceptor, QuicConnection};
 
 use crate::connection::{ConnectionConfig, ConnectionHandler, ShutdownReason};
 use crate::registry::ConnectionRegistry;

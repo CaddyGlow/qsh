@@ -1,7 +1,9 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
+    use crate::cli::{CliLogFormat, NotificationStyle, OverlayPosition, SshBootstrapMode};
+    use crate::{Cli, CpCli, FilePath};
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn verify_cli() {
@@ -79,6 +81,31 @@ mod tests {
         assert_eq!(
             cli.bootstrap_server_args,
             Some("--log-file /tmp/qsh.log -vvv".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_bootstrap_server_env() {
+        let cli = Cli::try_parse_from([
+            "qsh",
+            "--bootstrap-server-env",
+            "FOO=bar",
+            "--bootstrap-server-env",
+            "BAZ=qux",
+            "example.com",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.bootstrap_server_env,
+            vec!["FOO=bar".to_string(), "BAZ=qux".to_string()]
+        );
+        let parsed = cli.parse_bootstrap_server_env().unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                ("FOO".to_string(), "bar".to_string()),
+                ("BAZ".to_string(), "qux".to_string())
+            ]
         );
     }
 
@@ -248,8 +275,8 @@ mod tests {
 
     #[test]
     fn parse_notification_style() {
-        let cli =
-            Cli::try_parse_from(["qsh", "--notification-style", "enhanced", "example.com"]).unwrap();
+        let cli = Cli::try_parse_from(["qsh", "--notification-style", "enhanced", "example.com"])
+            .unwrap();
         assert_eq!(cli.notification_style, NotificationStyle::Enhanced);
 
         let cli =
@@ -448,18 +475,16 @@ mod tests {
 
     #[test]
     fn cp_is_upload() {
-        let cli =
-            CpCli::try_parse_from(["qscp", "/local/file.txt", "user@host:/remote/file.txt"])
-                .unwrap();
+        let cli = CpCli::try_parse_from(["qscp", "/local/file.txt", "user@host:/remote/file.txt"])
+            .unwrap();
         assert!(cli.is_upload());
         assert!(!cli.is_download());
     }
 
     #[test]
     fn cp_is_download() {
-        let cli =
-            CpCli::try_parse_from(["qscp", "user@host:/remote/file.txt", "/local/file.txt"])
-                .unwrap();
+        let cli = CpCli::try_parse_from(["qscp", "user@host:/remote/file.txt", "/local/file.txt"])
+            .unwrap();
         assert!(cli.is_download());
         assert!(!cli.is_upload());
     }
@@ -479,9 +504,8 @@ mod tests {
 
     #[test]
     fn cp_remote_host_download() {
-        let cli =
-            CpCli::try_parse_from(["qscp", "server.example.com:/remote/path", "/local/path"])
-                .unwrap();
+        let cli = CpCli::try_parse_from(["qscp", "server.example.com:/remote/path", "/local/path"])
+            .unwrap();
         let (host, user) = cli.remote_host().unwrap();
         assert_eq!(host, "server.example.com");
         assert!(user.is_none());
@@ -520,16 +544,15 @@ mod tests {
 
     #[test]
     fn cp_parallel_flag() {
-        let cli = CpCli::try_parse_from(["qscp", "-j", "8", "/local/file", "host:/remote/file"])
-            .unwrap();
+        let cli =
+            CpCli::try_parse_from(["qscp", "-j", "8", "/local/file", "host:/remote/file"]).unwrap();
         assert_eq!(cli.parallel, 8);
     }
 
     #[test]
     fn cp_port_flag() {
-        let cli =
-            CpCli::try_parse_from(["qscp", "-P", "2222", "/local/file", "host:/remote/file"])
-                .unwrap();
+        let cli = CpCli::try_parse_from(["qscp", "-P", "2222", "/local/file", "host:/remote/file"])
+            .unwrap();
         assert_eq!(cli.port, 2222);
     }
 

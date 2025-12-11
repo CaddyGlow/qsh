@@ -2,9 +2,10 @@
 //!
 //! Manages an interactive PTY session within a channel.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -12,11 +13,13 @@ use tracing::{debug, info, trace, warn};
 
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::{
-    ChannelCloseReason, ChannelData, ChannelId, ChannelPayload, Message,
-    TerminalInputData, TerminalOutputData, TerminalParams,
+    ChannelCloseReason, ChannelData, ChannelId, ChannelPayload, Message, OutputMode,
+    StateUpdateData, TerminalInputData, TerminalOutputData, TerminalParams,
 };
-use qsh_core::terminal::{TerminalParser, TerminalState};
-use qsh_core::transport::{Connection, QuicConnection, QuicStream, StreamPair, StreamType, TransportSender};
+use qsh_core::terminal::{Display, StateDiff, TerminalParser, TerminalState};
+use qsh_core::transport::{
+    Connection, QuicConnection, QuicStream, StreamPair, StreamType, TransportSender,
+};
 
 use crate::pty::{Pty, PtyRelay};
 use crate::registry::PtyControl;
@@ -63,6 +66,27 @@ struct RealPtyControl {
     pty: Arc<Pty>,
 }
 
+fn debug_rows_enabled() -> bool {
+    static DEBUG_ROWS: OnceLock<bool> = OnceLock::new();
+    *DEBUG_ROWS.get_or_init(|| {
+        std::env::var("QSH_MOSH_DEBUG_ROWS")
+            .ok()
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn take_debug_budget() -> bool {
+    static DEBUG_BUDGET: OnceLock<AtomicUsize> = OnceLock::new();
+    let budget = DEBUG_BUDGET.get_or_init(|| AtomicUsize::new(16));
+    budget
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| (v > 0).then_some(v - 1))
+        .is_ok()
+}
+
 impl PtyControl for RealPtyControl {
     fn size(&self) -> (u16, u16) {
         self.pty.size()
@@ -94,6 +118,7 @@ impl TerminalChannel {
         params: TerminalParams,
         quic: Arc<QuicConnection>,
         handler: Arc<crate::connection::ConnectionHandler>,
+        output_mode: OutputMode,
     ) -> Result<(Self, TerminalState)> {
         let cols = params.term_size.cols;
         let rows = params.term_size.rows;
@@ -102,7 +127,10 @@ impl TerminalChannel {
         let env: Vec<(String, String)> = params
             .env
             .into_iter()
-            .chain(std::iter::once(("TERM".to_string(), params.term_type.clone())))
+            .chain(std::iter::once((
+                "TERM".to_string(),
+                params.term_type.clone(),
+            )))
             .collect();
 
         // Spawn PTY with optional command
@@ -127,7 +155,7 @@ impl TerminalChannel {
         let (output_tx, _) = broadcast::channel(256);
 
         // Create shutdown channel
-        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
 
         // Open output stream
         let output_stream = quic
@@ -155,86 +183,19 @@ impl TerminalChannel {
             handler: Arc::downgrade(&handler),
         });
 
-        // Spawn output relay task with Mosh-style output batching (8ms mindelay for server)
+        // Spawn output relay task based on output mode
         let inner_clone = Arc::clone(&inner);
-        let mut output_rx = output_rx;
         let relay_task = tokio::spawn(async move {
-            // Initialize TransportSender for Mosh-style output coalescing
-            // Server uses 8ms mindelay (vs 1ms for client) for efficient output batching
-            let mut output_sender = TransportSender::for_server();
-
-            loop {
-                tokio::select! {
-                    biased;
-
-                    _ = shutdown_rx.recv() => {
-                        debug!(channel_id = %inner_clone.channel_id, "Terminal relay shutdown");
-                        // Flush any pending output before shutdown
-                        if output_sender.has_pending() {
-                            let data = output_sender.flush();
-                            let _ = inner_clone.send_output_to_client(data).await;
-                        }
-                        break;
-                    }
-
-                    output = output_rx.recv() => {
-                        match output {
-                            Some(data) => {
-                                // Update terminal state immediately (for accurate tracking)
-                                // This also broadcasts to local subscribers
-                                inner_clone.update_state_and_broadcast(&data).await;
-
-                                // Push to TransportSender for batched network send
-                                output_sender.push(&data);
-                                trace!(
-                                    channel_id = %inner_clone.channel_id,
-                                    output_len = data.len(),
-                                    pending_len = output_sender.pending_len(),
-                                    "Pushed output to TransportSender"
-                                );
-
-                                // Check if ready to send (timer may have expired)
-                                if let Some(batched) = output_sender.tick() {
-                                    trace!(
-                                        channel_id = %inner_clone.channel_id,
-                                        len = batched.len(),
-                                        send_interval_ms = output_sender.send_interval().as_millis(),
-                                        "TransportSender tick flush (inline)"
-                                    );
-                                    let _ = inner_clone.send_output_to_client(batched).await;
-                                }
-                            }
-                            None => {
-                                // PTY has exited - flush remaining output then break
-                                if output_sender.has_pending() {
-                                    let data = output_sender.flush();
-                                    debug!(
-                                        channel_id = %inner_clone.channel_id,
-                                        len = data.len(),
-                                        "Flushing remaining output on PTY exit"
-                                    );
-                                    let _ = inner_clone.send_output_to_client(data).await;
-                                }
-                                info!(channel_id = %inner_clone.channel_id, "PTY output_rx returned None - PTY exited, breaking relay loop");
-                                break;
-                            }
-                        }
-                    }
-
-                    // TransportSender timer: flush pending output when timing allows
-                    // (Mosh-style: max(mindelay_clock + 8ms, last_send + send_interval))
-                    _ = tokio::time::sleep_until(output_sender.next_send_time().into()),
-                        if output_sender.has_pending() => {
-                        if let Some(batched) = output_sender.tick() {
-                            trace!(
-                                channel_id = %inner_clone.channel_id,
-                                len = batched.len(),
-                                send_interval_ms = output_sender.send_interval().as_millis(),
-                                "TransportSender timer flush"
-                            );
-                            let _ = inner_clone.send_output_to_client(batched).await;
-                        }
-                    }
+            // Call the appropriate relay loop based on output mode
+            match output_mode {
+                OutputMode::Direct => {
+                    direct_relay_loop(inner_clone.clone(), output_rx, shutdown_rx).await;
+                }
+                OutputMode::Mosh => {
+                    mosh_relay_loop(inner_clone.clone(), output_rx, shutdown_rx).await;
+                }
+                OutputMode::StateDiff => {
+                    statediff_relay_loop(inner_clone.clone(), output_rx, shutdown_rx).await;
                 }
             }
 
@@ -396,7 +357,9 @@ impl TerminalChannel {
 
     /// Handle state acknowledgment from client.
     pub async fn handle_state_ack(&self, generation: u64) {
-        self.inner.acked_generation.store(generation, Ordering::SeqCst);
+        self.inner
+            .acked_generation
+            .store(generation, Ordering::SeqCst);
     }
 
     /// Subscribe to PTY output.
@@ -499,6 +462,222 @@ impl TerminalChannel {
     }
 }
 
+/// Direct relay loop: send raw PTY output immediately (no batching).
+async fn direct_relay_loop(
+    inner: Arc<TerminalChannelInner>,
+    mut output_rx: mpsc::Receiver<Vec<u8>>,
+    mut shutdown_rx: mpsc::Receiver<()>,
+) {
+    debug!(channel_id = %inner.channel_id, "Terminal relay: DIRECT mode (no batching)");
+
+    loop {
+        tokio::select! {
+            biased;
+
+            _ = shutdown_rx.recv() => {
+                debug!(channel_id = %inner.channel_id, "Terminal relay shutdown");
+                break;
+            }
+
+            output = output_rx.recv() => {
+                match output {
+                    Some(data) => {
+                        // Update terminal state immediately (for accurate tracking)
+                        // This also broadcasts to local subscribers
+                        inner.update_state_and_broadcast(&data).await;
+
+                        // Send immediately without batching
+                        trace!(
+                            channel_id = %inner.channel_id,
+                            len = data.len(),
+                            "Sending output immediately (no batching)"
+                        );
+                        let _ = inner.send_output_to_client(data).await;
+                    }
+                    None => {
+                        info!(channel_id = %inner.channel_id, "PTY output_rx returned None - PTY exited, breaking relay loop");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Mosh relay loop: generate ANSI escape sequences from terminal state diffs, batched.
+async fn mosh_relay_loop(
+    inner: Arc<TerminalChannelInner>,
+    mut output_rx: mpsc::Receiver<Vec<u8>>,
+    mut shutdown_rx: mpsc::Receiver<()>,
+) {
+    debug!(channel_id = %inner.channel_id, "Terminal relay: MOSH mode (ANSI from state diffs, batched)");
+
+    let mut output_sender = TransportSender::for_server();
+    let mut display = Display::new();
+
+    loop {
+        tokio::select! {
+            biased;
+
+            _ = shutdown_rx.recv() => {
+                debug!(channel_id = %inner.channel_id, "Terminal relay shutdown");
+                // Generate final frame and send
+                let state = inner.parser.lock().await.state().clone();
+                let ansi = display.new_frame(&state);
+                if !ansi.is_empty() {
+                    let _ = inner.send_output_to_client(ansi).await;
+                }
+                break;
+            }
+
+            output = output_rx.recv() => {
+                match output {
+                    Some(data) => {
+                        // Update terminal state from raw PTY output
+                        inner.update_state_and_broadcast(&data).await;
+                        inner.maybe_debug_log_state("mosh_update").await;
+
+                        // Accumulate raw bytes for timing (use dummy byte)
+                        output_sender.push(&[0]);
+
+                        // Check if it's time to send a frame
+                        if output_sender.tick().is_some() {
+                            output_sender.flush();
+
+                            // Generate complete ANSI frame from current state
+                            let state = inner.parser.lock().await.state().clone();
+                            let ansi = display.new_frame(&state);
+
+                            trace!(
+                                channel_id = %inner.channel_id,
+                                output_len = data.len(),
+                                ansi_len = ansi.len(),
+                                "Generated ANSI frame (mosh mode)"
+                            );
+
+                            // Send complete frame immediately (don't batch frames together!)
+                            if !ansi.is_empty() {
+                                let _ = inner.send_output_to_client(ansi).await;
+                            }
+                        }
+                    }
+                    None => {
+                        // Generate final frame and send
+                        let state = inner.parser.lock().await.state().clone();
+                        let ansi = display.new_frame(&state);
+                        if !ansi.is_empty() {
+                            debug!(
+                                channel_id = %inner.channel_id,
+                                len = ansi.len(),
+                                "Sending final ANSI frame on PTY exit"
+                            );
+                            let _ = inner.send_output_to_client(ansi).await;
+                        }
+                        info!(channel_id = %inner.channel_id, "PTY output_rx returned None - PTY exited, breaking relay loop");
+                        break;
+                    }
+                }
+            }
+
+            _ = tokio::time::sleep_until(output_sender.next_send_time().into()),
+                if output_sender.has_pending() => {
+                output_sender.flush();
+
+                // Time to send a frame
+                let state = inner.parser.lock().await.state().clone();
+                let ansi = display.new_frame(&state);
+
+                trace!(
+                    channel_id = %inner.channel_id,
+                    len = ansi.len(),
+                    "Generated ANSI frame (timer)"
+                );
+
+                // Send complete frame immediately
+                if !ansi.is_empty() {
+                    let _ = inner.send_output_to_client(ansi).await;
+                }
+            }
+        }
+    }
+}
+
+/// StateDiff relay loop: send binary StateDiff structs, batched.
+async fn statediff_relay_loop(
+    inner: Arc<TerminalChannelInner>,
+    mut output_rx: mpsc::Receiver<Vec<u8>>,
+    mut shutdown_rx: mpsc::Receiver<()>,
+) {
+    debug!(channel_id = %inner.channel_id, "Terminal relay: STATEDIFF mode (binary diffs, batched)");
+
+    let mut output_sender = TransportSender::for_server();
+    let mut last_sent_state: Option<TerminalState> = None;
+
+    loop {
+        tokio::select! {
+            biased;
+
+            _ = shutdown_rx.recv() => {
+                debug!(channel_id = %inner.channel_id, "Terminal relay shutdown");
+                send_state_diff(&inner, &mut last_sent_state).await;
+                break;
+            }
+
+            output = output_rx.recv() => {
+                match output {
+                    Some(data) => {
+                        inner.update_state_and_broadcast(&data).await;
+                        output_sender.push(&[0]); // Dummy byte for timing
+
+                        if output_sender.tick().is_some() {
+                            output_sender.flush();
+                            send_state_diff(&inner, &mut last_sent_state).await;
+                        }
+                    }
+                    None => {
+                        send_state_diff(&inner, &mut last_sent_state).await;
+                        info!(channel_id = %inner.channel_id, "PTY output_rx returned None - PTY exited, breaking relay loop");
+                        break;
+                    }
+                }
+            }
+
+            _ = tokio::time::sleep_until(output_sender.next_send_time().into()),
+                if output_sender.has_pending() => {
+                output_sender.flush();
+                send_state_diff(&inner, &mut last_sent_state).await;
+            }
+        }
+    }
+}
+
+/// Helper function to send state diff in statediff mode.
+async fn send_state_diff(
+    inner: &TerminalChannelInner,
+    last_sent_state: &mut Option<TerminalState>,
+) {
+    let current_state = inner.parser.lock().await.state().clone();
+
+    let diff = if let Some(last) = last_sent_state {
+        last.diff_to(&current_state)
+    } else {
+        StateDiff::Full(current_state.clone())
+    };
+
+    trace!(
+        channel_id = %inner.channel_id,
+        diff_type = match &diff {
+            StateDiff::Full(_) => "Full",
+            StateDiff::Incremental { .. } => "Incremental",
+            StateDiff::CursorOnly { .. } => "CursorOnly",
+        },
+        "Sending state diff"
+    );
+
+    let _ = inner.send_state_update(diff).await;
+    *last_sent_state = Some(current_state);
+}
+
 impl TerminalChannelInner {
     /// Process PTY output and send to client (non-batched version).
     ///
@@ -575,6 +754,77 @@ impl TerminalChannelInner {
 
         // Broadcast to any local subscribers
         let _ = self.output_tx.send(data.to_vec());
+    }
+
+    async fn maybe_debug_log_state(&self, label: &str) {
+        if !debug_rows_enabled() || !take_debug_budget() {
+            return;
+        }
+
+        let state = self.parser.lock().await.state().clone();
+        let cursor = state.cursor;
+        let rows = state.rows().min(8);
+        for r in 0..rows {
+            if let Some(row) = state.screen().row(r) {
+                let preview: String = row
+                    .iter()
+                    .take(state.cols() as usize)
+                    .map(|c| {
+                        let ch = c.ch;
+                        if ch.is_control() { ' ' } else { ch }
+                    })
+                    .collect();
+                tracing::debug!(
+                    label,
+                    row = r,
+                    cursor_row = cursor.row,
+                    cursor_col = cursor.col,
+                    preview = ?preview,
+                    "server parser row"
+                );
+            }
+        }
+    }
+
+    /// Send state update to client (used in statediff mode).
+    async fn send_state_update(&self, diff: StateDiff) -> Result<()> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        // Skip sending if disconnected
+        if self.disconnected.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        let mut stream_guard = self.output_stream.lock().await;
+        if let Some(ref mut stream) = *stream_guard {
+            let state_update = Message::ChannelDataMsg(ChannelData {
+                channel_id: self.channel_id,
+                payload: ChannelPayload::StateUpdate(StateUpdateData {
+                    diff,
+                    confirmed_input_seq: self.confirmed_input_seq.load(Ordering::SeqCst),
+                    timestamp: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros() as u64,
+                }),
+            });
+
+            if let Err(e) = stream.send(&state_update).await {
+                // Connection lost - mark disconnected
+                if !self.disconnected.swap(true, Ordering::SeqCst) {
+                    info!(
+                        channel_id = %self.channel_id,
+                        error = %e,
+                        "Output stream disconnected during state update"
+                    );
+                }
+                return Ok(());
+            }
+        }
+
+        Ok(())
     }
 
     /// Send batched output to client (called from TransportSender timer).

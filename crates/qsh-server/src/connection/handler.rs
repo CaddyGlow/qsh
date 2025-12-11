@@ -39,7 +39,9 @@ impl ConnectionHandler {
         use tracing::warn;
 
         let new_quic = Arc::new(new_quic);
-        let new_control_sender = new_control.sender().expect("control stream must support sending");
+        let new_control_sender = new_control
+            .sender()
+            .expect("control stream must support sending");
 
         info!(
             session_id = ?self.session_id,

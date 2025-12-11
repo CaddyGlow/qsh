@@ -34,7 +34,10 @@ impl S2nSender {
     pub async fn send_raw(&self, data: &[u8]) -> Result<()> {
         use tokio::io::AsyncWriteExt;
 
-        if matches!(self.inner.direction, super::stream::StreamDirection::RecvOnly) {
+        if matches!(
+            self.inner.direction,
+            super::stream::StreamDirection::RecvOnly
+        ) {
             return Err(Error::Transport {
                 message: "stream is receive-only".to_string(),
             });
@@ -56,7 +59,10 @@ impl S2nSender {
     pub async fn finish(&self) -> Result<()> {
         use tokio::io::AsyncWriteExt;
 
-        if matches!(self.inner.direction, super::stream::StreamDirection::RecvOnly) {
+        if matches!(
+            self.inner.direction,
+            super::stream::StreamDirection::RecvOnly
+        ) {
             return Ok(());
         }
 

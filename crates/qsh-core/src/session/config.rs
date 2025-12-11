@@ -5,9 +5,7 @@
 
 use std::time::Duration;
 
-use crate::constants::{
-    DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_CHANNELS, DEFAULT_MAX_FORWARDS,
-};
+use crate::constants::{DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_CHANNELS, DEFAULT_MAX_FORWARDS};
 use crate::protocol::Capabilities;
 
 /// Base configuration shared between client and server.

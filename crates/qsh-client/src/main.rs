@@ -260,13 +260,33 @@ async fn run_client_channel_model(
 ) -> qsh_core::Result<()> {
     info!("Using channel model...");
 
+    // Build server args, adding --mode if requested
+    let mut server_args = cli.bootstrap_server_args.clone().unwrap_or_default();
+
+    // Pass output mode to server
+    let output_mode = cli.output_mode();
+    if !server_args.is_empty() {
+        server_args.push(' ');
+    }
+    server_args.push_str("--mode ");
+    server_args.push_str(match output_mode {
+        qsh_core::protocol::OutputMode::Direct => "direct",
+        qsh_core::protocol::OutputMode::Mosh => "mosh",
+        qsh_core::protocol::OutputMode::StateDiff => "state-diff",
+    });
+
     // Build SSH config from CLI options
     let ssh_config = SshConfig {
         connect_timeout: std::time::Duration::from_secs(30),
         identity_file: cli.identity.first().cloned(),
         skip_host_key_check: false,
         port_range: cli.bootstrap_port_range,
-        server_args: cli.bootstrap_server_args.clone(),
+        server_env: cli.parse_bootstrap_server_env()?,
+        server_args: if server_args.is_empty() {
+            None
+        } else {
+            Some(server_args)
+        },
         mode: match cli.ssh_bootstrap_mode {
             SshBootstrapMode::Ssh => BootstrapMode::SshCli,
             SshBootstrapMode::Russh => BootstrapMode::Russh,
@@ -742,6 +762,7 @@ async fn run_reconnectable_session(
                 allocate_pty: cli.should_allocate_pty(),
                 last_generation: terminal_state.last_generation,
                 last_input_seq: terminal_state.last_input_seq,
+                output_mode: cli.output_mode(),
             };
 
             match conn.open_terminal(terminal_params).await {
@@ -910,7 +931,7 @@ async fn run_reconnectable_session(
                     }
                 } => {
                     if let Some(msg) = result {
-                        debug!(?msg, "Received control message");
+                        trace!(?msg, "Received control message");
                         match msg {
                             Message::Heartbeat(hb) => {
                                 if let Some(_rtt) = heartbeat_tracker.receive_heartbeat(&hb) {

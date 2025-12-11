@@ -25,7 +25,6 @@ pub enum Message {
     // =========================================================================
     // Connection-level messages (control stream)
     // =========================================================================
-
     /// Client hello with session key and capabilities.
     Hello(HelloPayload),
     /// Server acknowledgment of hello.
@@ -38,7 +37,6 @@ pub enum Message {
     // =========================================================================
     // Global requests (control stream)
     // =========================================================================
-
     /// Connection-level request (for port forwarding setup, etc.).
     GlobalRequest(GlobalRequestPayload),
     /// Response to a global request.
@@ -47,7 +45,6 @@ pub enum Message {
     // =========================================================================
     // Channel lifecycle messages (control stream)
     // =========================================================================
-
     /// Request to open a new channel.
     ChannelOpen(ChannelOpenPayload),
     /// Accept a channel open request.
@@ -60,7 +57,6 @@ pub enum Message {
     // =========================================================================
     // Per-channel control messages (control stream)
     // =========================================================================
-
     /// Terminal resize notification.
     Resize(ResizePayload),
     /// Client acknowledgment of state update.
@@ -69,14 +65,12 @@ pub enum Message {
     // =========================================================================
     // Channel data (channel streams)
     // =========================================================================
-
     /// Data on a channel stream (wrapped payload).
     ChannelDataMsg(ChannelData),
 
     // =========================================================================
     // Standalone authentication messages (feature-gated)
     // =========================================================================
-
     /// Server sends after QUIC connect (includes server signature for client to verify).
     #[cfg(feature = "standalone")]
     AuthChallenge(AuthChallengePayload),
@@ -96,8 +90,8 @@ pub enum Message {
 mod tests {
     use super::*;
     use crate::protocol::{
-        Capabilities, ChannelAcceptData, ChannelId, ChannelParams, ChannelRejectCode,
-        SessionId, ShutdownReason, TerminalParams,
+        Capabilities, ChannelAcceptData, ChannelId, ChannelParams, ChannelRejectCode, SessionId,
+        ShutdownReason, TerminalParams,
     };
     use crate::terminal::TerminalState;
 

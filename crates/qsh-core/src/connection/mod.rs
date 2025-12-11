@@ -5,10 +5,10 @@
 //! - `ChannelMap`: Generic channel container for both client and server
 //! - `GlobalRequestTracker`: Track pending global requests and responses
 
-mod heartbeat;
 mod channel_map;
 mod global_request;
+mod heartbeat;
 
-pub use heartbeat::{HeartbeatTracker, HeartbeatPayload};
 pub use channel_map::ChannelMap;
 pub use global_request::GlobalRequestTracker;
+pub use heartbeat::{HeartbeatPayload, HeartbeatTracker};

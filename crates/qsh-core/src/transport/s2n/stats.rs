@@ -4,8 +4,8 @@
 //! handshake state tracking, and session ticket management for 0-RTT resumption.
 
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use s2n_quic::provider::tls::s2n_tls::callbacks::ConnectionFuture;
@@ -185,9 +185,7 @@ impl s2n_quic::provider::tls::s2n_tls::config::ConnectionInitializer for Session
     }
 }
 
-impl s2n_quic::provider::tls::s2n_tls::callbacks::SessionTicketCallback
-    for SessionTicketHandler
-{
+impl s2n_quic::provider::tls::s2n_tls::callbacks::SessionTicketCallback for SessionTicketHandler {
     fn on_session_ticket(
         &self,
         connection: &mut s2n_quic::provider::tls::s2n_tls::connection::Connection,
@@ -249,26 +247,26 @@ impl s2n_quic::provider::event::Subscriber for StatsSubscriber {
         _meta: &s2n_quic::provider::event::events::ConnectionMeta,
         event: &s2n_quic::provider::event::events::RecoveryMetrics,
     ) {
-        context.stats.smoothed_rtt_us.store(
-            event.smoothed_rtt.as_micros() as u64,
-            Ordering::Relaxed,
-        );
-        context.stats.min_rtt_us.store(
-            event.min_rtt.as_micros() as u64,
-            Ordering::Relaxed,
-        );
-        context.stats.latest_rtt_us.store(
-            event.latest_rtt.as_micros() as u64,
-            Ordering::Relaxed,
-        );
-        context.stats.congestion_window.store(
-            event.congestion_window,
-            Ordering::Relaxed,
-        );
-        context.stats.bytes_in_flight.store(
-            event.bytes_in_flight,
-            Ordering::Relaxed,
-        );
+        context
+            .stats
+            .smoothed_rtt_us
+            .store(event.smoothed_rtt.as_micros() as u64, Ordering::Relaxed);
+        context
+            .stats
+            .min_rtt_us
+            .store(event.min_rtt.as_micros() as u64, Ordering::Relaxed);
+        context
+            .stats
+            .latest_rtt_us
+            .store(event.latest_rtt.as_micros() as u64, Ordering::Relaxed);
+        context
+            .stats
+            .congestion_window
+            .store(event.congestion_window, Ordering::Relaxed);
+        context
+            .stats
+            .bytes_in_flight
+            .store(event.bytes_in_flight, Ordering::Relaxed);
     }
 
     fn on_packet_lost(
@@ -278,7 +276,10 @@ impl s2n_quic::provider::event::Subscriber for StatsSubscriber {
         event: &s2n_quic::provider::event::events::PacketLost,
     ) {
         context.stats.packets_lost.fetch_add(1, Ordering::Relaxed);
-        context.stats.bytes_lost.fetch_add(event.bytes_lost as u64, Ordering::Relaxed);
+        context
+            .stats
+            .bytes_lost
+            .fetch_add(event.bytes_lost as u64, Ordering::Relaxed);
     }
 
     fn on_packet_sent(

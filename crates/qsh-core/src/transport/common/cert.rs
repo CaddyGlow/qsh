@@ -66,11 +66,9 @@ pub fn cert_hash(cert_der: &[u8]) -> Vec<u8> {
 
 /// Generate a self-signed certificate and return (cert_pem, key_pem).
 pub fn generate_self_signed_cert() -> Result<(Vec<u8>, Vec<u8>)> {
-    let certified_key =
-        rcgen::generate_simple_self_signed(vec!["qsh-server".to_string()]).map_err(|e| {
-            Error::CertificateError {
-                message: format!("failed to generate certificate: {}", e),
-            }
+    let certified_key = rcgen::generate_simple_self_signed(vec!["qsh-server".to_string()])
+        .map_err(|e| Error::CertificateError {
+            message: format!("failed to generate certificate: {}", e),
         })?;
 
     let cert_pem = certified_key.cert.pem().into_bytes();
