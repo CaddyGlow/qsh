@@ -803,10 +803,6 @@ async fn run_reconnectable_session(
         prediction_overlay.clear_all();
         renderer.invalidate();
 
-        // Frame rate tracking (for info display)
-        let mut frame_count: u64 = 0;
-        let frame_rate_start = std::time::Instant::now();
-
         // Heartbeat tracking for RTT measurement (mosh-style adaptive interval)
         let mut heartbeat_tracker = HeartbeatTracker::new();
         // Next heartbeat time (adaptive: SRTT/2 clamped to 20-250ms)
@@ -1013,15 +1009,9 @@ async fn run_reconnectable_session(
                         }
                         EscapeResult::Waiting => {
                             // Waiting for command key - show connection info (like mosh)
-                            // Calculate frame rate
-                            let elapsed = frame_rate_start.elapsed().as_secs_f64();
-                            let fps = if elapsed > 0.0 {
-                                Some(frame_count as f64 / elapsed)
-                            } else {
-                                None
-                            };
                             // Show as permanent while waiting (will be cleared on command/timeout)
-                            notification.show_info(fps, true);
+                            // Uses internal rolling FPS average
+                            notification.show_info(None, true);
                             render_notification(&notification, &mut stdout).await;
                             continue;
                         }
@@ -1209,8 +1199,8 @@ async fn run_reconnectable_session(
                             notification.server_acked(now);
                             notification.adjust_message();
 
-                            // Track frame rate
-                            frame_count += 1;
+                            // Track frame rate (rolling average, default 1s window)
+                            notification.record_frame(now);
 
                             // Track confirmed input seq for recovery
                             terminal_state.last_input_seq = output.confirmed_input_seq;
@@ -1393,14 +1383,9 @@ async fn run_reconnectable_session(
 
                     // If escape handler is waiting, refresh the info bar with current stats
                     if escape_handler.is_waiting() {
-                        let elapsed = frame_rate_start.elapsed().as_secs_f64();
-                        let fps = if elapsed > 0.0 {
-                            Some(frame_count as f64 / elapsed)
-                        } else {
-                            None
-                        };
                         // Keep permanent while waiting
-                        notification.show_info(fps, true);
+                        // Uses internal rolling FPS average
+                        notification.show_info(None, true);
                     }
 
                     // Render notification bar
@@ -1421,13 +1406,8 @@ async fn run_reconnectable_session(
                     }
 
                     // Refresh the info bar with current stats
-                    let elapsed = frame_rate_start.elapsed().as_secs_f64();
-                    let fps = if elapsed > 0.0 {
-                        Some(frame_count as f64 / elapsed)
-                    } else {
-                        None
-                    };
-                    notification.show_info(fps, true);
+                    // Uses internal rolling FPS average
+                    notification.show_info(None, true);
                     render_notification(&notification, &mut stdout).await;
                 }
             }

@@ -131,6 +131,21 @@ impl NotificationEngine {
         self.metrics.update_packet_loss(loss);
     }
 
+    /// Record a frame for FPS calculation.
+    ///
+    /// Call this for each terminal output frame to maintain a rolling FPS average.
+    pub fn record_frame(&mut self, timestamp: Instant) {
+        self.metrics.record_frame(timestamp);
+    }
+
+    /// Set the FPS averaging window duration.
+    ///
+    /// # Arguments
+    /// * `window` - Duration for the rolling FPS window (default: 1 second)
+    pub fn set_fps_window(&mut self, window: Duration) {
+        self.metrics.set_fps_window(window);
+    }
+
     /// Record that we received data from the server.
     ///
     /// This is called for any data received, including keepalives.
@@ -190,7 +205,7 @@ impl NotificationEngine {
     /// Displays RTT, frame rate, and packet loss in the notification bar.
     ///
     /// # Arguments
-    /// * `frame_rate` - Current frame rate (fps)
+    /// * `frame_rate` - Optional override for frame rate (fps). If None, uses internal rolling average.
     /// * `permanent` - If true, stays visible until cleared; if false, expires after 1 second
     pub fn show_info(&mut self, frame_rate: Option<f64>, permanent: bool) {
         // Heartbeat SRTT (application-level)
@@ -212,7 +227,9 @@ impl NotificationEngine {
             .map(|l| format!("{:.1}%", l * 100.0))
             .unwrap_or_else(|| "-".to_string());
 
-        let fps_str = frame_rate
+        // Use provided frame_rate or fall back to internal rolling average
+        let fps = frame_rate.or_else(|| self.metrics.fps());
+        let fps_str = fps
             .map(|f| format!("{:.0}fps", f))
             .unwrap_or_else(|| "-".to_string());
 

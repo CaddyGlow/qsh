@@ -1,5 +1,6 @@
 //! Rendering logic for notification bar.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use super::format::{format_rtt, human_readable_duration, human_readable_duration_short};
@@ -26,6 +27,10 @@ pub struct NotificationMetrics {
     pub rtt: Option<Duration>,
     /// Packet loss for enhanced display.
     pub packet_loss: Option<f64>,
+    /// Frame timestamps for FPS calculation (rolling window).
+    frame_timestamps: VecDeque<Instant>,
+    /// FPS averaging window duration (default: 1 second).
+    fps_window: Duration,
 }
 
 impl Default for NotificationMetrics {
@@ -35,13 +40,26 @@ impl Default for NotificationMetrics {
 }
 
 impl NotificationMetrics {
-    /// Create new metrics.
+    /// Default FPS averaging window duration (1 second).
+    const DEFAULT_FPS_WINDOW: Duration = Duration::from_secs(1);
+
+    /// Create new metrics with default 1-second FPS window.
     pub fn new() -> Self {
         Self {
             user_host: None,
             rtt: None,
             packet_loss: None,
+            frame_timestamps: VecDeque::new(),
+            fps_window: Self::DEFAULT_FPS_WINDOW,
         }
+    }
+
+    /// Set the FPS averaging window duration.
+    ///
+    /// # Arguments
+    /// * `window` - Duration for the rolling FPS window (e.g., 1s, 5s)
+    pub fn set_fps_window(&mut self, window: Duration) {
+        self.fps_window = window;
     }
 
     /// Set user@host for enhanced display.
@@ -57,6 +75,45 @@ impl NotificationMetrics {
     /// Update packet loss for enhanced display.
     pub fn update_packet_loss(&mut self, loss: f64) {
         self.packet_loss = Some(loss.clamp(0.0, 1.0));
+    }
+
+    /// Record a frame for FPS calculation.
+    ///
+    /// Maintains a rolling window of frame timestamps.
+    pub fn record_frame(&mut self, now: Instant) {
+        // Add the new frame timestamp
+        self.frame_timestamps.push_back(now);
+
+        // Remove frames older than the window
+        let cutoff = now - self.fps_window;
+        while let Some(&oldest) = self.frame_timestamps.front() {
+            if oldest < cutoff {
+                self.frame_timestamps.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Get the average FPS over the configured window.
+    ///
+    /// Returns None if there are no frames in the window.
+    pub fn fps(&self) -> Option<f64> {
+        if self.frame_timestamps.len() < 2 {
+            return None;
+        }
+
+        // Calculate elapsed time from oldest to newest frame
+        let oldest = *self.frame_timestamps.front()?;
+        let newest = *self.frame_timestamps.back()?;
+        let elapsed = newest.duration_since(oldest).as_secs_f64();
+
+        if elapsed > 0.0 {
+            // Count is len - 1 because we're measuring intervals
+            Some((self.frame_timestamps.len() - 1) as f64 / elapsed)
+        } else {
+            None
+        }
     }
 }
 
