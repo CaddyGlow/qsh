@@ -211,6 +211,9 @@ pub enum SessionEvent {
     TransportFlush,
     OverlayRefresh,
     EscapeInfo,
+    InputQueued,  // Input was queued in transport sender, will flush on timer
+    Exit,         // User requested exit (EOF or escape sequence)
+    Error(qsh_core::Error),  // Terminal event error
 }
 
 /// Terminal-specific event wrapper.
@@ -473,7 +476,416 @@ impl TerminalComponent {
     }
 
     pub async fn next_event(&mut self) -> SessionEvent {
-        todo!("Select over terminal event sources")
+        // Set up SIGWINCH signal handler for resize events
+        #[cfg(unix)]
+        let mut sigwinch = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+            .expect("Failed to setup SIGWINCH handler");
+
+        loop {
+            #[cfg(unix)]
+            let resize_event = sigwinch.recv();
+            #[cfg(not(unix))]
+            let resize_event = std::future::pending::<Option<()>>();
+
+            // Get terminal reference for this iteration
+            let terminal = self.channel.as_mut().expect("Terminal channel not initialized");
+
+            tokio::select! {
+                biased;
+
+                // Handle terminal resize
+                _ = resize_event => {
+                    if let Ok(new_size) = crate::get_terminal_size() {
+                        tracing::debug!(cols = new_size.cols, rows = new_size.rows, "Terminal resized");
+
+                        // Update client-side parser with new size
+                        if let Some(ref mut parser) = self.client_parser {
+                            *parser = TerminalParser::new(new_size.cols, new_size.rows);
+                            self.renderer.invalidate(); // Force full redraw
+                        }
+
+                        // Clear prediction overlay on resize
+                        if self.prediction_enabled {
+                            let mut prediction = terminal.prediction_mut().await;
+                            prediction.reset();
+                            self.prediction_overlay.clear_all();
+                        }
+
+                        return SessionEvent::WindowResize(new_size);
+                    }
+                }
+
+                // Handle user input from stdin
+                result = self.stdin.read() => {
+                    let data = match result {
+                        Some(data) => data,
+                        None => {
+                            tracing::info!("EOF on stdin");
+                            return SessionEvent::Exit;
+                        }
+                    };
+
+                    // Process escape sequences
+                    match self.escape_handler.process(&data) {
+                        crate::EscapeResult::Command(crate::EscapeCommand::Disconnect) => {
+                            tracing::info!("Escape sequence: disconnect");
+                            self.notification.clear_message();
+                            return SessionEvent::Exit;
+                        }
+                        crate::EscapeResult::Command(crate::EscapeCommand::ToggleOverlay) => {
+                            // Overlay removed, command is now a no-op
+                            self.notification.clear_message();
+                            continue;
+                        }
+                        crate::EscapeResult::Command(crate::EscapeCommand::SendEscapeKey) => {
+                            self.notification.clear_message();
+                            // Send the escape character itself - flush immediately
+                            let escape_key = self.escape_handler.escape_key().unwrap_or(0x1e);
+                            let esc = [escape_key];
+
+                            // Reserve sequence for this batch
+                            if self.pending_seq.is_none() {
+                                self.pending_seq = Some(terminal.reserve_sequence());
+                            }
+                            self.transport_sender.push(&esc);
+
+                            // Force flush immediately (user action)
+                            return SessionEvent::TransportFlush;
+                        }
+                        crate::EscapeResult::Waiting => {
+                            // Waiting for command key - show connection info
+                            self.notification.show_info(None, true);
+                            return SessionEvent::EscapeInfo;
+                        }
+                        crate::EscapeResult::PassThrough(pass_data) => {
+                            // Clear info bar (escape sequence resolved or timed out)
+                            self.notification.clear_message();
+
+                            // Handle the actual input
+                            return self.handle_user_input(bytes::Bytes::from(pass_data)).await;
+                        }
+                    }
+                }
+
+                // TransportSender timer: flush pending input when timing allows
+                _ = tokio::time::sleep_until(self.transport_sender.next_send_time().into()),
+                    if self.transport_sender.has_pending() => {
+                    if self.transport_sender.tick().is_some() {
+                        tracing::trace!("TransportSender timer flush");
+                        return SessionEvent::TransportFlush;
+                    }
+                }
+
+                // Handle terminal events (output or state sync)
+                result = terminal.recv_event() => {
+                    match result {
+                        Ok(event) => {
+                            return self.handle_terminal_event(event).await;
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, "recv_event returned error");
+                            return SessionEvent::Error(e);
+                        }
+                    }
+                }
+
+                // Periodic refresh for RTT/metrics updates
+                _ = self.overlay_refresh.tick() => {
+                    return SessionEvent::OverlayRefresh;
+                }
+
+                // Fast refresh for escape info bar (only active when waiting)
+                _ = self.escape_info_refresh.tick(), if self.escape_handler.is_waiting() => {
+                    return SessionEvent::EscapeInfo;
+                }
+            }
+        }
+    }
+
+    // Handle user input with prediction and transport batching
+    async fn handle_user_input(&mut self, data: bytes::Bytes) -> SessionEvent {
+        let terminal = self.channel.as_mut().expect("Terminal channel not initialized");
+        // Mosh-style paste detection: >threshold bytes triggers immediate flush
+        let is_paste = data.len() > self.paste_threshold;
+        if is_paste {
+            tracing::debug!(
+                len = data.len(),
+                threshold = self.paste_threshold,
+                "Paste detected, will flush immediately"
+            );
+        }
+
+        // Check if input contains predictable characters
+        let has_predictable = self.prediction_enabled
+            && !is_paste
+            && data.iter().any(|&b| is_predictable_char(b));
+
+        // Track predictable flag for batch
+        self.pending_predictable |= has_predictable;
+
+        // Reserve sequence for this batch (first push assigns sequence)
+        if self.pending_seq.is_none() {
+            self.pending_seq = Some(terminal.reserve_sequence());
+        }
+        let seq = self.pending_seq.unwrap();
+
+        // Mosh-style: prediction runs IMMEDIATELY (before send timing)
+        if self.prediction_enabled {
+            let mut prediction = terminal.prediction_mut().await;
+
+            // Reset prediction on paste (Mosh stmclient.cc:333-335)
+            if is_paste {
+                prediction.reset();
+                self.prediction_overlay.clear_all();
+            } else {
+                // Get current cursor position (from client parser or predicted)
+                let cursor = if let Some(pred_cursor) = prediction.get_predicted_cursor() {
+                    pred_cursor
+                } else if let Some(ref parser) = self.client_parser {
+                    let state = parser.state();
+                    (state.cursor.col, state.cursor.row)
+                } else {
+                    (0, 0)
+                };
+
+                // Get terminal size for wrap calculation
+                let term_size = crate::get_terminal_size().unwrap_or(qsh_core::protocol::TermSize { cols: 80, rows: 24 });
+
+                // Only render if prediction engine says we should display
+                if prediction.should_display() {
+                    // Process each byte with position tracking
+                    for &byte in data.iter() {
+                        if let Some(echo) = prediction.new_user_byte(byte, cursor, term_size.cols, seq) {
+                            // Add to overlay for position-based rendering
+                            let pred_cursor = prediction.get_predicted_cursor().unwrap_or(cursor);
+
+                            // The cursor after new_user_byte points to the next position,
+                            // so the character was placed at pred_cursor - 1 (wrapping handled)
+                            let char_col = if pred_cursor.0 == 0 && pred_cursor.1 > cursor.1 {
+                                // Wrapped to next line, char was at end of previous line
+                                term_size.cols.saturating_sub(1)
+                            } else {
+                                pred_cursor.0.saturating_sub(1)
+                            };
+                            let char_row = if pred_cursor.0 == 0 && pred_cursor.1 > cursor.1 {
+                                pred_cursor.1.saturating_sub(1)
+                            } else {
+                                pred_cursor.1
+                            };
+
+                            // Render prediction at position using position-based overlay
+                            let pred = crate::prediction::Prediction {
+                                sequence: echo.sequence,
+                                char: echo.char,
+                                col: char_col,
+                                row: char_row,
+                                timestamp: std::time::Instant::now(),
+                            };
+                            self.prediction_overlay.add(&pred, echo.style);
+                        }
+                    }
+                } else {
+                    // Still process bytes for cursor tracking even if not displaying
+                    for &byte in data.iter() {
+                        let _ = prediction.new_user_byte(byte, cursor, term_size.cols, seq);
+                    }
+                }
+            }
+        }
+
+        // Accumulate in TransportSender (Mosh-style batching)
+        self.transport_sender.push(&data);
+        tracing::trace!(
+            input_len = data.len(),
+            pending_len = self.transport_sender.pending_len(),
+            seq = seq,
+            "Pushed input to TransportSender"
+        );
+
+        // Check for quit/suspend sequences that should flush immediately
+        let has_quit_signal = data.iter().any(|&b| b == 0x03 || b == 0x1A);
+        if has_quit_signal {
+            tracing::debug!("Quit/suspend signal detected, will flush immediately");
+        }
+
+        // Determine if we should flush now
+        let should_flush = is_paste || has_quit_signal;
+
+        if should_flush {
+            SessionEvent::TransportFlush
+        } else if let Some(_data) = self.transport_sender.tick() {
+            // Timer-based flush (Mosh timing algorithm) - inline check
+            tracing::trace!("TransportSender tick flush (inline)");
+            SessionEvent::TransportFlush
+        } else {
+            // Input queued, will flush on timer
+            SessionEvent::InputQueued
+        }
+    }
+
+    // Handle terminal output events
+    async fn handle_terminal_event(
+        &mut self,
+        event: crate::TerminalEvent,
+    ) -> SessionEvent {
+        let terminal = self.channel.as_mut().expect("Terminal channel not initialized");
+        match event {
+            crate::TerminalEvent::Output(output) => {
+                tracing::trace!(
+                    len = output.data.len(),
+                    confirmed_seq = output.confirmed_input_seq,
+                    "Received terminal output"
+                );
+
+                // Update notification engine (mosh-style)
+                let now = std::time::Instant::now();
+                self.notification.server_heard(now);
+                self.notification.server_acked(now);
+                self.notification.adjust_message();
+
+                // Track frame rate (rolling average)
+                self.notification.record_frame(now);
+
+                // Track confirmed input seq for recovery
+                self.terminal_state.last_input_seq = output.confirmed_input_seq;
+
+                // Update client-side terminal state
+                if let Some(ref mut parser) = self.client_parser {
+                    parser.process(&output.data);
+                }
+
+                // Validate and confirm predictions
+                if self.prediction_enabled {
+                    let mut prediction = terminal.prediction_mut().await;
+
+                    // Validate predictions against client state
+                    if let Some(ref parser) = self.client_parser {
+                        let client_state = parser.state();
+                        prediction.validate(client_state);
+                        // Update predicted cursor to match server
+                        prediction.init_cursor(client_state.cursor.col, client_state.cursor.row);
+                    }
+
+                    // Confirm predictions up to this sequence
+                    prediction.confirm(output.confirmed_input_seq);
+                    prediction.confirm_cells(output.confirmed_input_seq);
+
+                    // Clear confirmed predictions from overlay
+                    self.prediction_overlay.clear_confirmed(output.confirmed_input_seq);
+                }
+
+                SessionEvent::TerminalOutput(TerminalOutputEvent::Output(bytes::Bytes::from(output.data)))
+            }
+            crate::TerminalEvent::StateSync(update) => {
+                tracing::debug!("Received state sync");
+
+                // Update notification engine (mosh-style)
+                let now = std::time::Instant::now();
+                self.notification.server_heard(now);
+                self.notification.server_acked(now);
+                self.notification.adjust_message();
+
+                // Track confirmed input seq
+                self.terminal_state.last_input_seq = update.confirmed_input_seq;
+
+                // Reset prediction engine on full state sync
+                if self.prediction_enabled {
+                    let mut prediction = terminal.prediction_mut().await;
+                    prediction.reset();
+                    self.prediction_overlay.clear_all();
+                }
+
+                // Render the full state to the terminal (mosh-style resync)
+                if let qsh_core::terminal::StateDiff::Full(ref state) = update.diff {
+                    tracing::debug!("Full state sync (resync or large change)");
+
+                    // Update client parser to match server state
+                    if let Some(ref mut parser) = self.client_parser {
+                        *parser = TerminalParser::new(state.screen().cols(), state.screen().rows());
+                    }
+
+                    // Update predicted cursor from synced state
+                    if self.prediction_enabled {
+                        let mut prediction = terminal.prediction_mut().await;
+                        prediction.init_cursor(state.cursor.col, state.cursor.row);
+                    }
+
+                    let ansi_data = state.render_to_ansi();
+                    SessionEvent::TerminalOutput(TerminalOutputEvent::StateSync(ansi_data))
+                } else {
+                    // Incremental update - shouldn't happen in current protocol
+                    SessionEvent::InputQueued // No-op
+                }
+            }
+        }
+    }
+
+    /// Flush any pending transport data and return the data to send
+    pub fn flush_transport(&mut self) -> Option<(bytes::Bytes, u64, bool)> {
+        if self.transport_sender.has_pending() {
+            let data = self.transport_sender.flush();
+            if !data.is_empty() {
+                if let Some(seq) = self.pending_seq.take() {
+                    let predictable = self.pending_predictable;
+                    self.pending_predictable = false;
+                    return Some((bytes::Bytes::from(data), seq, predictable));
+                }
+            }
+        }
+        None
+    }
+
+    /// Get mutable reference to notification engine for RTT updates
+    pub fn notification_mut(&mut self) -> &mut crate::overlay::NotificationEngine {
+        &mut self.notification
+    }
+
+    /// Render notification bar to stdout
+    pub async fn render_notification(&mut self) {
+        render_notification(&self.notification, &mut self.stdout).await;
+    }
+
+    /// Get terminal channel ID (if connected)
+    pub fn channel_id(&self) -> Option<qsh_core::protocol::ChannelId> {
+        self.channel.as_ref().map(|ch| ch.channel_id())
+    }
+
+    /// Write data to stdout
+    pub async fn stdout_write(&mut self, data: &[u8]) -> Result<()> {
+        self.stdout.write(data).await.map_err(|e| e.into())
+    }
+
+    /// Render prediction overlay to stdout
+    pub async fn render_prediction_overlay(&mut self) {
+        let overlay_output = self.prediction_overlay.render();
+        if !overlay_output.is_empty() {
+            let _ = self.stdout.write(overlay_output.as_bytes()).await;
+        }
+    }
+
+    /// Update transport sender RTT for adaptive send interval
+    pub fn update_transport_rtt(&mut self, rtt: std::time::Duration) {
+        self.transport_sender.set_rtt(rtt);
+    }
+
+    /// Update prediction engine RTT for adaptive display
+    pub async fn update_prediction_rtt(&mut self, rtt: std::time::Duration) {
+        if self.prediction_enabled {
+            if let Some(ref mut terminal) = self.channel {
+                let mut prediction = terminal.prediction_mut().await;
+                prediction.update_rtt(rtt);
+                prediction.check_glitches();
+            }
+        }
+    }
+
+    /// Queue input to terminal channel
+    pub fn queue_input(&mut self, data: &[u8], seq: u64, predictable: bool) -> Result<()> {
+        if let Some(ref terminal) = self.channel {
+            terminal.queue_input_with_seq(data, seq, predictable)
+        } else {
+            Ok(())
+        }
     }
 
     pub async fn handle_control(&mut self, msg: &Message) -> Result<()> {
@@ -495,6 +907,28 @@ impl TerminalComponent {
             _ => {}
         }
         Ok(())
+    }
+}
+
+// Helper function to check if a character is predictable (from main.rs:443)
+fn is_predictable_char(b: u8) -> bool {
+    // Printable ASCII: 0x20 (space) through 0x7E (~)
+    (0x20..=0x7E).contains(&b)
+}
+
+// Helper function to render notification bar (from main.rs)
+async fn render_notification(
+    notification: &crate::overlay::NotificationEngine,
+    stdout: &mut crate::StdoutWriter,
+) {
+    // Get terminal width for rendering (default to 80 if unavailable)
+    let term_width = crate::get_terminal_size()
+        .map(|size| size.cols)
+        .unwrap_or(80);
+
+    let notification_output = notification.render(term_width);
+    if !notification_output.is_empty() {
+        let _ = stdout.write(notification_output.as_bytes()).await;
     }
 }
 
@@ -748,7 +1182,7 @@ impl Session {
 
     /// Run the unified session event loop.
     pub async fn run(mut self) -> Result<i32> {
-        use tracing::{debug, info, trace, warn};
+        use tracing::{debug, error, info, trace, warn};
 
         loop {
             let conn = self.connection.wait_connected().await?;
@@ -815,6 +1249,21 @@ impl Session {
                                         info!(reason = ?payload.reason, "Server requested shutdown");
                                         break Ok(0);
                                     }
+                                    Message::ChannelAccept(ref accept) => {
+                                        // Dispatch to waiting channel open tasks
+                                        if let Some(tx) = conn.pending_channel_accepts.lock().await.remove(&accept.channel_id) {
+                                            let _ = tx.send(Ok(accept.data.clone()));
+                                        }
+                                    }
+                                    Message::ChannelReject(ref reject) => {
+                                        // Dispatch rejection to waiting channel open tasks
+                                        if let Some(tx) = conn.pending_channel_accepts.lock().await.remove(&reject.channel_id) {
+                                            let err = qsh_core::Error::Protocol {
+                                                message: format!("Channel rejected: {}", reject.message),
+                                            };
+                                            let _ = tx.send(Err(err));
+                                        }
+                                    }
                                     _ => {}
                                 }
                             }
@@ -830,8 +1279,127 @@ impl Session {
                             None => std::future::pending().await,
                         }
                     } => {
-                        // TODO: Handle terminal events
-                        debug!(?ev, "Terminal event");
+                        match ev {
+                            SessionEvent::Exit => {
+                                info!("Terminal exit requested");
+                                break Ok(0);
+                            }
+                            SessionEvent::Error(e) => {
+                                if e.is_transient() {
+                                    debug!(error = %e, "Terminal transient error");
+                                    break Err(e.into());
+                                } else {
+                                    error!(error = %e, "Terminal fatal error");
+                                    return Err(e.into());
+                                }
+                            }
+                            SessionEvent::WindowResize(size) => {
+                                // Send resize to server
+                                if let Some(ref term) = self.parts.terminal {
+                                    if let Some(channel_id) = term.channel_id() {
+                                        if let Err(e) = conn.send_resize(channel_id, size.cols, size.rows).await {
+                                            debug!(error = %e, "Failed to send resize");
+                                            // Non-fatal - server will sync on next state update
+                                        }
+                                    }
+                                }
+                            }
+                            SessionEvent::TransportFlush => {
+                                // Flush pending transport data to server
+                                if let Some(ref mut term) = self.parts.terminal {
+                                    if let Some((data, seq, predictable)) = term.flush_transport() {
+                                        if let Err(e) = term.queue_input(&data, seq, predictable) {
+                                            warn!(error = %e, "Failed to queue input");
+                                            break Err(e.into());
+                                        }
+                                    }
+                                }
+                            }
+                            SessionEvent::TerminalOutput(output_event) => {
+                                // Write terminal output to stdout and render notification
+                                if let Some(ref mut term) = self.parts.terminal {
+                                    match output_event {
+                                        TerminalOutputEvent::Output(data) => {
+                                            // Write server output (already handled in event processing)
+                                            // The data was already written to stdout in handle_terminal_event
+                                            // Just need to write it here since we extracted the event
+                                            if let Err(e) = term.stdout_write(&data).await {
+                                                warn!(error = %e, "stdout write error");
+                                                break Err(e.into());
+                                            }
+
+                                            // Render prediction overlay if enabled
+                                            term.render_prediction_overlay().await;
+
+                                            // Render notification bar
+                                            term.render_notification().await;
+                                        }
+                                        TerminalOutputEvent::StateSync(ansi_data) => {
+                                            // Full state sync - write to stdout
+                                            if let Err(e) = term.stdout_write(&ansi_data).await {
+                                                warn!(error = %e, "stdout write error during state sync");
+                                                break Err(e.into());
+                                            }
+
+                                            // Render notification bar
+                                            term.render_notification().await;
+                                        }
+                                    }
+                                }
+                            }
+                            SessionEvent::OverlayRefresh => {
+                                // Periodic RTT/metrics update
+                                if let Some(ref mut term) = self.parts.terminal {
+                                    // Update RTT from heartbeat tracker (SRTT like mosh)
+                                    if let Some(srtt) = heartbeat.tracker.srtt() {
+                                        term.notification_mut().update_rtt(srtt);
+
+                                        // Update TransportSender RTT for adaptive send_interval
+                                        term.update_transport_rtt(srtt);
+
+                                        // Update prediction engine RTT for adaptive display
+                                        term.update_prediction_rtt(srtt).await;
+                                    }
+
+                                    // Update quiche RTT (QUIC transport-level) with smoothing
+                                    let quiche_rtt = conn.rtt().await;
+                                    term.notification_mut().update_quiche_rtt(quiche_rtt);
+
+                                    // Update packet loss metric from QUIC stats
+                                    let loss = conn.quic().packet_loss().await;
+                                    term.notification_mut().update_packet_loss(loss);
+
+                                    // Update notification engine (expire messages, etc.)
+                                    term.notification_mut().adjust_message();
+
+                                    // Render notification bar
+                                    term.render_notification().await;
+                                }
+                            }
+                            SessionEvent::EscapeInfo => {
+                                // Fast refresh for escape info bar
+                                if let Some(ref mut term) = self.parts.terminal {
+                                    // Update RTT from heartbeat tracker (SRTT like mosh)
+                                    if let Some(srtt) = heartbeat.tracker.srtt() {
+                                        term.notification_mut().update_rtt(srtt);
+                                    }
+
+                                    // Update quiche RTT (QUIC transport-level) with smoothing
+                                    let quiche_rtt = conn.rtt().await;
+                                    term.notification_mut().update_quiche_rtt(quiche_rtt);
+
+                                    // Render notification bar with current stats
+                                    term.render_notification().await;
+                                }
+                            }
+                            SessionEvent::InputQueued => {
+                                // Input queued in transport sender, no action needed
+                            }
+                            SessionEvent::StdinInput(_) | SessionEvent::WindowResize(_) => {
+                                // These are handled internally by TerminalComponent
+                                // Should not reach here
+                            }
+                        }
                     }
 
                     // Forward events (guarded, mostly pending)

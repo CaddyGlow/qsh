@@ -185,6 +185,10 @@ pub struct ChannelConnection {
         tokio::sync::Mutex<StdHashMap<u32, tokio::sync::oneshot::Sender<GlobalReplyResult>>>,
     /// Next global request ID.
     next_global_request_id: std::sync::atomic::AtomicU32,
+    /// Pending channel accepts (for open_dynamic, open_direct_tcpip).
+    pub(crate) pending_channel_accepts: tokio::sync::Mutex<
+        StdHashMap<ChannelId, tokio::sync::oneshot::Sender<Result<ChannelAcceptData>>>,
+    >,
     /// Remote forward targets: (bind_host, bind_port) -> target info.
     remote_forwards: RwLock<StdHashMap<(String, u16), RemoteForwardTarget>>,
 }
@@ -356,6 +360,7 @@ impl ChannelConnection {
             next_channel_id: AtomicU64::new(0),
             pending_global_requests: tokio::sync::Mutex::new(StdHashMap::new()),
             next_global_request_id: std::sync::atomic::AtomicU32::new(0),
+            pending_channel_accepts: tokio::sync::Mutex::new(StdHashMap::new()),
             remote_forwards: RwLock::new(StdHashMap::new()),
         })
     }
@@ -409,6 +414,10 @@ impl ChannelConnection {
     pub async fn open_terminal(&self, params: TerminalParams) -> Result<TerminalChannel> {
         let channel_id = self.allocate_channel_id();
 
+        // Register oneshot channel BEFORE sending ChannelOpen (avoid race)
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending_channel_accepts.lock().await.insert(channel_id, tx);
+
         // Send ChannelOpen
         let open = ChannelOpenPayload {
             channel_id,
@@ -417,7 +426,15 @@ impl ChannelConnection {
         self.send_control(&Message::ChannelOpen(open)).await?;
 
         // Wait for ChannelAccept or ChannelReject
-        let (accept_data, _) = self.wait_channel_accept(channel_id).await?;
+        let accept_data = match rx.await {
+            Ok(Ok(data)) => data,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(qsh_core::Error::Protocol {
+                    message: format!("Channel accept sender dropped for {:?}", channel_id),
+                });
+            }
+        };
 
         // Open input/output streams
         let input_stream = self
@@ -457,6 +474,10 @@ impl ChannelConnection {
         let channel_id = self.allocate_channel_id();
         let resume_offset = params.resume_from;
 
+        // Register oneshot channel BEFORE sending ChannelOpen (avoid race)
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending_channel_accepts.lock().await.insert(channel_id, tx);
+
         // Send ChannelOpen
         let open = ChannelOpenPayload {
             channel_id,
@@ -465,7 +486,15 @@ impl ChannelConnection {
         self.send_control(&Message::ChannelOpen(open)).await?;
 
         // Wait for ChannelAccept or ChannelReject
-        let (accept_data, _) = self.wait_channel_accept(channel_id).await?;
+        let accept_data = match rx.await {
+            Ok(Ok(data)) => data,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(qsh_core::Error::Protocol {
+                    message: format!("Channel accept sender dropped for {:?}", channel_id),
+                });
+            }
+        };
 
         // Open bidirectional stream for file data
         let stream = self
@@ -496,6 +525,10 @@ impl ChannelConnection {
         let target_host = params.target_host.clone();
         let target_port = params.target_port;
 
+        // Register oneshot channel BEFORE sending ChannelOpen (avoid race)
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending_channel_accepts.lock().await.insert(channel_id, tx);
+
         // Send ChannelOpen
         let open = ChannelOpenPayload {
             channel_id,
@@ -504,7 +537,15 @@ impl ChannelConnection {
         self.send_control(&Message::ChannelOpen(open)).await?;
 
         // Wait for ChannelAccept or ChannelReject
-        self.wait_channel_accept(channel_id).await?;
+        let accept_data = match rx.await {
+            Ok(Ok(data)) => data,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(qsh_core::Error::Protocol {
+                    message: format!("Channel accept sender dropped for {:?}", channel_id),
+                });
+            }
+        };
 
         // Open bidirectional stream for forwarded data
         let stream = self
@@ -530,6 +571,10 @@ impl ChannelConnection {
         let target_host = params.target_host.clone();
         let target_port = params.target_port;
 
+        // Register oneshot channel BEFORE sending ChannelOpen (avoid race)
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending_channel_accepts.lock().await.insert(channel_id, tx);
+
         // Send ChannelOpen
         let open = ChannelOpenPayload {
             channel_id,
@@ -538,7 +583,15 @@ impl ChannelConnection {
         self.send_control(&Message::ChannelOpen(open)).await?;
 
         // Wait for ChannelAccept
-        self.wait_channel_accept(channel_id).await?;
+        let accept_data = match rx.await {
+            Ok(Ok(data)) => data,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(qsh_core::Error::Protocol {
+                    message: format!("Channel accept sender dropped for {:?}", channel_id),
+                });
+            }
+        };
 
         // Open bidirectional stream
         let stream = self
@@ -859,39 +912,6 @@ impl ChannelConnection {
             message: message.to_string(),
         }))
         .await
-    }
-
-    /// Wait for ChannelAccept or ChannelReject.
-    async fn wait_channel_accept(
-        &self,
-        channel_id: ChannelId,
-    ) -> Result<(ChannelAcceptData, ChannelId)> {
-        let mut control = self.control.lock().await;
-
-        loop {
-            match control.recv().await? {
-                Message::ChannelAccept(accept) if accept.channel_id == channel_id => {
-                    return Ok((accept.data, accept.channel_id));
-                }
-                Message::ChannelReject(reject) if reject.channel_id == channel_id => {
-                    return Err(channel_reject_to_error(reject.code, Some(reject.message)));
-                }
-                Message::GlobalReply(reply) => {
-                    // Handle global reply
-                    if let Some(tx) = self
-                        .pending_global_requests
-                        .lock()
-                        .await
-                        .remove(&reply.request_id)
-                    {
-                        let _ = tx.send(reply.result);
-                    }
-                }
-                other => {
-                    debug!(?other, "Ignoring message while waiting for ChannelAccept");
-                }
-            }
-        }
     }
 
     /// Receive a control message.
