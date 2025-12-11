@@ -181,7 +181,7 @@ pub struct ChannelConnection {
     /// Next client-side channel ID.
     next_channel_id: AtomicU64,
     /// Pending global requests.
-    pending_global_requests:
+    pub(crate) pending_global_requests:
         tokio::sync::Mutex<StdHashMap<u32, tokio::sync::oneshot::Sender<GlobalReplyResult>>>,
     /// Next global request ID.
     next_global_request_id: std::sync::atomic::AtomicU32,
@@ -618,30 +618,27 @@ impl ChannelConnection {
             .next_global_request_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
+        // Register oneshot channel BEFORE sending the request (avoid race)
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending_global_requests
+            .lock()
+            .await
+            .insert(request_id, tx);
+
         let payload = GlobalRequestPayload {
             request_id,
             request,
         };
 
-        let mut control = self.control.lock().await;
-        control.send(&Message::GlobalRequest(payload)).await?;
+        // Send the request (using control_sender to avoid locking recv)
+        self.control_sender.send(&Message::GlobalRequest(payload)).await?;
 
-        // Read until we get our GlobalReply
-        loop {
-            match control.recv().await? {
-                Message::GlobalReply(reply) if reply.request_id == request_id => {
-                    return Ok(reply.result);
-                }
-                Message::GlobalReply(reply) => {
-                    debug!(
-                        request_id = reply.request_id,
-                        "Received GlobalReply for different request"
-                    );
-                }
-                other => {
-                    debug!(?other, "Ignoring message while waiting for GlobalReply");
-                }
-            }
+        // Wait for the reply (will be sent by Session::run() event loop)
+        match rx.await {
+            Ok(result) => Ok(result),
+            Err(_) => Err(qsh_core::Error::Protocol {
+                message: format!("Global request sender dropped for request_id {}", request_id),
+            }),
         }
     }
 

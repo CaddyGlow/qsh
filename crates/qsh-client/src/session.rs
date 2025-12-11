@@ -1264,6 +1264,12 @@ impl Session {
                                             let _ = tx.send(Err(err));
                                         }
                                     }
+                                    Message::GlobalReply(ref reply) => {
+                                        // Dispatch to waiting global request tasks
+                                        if let Some(tx) = conn.pending_global_requests.lock().await.remove(&reply.request_id) {
+                                            let _ = tx.send(reply.result.clone());
+                                        }
+                                    }
                                     _ => {}
                                 }
                             }
