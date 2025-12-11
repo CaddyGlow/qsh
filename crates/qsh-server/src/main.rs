@@ -407,6 +407,7 @@ async fn run_server_initiate(cli: &Cli) -> qsh_core::Result<()> {
     info!(addr = %server_addr, "Connecting to client via QUIC");
 
     // Establish QUIC connection as initiator
+    // In reverse-attach mode: QUIC client (us) = logical server
     let connect_config = ConnectConfig {
         server_addr,
         local_port: None,
@@ -414,6 +415,8 @@ async fn run_server_initiate(cli: &Cli) -> qsh_core::Result<()> {
         connect_timeout: std::time::Duration::from_secs(30),
         cert_hash,
         session_data: None,
+        // Reverse mode: server initiates connection, so QUIC client = logical server
+        logical_role: qsh_core::transport::EndpointRole::Server,
     };
 
     let connect_result = connect_quic(&connect_config).await?;

@@ -92,6 +92,8 @@ impl QshListener {
             key_pem: config.key_pem.clone(),
             idle_timeout,
             ticket_key: None,
+            // Normal mode: server is listening, so QUIC server = logical server
+            logical_role: qsh_core::transport::EndpointRole::Server,
         };
 
         let acceptor = QuicAcceptor::bind(config.bind_addr, listener_config).await?;
@@ -128,6 +130,8 @@ impl QshListener {
             key_pem: config.key_pem.clone(),
             idle_timeout,
             ticket_key: None,
+            // Normal mode: server is listening, so QUIC server = logical server
+            logical_role: qsh_core::transport::EndpointRole::Server,
         };
 
         let acceptor = QuicAcceptor::with_socket(socket, listener_config).await?;

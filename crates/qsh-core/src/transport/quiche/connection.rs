@@ -20,7 +20,7 @@ use crate::protocol::ChannelId;
 use super::common::{CHANNEL_BIDI_MAGIC, CHANNEL_STREAM_MAGIC};
 use super::common::{channel_bidi_header, channel_stream_header, classify_io_error};
 use super::stream::{QuicheStream, QuicheStreamReader, QuicheStreamWriter};
-use crate::transport::{Connection, StreamPair, StreamType};
+use crate::transport::{Connection, StreamDirectionMapper, StreamPair, StreamType};
 
 // =============================================================================
 // QuicheConnectionInner - Internal connection state
@@ -42,6 +42,8 @@ pub struct QuicheConnectionInner {
     pub(crate) remote_addr: SocketAddr,
     /// Local address.
     pub(crate) local_addr: SocketAddr,
+    /// Stream direction mapper for role-aware stream type detection.
+    mapper: StreamDirectionMapper,
     /// Pending incoming streams (stream_type, stream_id).
     pub(crate) pending_streams: Mutex<VecDeque<(StreamType, u64)>>,
     /// Stream data buffers for reading (also used to track partial headers).
@@ -64,13 +66,28 @@ pub struct QuicheConnectionInner {
 
 impl QuicheConnectionInner {
     /// Create new connection inner from a quiche connection.
+    ///
+    /// # Arguments
+    ///
+    /// * `conn` - The quiche connection
+    /// * `socket` - The UDP socket
+    /// * `remote_addr` - Remote peer address
+    /// * `local_addr` - Local address
+    /// * `logical_role` - Logical endpoint role (client/server) from application perspective
+    /// * `quic_role` - QUIC endpoint role (client/server) from transport perspective
     pub fn new(
         conn: quiche::Connection,
         socket: Arc<tokio::net::UdpSocket>,
         remote_addr: SocketAddr,
         local_addr: SocketAddr,
-        is_server: bool,
+        logical_role: crate::transport::config::EndpointRole,
+        quic_role: crate::transport::config::EndpointRole,
     ) -> Self {
+        use crate::transport::config::EndpointRole;
+
+        // Create stream direction mapper
+        let mapper = StreamDirectionMapper::new(logical_role, quic_role);
+
         // QUIC stream ID convention:
         // Client-initiated bidi: 0, 4, 8, 12, ...
         // Server-initiated bidi: 1, 5, 9, 13, ...
@@ -79,7 +96,9 @@ impl QuicheConnectionInner {
         //
         // Stream 0 is reserved for the control stream, so client starts at 4
         // Stream 1 is reserved for server's control stream, so server starts at 5
-        let (next_bidi, next_uni) = if is_server {
+        //
+        // Note: Stream ID allocation is based on QUIC role, not logical role
+        let (next_bidi, next_uni) = if quic_role == EndpointRole::Server {
             (5, 3) // Server-initiated: skip control stream 1
         } else {
             (4, 2) // Client-initiated: skip control stream 0
@@ -90,6 +109,7 @@ impl QuicheConnectionInner {
             socket,
             remote_addr,
             local_addr,
+            mapper,
             pending_streams: Mutex::new(VecDeque::new()),
             stream_bufs: RwLock::new(HashMap::new()),
             known_streams: RwLock::new(std::collections::HashSet::new()),
@@ -405,23 +425,8 @@ impl QuicheConnectionInner {
         buffered.advance(9);
         drop(bufs); // Release lock before acquiring known_streams lock
 
-        // Determine stream direction from QUIC stream ID
-        // bit 0: initiator (0 = client, 1 = server)
-        // bit 1: stream type (0 = bidi, 1 = uni)
-        let is_uni = (stream_id & 0x2) != 0;
-
-        let result = match (magic, is_uni) {
-            (CHANNEL_BIDI_MAGIC, false) => Some(StreamType::ChannelBidi(channel_id)),
-            (CHANNEL_STREAM_MAGIC, true) => {
-                // Determine In vs Out based on initiator
-                if (stream_id & 0x1) == 1 {
-                    Some(StreamType::ChannelOut(channel_id)) // Server-initiated
-                } else {
-                    Some(StreamType::ChannelIn(channel_id)) // Client-initiated
-                }
-            }
-            _ => None,
-        };
+        // Use the mapper to detect stream type based on roles
+        let result = self.mapper.detect_stream_type(stream_id, channel_id, magic);
 
         // Mark stream as known if we successfully detected its type
         if result.is_some() {
@@ -595,19 +600,30 @@ pub struct QuicheConnection {
 
 impl QuicheConnection {
     /// Create a new connection wrapper.
+    ///
+    /// # Arguments
+    ///
+    /// * `conn` - The quiche connection
+    /// * `socket` - The UDP socket
+    /// * `remote_addr` - Remote peer address
+    /// * `local_addr` - Local address
+    /// * `logical_role` - Logical endpoint role (client/server) from application perspective
+    /// * `quic_role` - QUIC endpoint role (client/server) from transport perspective
     pub fn new(
         conn: quiche::Connection,
         socket: Arc<tokio::net::UdpSocket>,
         remote_addr: SocketAddr,
         local_addr: SocketAddr,
-        is_server: bool,
+        logical_role: crate::transport::config::EndpointRole,
+        quic_role: crate::transport::config::EndpointRole,
     ) -> Self {
         let inner = Arc::new(QuicheConnectionInner::new(
             conn,
             socket,
             remote_addr,
             local_addr,
-            is_server,
+            logical_role,
+            quic_role,
         ));
 
         // Spawn I/O driver task

@@ -143,6 +143,8 @@ pub async fn establish_quic_connection(config: &ConnectionConfig) -> Result<Quic
         connect_timeout: config.connect_timeout,
         cert_hash: config.cert_hash.clone(),
         session_data: config.session_data.clone(),
+        // For normal client mode, QUIC client = logical client
+        logical_role: qsh_core::transport::EndpointRole::Client,
     };
 
     // Use the backend-agnostic connect_quic from transport module

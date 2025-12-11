@@ -44,6 +44,8 @@ pub struct S2nAcceptor {
     server: s2n_quic::Server,
     /// Local address.
     local_addr: SocketAddr,
+    /// Logical role for accepted connections.
+    logical_role: crate::transport::config::EndpointRole,
 }
 
 impl S2nAcceptor {
@@ -113,7 +115,11 @@ impl S2nAcceptor {
             message: format!("failed to get local address: {}", e),
         })?;
 
-        Ok(Self { server, local_addr })
+        Ok(Self {
+            server,
+            local_addr,
+            logical_role: config.logical_role,
+        })
     }
 
     /// Get the local address this acceptor is bound to.
@@ -160,6 +166,7 @@ impl S2nAcceptor {
         let s2n_conn = S2nConnection::from_server_connection(
             connection,
             self.local_addr,
+            self.logical_role, // logical role from config
             stats,
             handshake,
             session_state,

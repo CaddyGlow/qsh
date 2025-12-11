@@ -21,7 +21,7 @@ use super::common::{
 };
 use super::stats::{ConnectionStats, HandshakeState, SessionTicketState};
 use super::stream::{S2nStream, S2nStreamReader, S2nStreamWriter};
-use super::{Connection, StreamType};
+use crate::transport::{Connection, StreamDirectionMapper, StreamType};
 
 // =============================================================================
 // S2nConnection - Public connection wrapper
@@ -35,13 +35,15 @@ pub struct S2nConnection {
     remote_addr: SocketAddr,
     /// Local address.
     local_addr: SocketAddr,
+    /// Stream direction mapper for role-aware stream type detection.
+    mapper: StreamDirectionMapper,
     /// Pending incoming streams (stream_type, stream).
     pending_streams: Mutex<VecDeque<(StreamType, S2nStream)>>,
     /// Connection closed flag.
     closed: AtomicBool,
     /// Control stream (stream ID 0).
     control_stream: Mutex<Option<BidirectionalStream>>,
-    /// Whether this is a server connection.
+    /// Whether this is a server connection (QUIC role, not logical role).
     is_server: bool,
     /// Connection statistics (populated by event subscriber).
     stats: Arc<ConnectionStats>,
@@ -53,16 +55,31 @@ pub struct S2nConnection {
 
 impl S2nConnection {
     /// Create a new connection wrapper from a client connection.
+    ///
+    /// # Arguments
+    ///
+    /// * `conn` - The s2n-quic connection
+    /// * `local_addr` - Local address
+    /// * `logical_role` - Logical endpoint role (client/server) from application perspective
+    /// * `stats` - Connection statistics
+    /// * `handshake` - Handshake state
+    /// * `session_state` - Session ticket state
     pub(crate) async fn from_client_connection(
         mut conn: s2n_quic::connection::Connection,
         local_addr: SocketAddr,
+        logical_role: crate::transport::config::EndpointRole,
         stats: Arc<ConnectionStats>,
         handshake: Arc<HandshakeState>,
         session_state: Arc<SessionTicketState>,
     ) -> Result<Self> {
+        use crate::transport::config::EndpointRole;
+
         let remote_addr = conn.remote_addr().map_err(|e| Error::Transport {
             message: format!("failed to get remote address: {}", e),
         })?;
+
+        // Create stream direction mapper
+        let mapper = StreamDirectionMapper::new(logical_role, EndpointRole::Client);
 
         // Open control stream (stream ID 0 equivalent)
         let control_stream =
@@ -78,6 +95,7 @@ impl S2nConnection {
             conn: Mutex::new(conn),
             remote_addr,
             local_addr,
+            mapper,
             pending_streams: Mutex::new(VecDeque::new()),
             closed: AtomicBool::new(false),
             control_stream: Mutex::new(Some(control_stream)),
@@ -89,16 +107,31 @@ impl S2nConnection {
     }
 
     /// Create a new connection wrapper from a server connection.
+    ///
+    /// # Arguments
+    ///
+    /// * `conn` - The s2n-quic connection
+    /// * `local_addr` - Local address
+    /// * `logical_role` - Logical endpoint role (client/server) from application perspective
+    /// * `stats` - Connection statistics
+    /// * `handshake` - Handshake state
+    /// * `session_state` - Session ticket state
     pub(crate) async fn from_server_connection(
         mut conn: s2n_quic::connection::Connection,
         local_addr: SocketAddr,
+        logical_role: crate::transport::config::EndpointRole,
         stats: Arc<ConnectionStats>,
         handshake: Arc<HandshakeState>,
         session_state: Arc<SessionTicketState>,
     ) -> Result<Self> {
+        use crate::transport::config::EndpointRole;
+
         let remote_addr = conn.remote_addr().map_err(|e| Error::Transport {
             message: format!("failed to get remote address: {}", e),
         })?;
+
+        // Create stream direction mapper
+        let mapper = StreamDirectionMapper::new(logical_role, EndpointRole::Server);
 
         // For server, accept the control stream initiated by client
         let control_stream = conn
@@ -117,6 +150,7 @@ impl S2nConnection {
             conn: Mutex::new(conn),
             remote_addr,
             local_addr,
+            mapper,
             pending_streams: Mutex::new(VecDeque::new()),
             closed: AtomicBool::new(false),
             control_stream: Mutex::new(Some(control_stream)),
@@ -364,14 +398,32 @@ impl Connection for S2nConnection {
                         let encoded = u64::from_le_bytes(header[1..9].try_into().unwrap());
                         let channel_id = ChannelId::decode(encoded);
 
+                        // s2n-quic doesn't expose stream IDs directly, so we need to infer
+                        // the stream direction from the initiator role.
+                        // For unidirectional streams:
+                        // - Client-initiated (this is a receive stream on server) -> ChannelIn
+                        // - Server-initiated (this is a receive stream on client) -> ChannelOut
+                        //
+                        // We can construct a "virtual" stream ID to pass to the mapper:
+                        // - Client-initiated uni: even number with bit 1 set (e.g., 2)
+                        // - Server-initiated uni: odd number with bit 1 set (e.g., 3)
+                        let virtual_stream_id = if self.is_server {
+                            2 // Client-initiated unidirectional
+                        } else {
+                            3 // Server-initiated unidirectional
+                        };
+
                         let stream_type = match magic {
                             CHANNEL_STREAM_MAGIC => {
-                                // Determine In vs Out based on who we are
-                                if self.is_server {
-                                    StreamType::ChannelIn(channel_id) // Client-initiated to server
-                                } else {
-                                    StreamType::ChannelOut(channel_id) // Server-initiated to client
-                                }
+                                // Use the mapper to detect stream type based on roles
+                                self.mapper
+                                    .detect_stream_type(virtual_stream_id, channel_id, magic)
+                                    .ok_or_else(|| Error::Transport {
+                                        message: format!(
+                                            "failed to detect stream type for magic {:#x}",
+                                            magic
+                                        ),
+                                    })?
                             }
                             _ => {
                                 return Err(Error::Transport {

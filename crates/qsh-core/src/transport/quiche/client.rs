@@ -192,12 +192,15 @@ pub async fn connect_quic(config: &ConnectConfig) -> Result<ConnectResult<Quiche
         info!(addr = %config.server_addr, "0-RTT session resumed");
     }
 
+    use crate::transport::config::EndpointRole;
+
     let quic_conn = QuicheConnection::new(
         conn,
         socket,
         config.server_addr,
         local_addr,
-        false, // is_server = false for client
+        config.logical_role, // logical role from config
+        EndpointRole::Client, // quic_role = Client for connect_quic
     );
 
     // Get session data for future 0-RTT resumption

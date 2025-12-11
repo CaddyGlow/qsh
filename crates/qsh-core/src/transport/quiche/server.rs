@@ -32,6 +32,8 @@ pub struct QuicheAcceptor {
     local_addr: std::net::SocketAddr,
     /// quiche configuration.
     quiche_config: quiche::Config,
+    /// Logical role for accepted connections.
+    logical_role: crate::transport::config::EndpointRole,
     /// Pending connections (connection ID -> (connection, peer address)).
     connections: HashMap<Vec<u8>, (quiche::Connection, Option<std::net::SocketAddr>)>,
     /// Receive buffer.
@@ -71,6 +73,7 @@ impl QuicheAcceptor {
             socket: Arc::new(socket),
             local_addr,
             quiche_config,
+            logical_role: config.logical_role,
             connections: HashMap::new(),
             recv_buf: [0u8; 65535],
             send_buf: [0u8; 65535],
@@ -99,6 +102,7 @@ impl QuicheAcceptor {
             socket,
             local_addr,
             quiche_config,
+            logical_role: config.logical_role,
             connections: HashMap::new(),
             recv_buf: [0u8; 65535],
             send_buf: [0u8; 65535],
@@ -203,12 +207,15 @@ impl QuicheAcceptor {
                             info!(addr = %peer, "Connection established");
 
                             // Wrap in QuicheConnection
+                            use crate::transport::config::EndpointRole;
+
                             let quic_conn = QuicheConnection::new(
                                 conn,
                                 Arc::clone(&self.socket),
                                 peer,
                                 self.local_addr,
-                                true, // is_server = true
+                                self.logical_role, // logical role from config
+                                EndpointRole::Server, // quic_role = Server for accept
                             );
 
                             return Ok((quic_conn, peer));

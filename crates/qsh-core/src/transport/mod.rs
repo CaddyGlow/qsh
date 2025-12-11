@@ -27,9 +27,11 @@ compile_error!(
 pub mod common;
 pub mod config;
 pub mod sender;
+pub mod stream_mapper;
 
 // Re-export sender types
 pub use sender::{SenderConfig, TransportSender};
+pub use stream_mapper::StreamDirectionMapper;
 
 #[cfg(feature = "quiche-backend")]
 mod quiche;
@@ -107,6 +109,12 @@ pub struct ConnectConfig {
     pub cert_hash: Option<Vec<u8>>,
     /// Cached session data for 0-RTT resumption.
     pub session_data: Option<Vec<u8>>,
+    /// Logical role for stream direction mapping.
+    ///
+    /// In normal mode, this should match the QUIC role (Client for connect_quic).
+    /// In reverse-attach mode, this is inverted (Server for connect_quic when
+    /// the logical server initiates the connection).
+    pub logical_role: EndpointRole,
 }
 
 impl Default for ConnectConfig {
@@ -118,6 +126,8 @@ impl Default for ConnectConfig {
             connect_timeout: Duration::from_secs(10),
             cert_hash: None,
             session_data: None,
+            // Default to Client (normal mode: QUIC client = logical client)
+            logical_role: EndpointRole::Client,
         }
     }
 }
@@ -145,6 +155,12 @@ pub struct ListenerConfig {
     pub idle_timeout: Duration,
     /// Optional session ticket key for 0-RTT (None = auto-generated).
     pub ticket_key: Option<Vec<u8>>,
+    /// Logical role for stream direction mapping.
+    ///
+    /// In normal mode, this should be Server (QUIC server = logical server).
+    /// In reverse-attach mode, this is Client (QUIC server accepts connections
+    /// from the logical server, but is itself the logical client).
+    pub logical_role: EndpointRole,
 }
 
 // Feature-gated connect function exports

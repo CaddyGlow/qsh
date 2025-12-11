@@ -170,11 +170,14 @@ async fn run_bootstrap_mode(cli: &Cli) -> qsh_core::Result<i32> {
     info!("Bootstrap response sent");
 
     // Create QUIC acceptor with the endpoint's certificate and key
+    // In reverse-attach mode: QUIC server (us) = logical client
     let listener_config = ListenerConfig {
         cert_pem: endpoint.cert_pem.clone(),
         key_pem: endpoint.key_pem.clone(),
         idle_timeout: cli.max_idle_timeout(),
         ticket_key: None,
+        // Reverse mode: client is listening, so QUIC server = logical client
+        logical_role: qsh_core::transport::EndpointRole::Client,
     };
 
     let mut acceptor = QuicAcceptor::bind(endpoint.bind_addr, listener_config).await?;

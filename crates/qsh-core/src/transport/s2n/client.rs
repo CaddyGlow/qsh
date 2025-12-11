@@ -176,6 +176,7 @@ pub async fn connect_quic(config: &ConnectConfig) -> Result<ConnectResult<S2nCon
     let s2n_conn = S2nConnection::from_client_connection(
         connection,
         local_addr,
+        config.logical_role, // logical role from config
         stats,
         handshake_state,
         Arc::clone(&session_state),
