@@ -27,6 +27,24 @@ impl Cli {
             return Ok(ConnectModeArg::Respond);
         }
 
+        // Attach mode validation
+        if self.attach.is_some() {
+            // --attach is incompatible with specifying a destination host
+            // (checked via clap conflicts_with, but we double-check here for clarity)
+            if self.destination.is_some() {
+                return Err(
+                    "--attach cannot be used with a destination host\n\
+                     Hint: --attach mode connects to an existing bootstrap session\n\
+                     Remove the destination argument or remove --attach"
+                        .to_string(),
+                );
+            }
+
+            // Attach mode doesn't participate in QUIC handshake; it's just pipe I/O
+            // Return Initiate as a placeholder (won't actually be used)
+            return Ok(ConnectModeArg::Initiate);
+        }
+
         // Normal mode (with destination) validation
         if let Some(_host) = self.destination.as_ref() {
             // Destination requires --connect-mode initiate (or we auto-infer it)
@@ -43,7 +61,7 @@ impl Cli {
             return Ok(ConnectModeArg::Initiate);
         }
 
-        // No bootstrap, no destination - this is invalid
+        // No bootstrap, no destination, no attach - this is invalid
         Err(
             "either --bootstrap or a destination host must be specified\n\
              Usage: qsh [user@]host[:port]  (connect to remote host)\n\

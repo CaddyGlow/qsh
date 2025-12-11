@@ -226,6 +226,27 @@ impl BootstrapEndpoint {
         BootstrapResponse::ok(endpoint_info)
     }
 
+    /// Generate a bootstrap response with an attach pipe path.
+    pub fn response_with_pipe(
+        &self,
+        connect_mode: ConnectMode,
+        attach_pipe: &str,
+    ) -> BootstrapResponse {
+        let address = self.bind_addr.ip().to_string();
+        let port = self.bind_addr.port();
+
+        let endpoint_info = EndpointInfo::with_attach_pipe(
+            address,
+            port,
+            self.session_key,
+            &self.cert_hash,
+            connect_mode,
+            attach_pipe,
+        );
+
+        BootstrapResponse::ok(endpoint_info)
+    }
+
     /// Generate a bootstrap response with an external address override.
     pub fn response_with_external(
         &self,
@@ -248,6 +269,20 @@ impl BootstrapEndpoint {
     /// Print the bootstrap response to stdout.
     pub fn print_response(&self, connect_mode: ConnectMode) -> Result<()> {
         let response = self.response(connect_mode);
+        let json = response.to_json()?;
+        println!("{}", json);
+        // Force a flush to ensure the client sees the JSON immediately
+        io::stdout().flush()?;
+        Ok(())
+    }
+
+    /// Print the bootstrap response with attach pipe to stdout.
+    pub fn print_response_with_pipe(
+        &self,
+        connect_mode: ConnectMode,
+        attach_pipe: &str,
+    ) -> Result<()> {
+        let response = self.response_with_pipe(connect_mode, attach_pipe);
         let json = response.to_json()?;
         println!("{}", json);
         // Force a flush to ensure the client sees the JSON immediately

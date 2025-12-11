@@ -69,8 +69,16 @@ fn write_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 impl ReconnectableConnection {
     /// Create a new reconnectable connection from an established connection.
     pub fn new(conn: ChannelConnection, context: SessionContext) -> Self {
+        Self::from_arc(Arc::new(conn), context)
+    }
+
+    /// Create a new reconnectable connection from an Arc'd connection.
+    ///
+    /// Use this when you already have an Arc<ChannelConnection>, e.g., when
+    /// sharing the connection with a background task.
+    pub fn from_arc(conn: Arc<ChannelConnection>, context: SessionContext) -> Self {
         Self {
-            inner: RwLock::new(Some(Arc::new(conn))),
+            inner: RwLock::new(Some(conn)),
             context: RwLock::new(context),
             state: RwLock::new(ConnectionState::Connected),
             state_changed: Notify::new(),

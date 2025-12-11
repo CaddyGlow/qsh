@@ -12,7 +12,9 @@
 //! - Raw terminal mode handling
 //! - Channel-based multiplexing (SSH-style)
 //! - Direct connection mode with SSH key authentication (feature-gated)
+//! - Attach pipe for bootstrap sessions (reverse mode)
 
+pub mod attach;
 pub mod channel;
 pub mod cli;
 pub mod connection;

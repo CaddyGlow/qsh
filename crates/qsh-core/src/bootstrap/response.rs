@@ -54,6 +54,10 @@ pub struct EndpointInfo {
     /// Connect mode indicating this endpoint's role.
     #[serde(default)]
     pub connect_mode: ConnectMode,
+    /// Path to the named pipe for attaching to this session.
+    /// Used in bootstrap/responder mode to allow a separate process to attach.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attach_pipe: Option<String>,
 }
 
 impl BootstrapResponse {
@@ -134,6 +138,7 @@ impl EndpointInfo {
             session_key: base64::engine::general_purpose::STANDARD.encode(session_key),
             server_cert_hash: base64::engine::general_purpose::STANDARD.encode(server_cert_hash),
             connect_mode: ConnectMode::Respond,
+            attach_pipe: None,
         }
     }
 
@@ -152,6 +157,27 @@ impl EndpointInfo {
             session_key: base64::engine::general_purpose::STANDARD.encode(session_key),
             server_cert_hash: base64::engine::general_purpose::STANDARD.encode(server_cert_hash),
             connect_mode,
+            attach_pipe: None,
+        }
+    }
+
+    /// Create new endpoint info with connect mode and attach pipe.
+    pub fn with_attach_pipe(
+        address: impl Into<String>,
+        port: u16,
+        session_key: [u8; SESSION_KEY_LEN],
+        server_cert_hash: &[u8],
+        connect_mode: ConnectMode,
+        attach_pipe: impl Into<String>,
+    ) -> Self {
+        use base64::Engine;
+        Self {
+            address: address.into(),
+            port,
+            session_key: base64::engine::general_purpose::STANDARD.encode(session_key),
+            server_cert_hash: base64::engine::general_purpose::STANDARD.encode(server_cert_hash),
+            connect_mode,
+            attach_pipe: Some(attach_pipe.into()),
         }
     }
 
@@ -258,6 +284,7 @@ mod tests {
             session_key: "not-valid-base64!!!".to_string(),
             server_cert_hash: "AAAA".to_string(),
             connect_mode: ConnectMode::Respond,
+            attach_pipe: None,
         };
 
         let result = info.decode_session_key();
@@ -273,6 +300,7 @@ mod tests {
             session_key: base64::engine::general_purpose::STANDARD.encode(&[0u8; 16]), // Wrong length
             server_cert_hash: "AAAA".to_string(),
             connect_mode: ConnectMode::Respond,
+            attach_pipe: None,
         };
 
         let result = info.decode_session_key();

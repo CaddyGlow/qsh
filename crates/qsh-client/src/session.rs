@@ -348,6 +348,69 @@ impl TerminalComponent {
         })
     }
 
+    /// Create a terminal component for bootstrap/responder mode.
+    ///
+    /// In bootstrap mode, stdin/stdout are replaced with a Unix socket (attach pipe).
+    /// The attach client connects and provides the actual terminal I/O.
+    pub fn new_bootstrap(
+        stdin_fd: std::os::unix::io::RawFd,
+        stdout_fd: std::os::unix::io::RawFd,
+        output_mode: qsh_core::protocol::OutputMode,
+    ) -> Result<Self> {
+        use std::time::Duration;
+        use tokio::time::MissedTickBehavior;
+
+        // No escape key in bootstrap mode (pass-through)
+        let escape_handler = crate::EscapeHandler::new(None);
+
+        // Bootstrap mode is always interactive (PTY on remote side)
+        let is_interactive = true;
+
+        // No raw mode guard needed - the attach client handles raw mode
+        let _raw_guard = None;
+
+        // No prediction in bootstrap mode (server is the one with the shell)
+        let prediction_enabled = false;
+        let prediction_mode = crate::cli::PredictionMode::Off;
+
+        // Overlay refresh interval
+        let mut overlay_refresh = tokio::time::interval(Duration::from_secs(2));
+        overlay_refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        let mut escape_info_refresh = tokio::time::interval(Duration::from_millis(250));
+        escape_info_refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        // Minimal notification engine (default style is Minimal)
+        let notification = crate::overlay::NotificationEngine::new();
+
+        Ok(Self {
+            channel: None,
+            stdin: crate::StdinReader::from_fd(stdin_fd),
+            stdout: crate::StdoutWriter::from_fd(stdout_fd),
+            prediction_enabled,
+            prediction_mode,
+            renderer: crate::render::StateRenderer::new(),
+            prediction_overlay: crate::overlay::PredictionOverlay::new(),
+            client_parser: None,
+            terminal_state: TerminalSessionState::new(),
+            notification,
+            escape_handler,
+            transport_sender: TransportSender::new(qsh_core::transport::SenderConfig::client()),
+            pending_seq: None,
+            pending_predictable: false,
+            paste_threshold: 64,
+            overlay_refresh,
+            escape_info_refresh,
+            is_first_connection: true,
+            reconnect_error: None,
+            disconnect_requested: false,
+            is_interactive,
+            cli_command: None,
+            cli_output_mode: output_mode,
+            _raw_guard,
+        })
+    }
+
     pub async fn on_connect(&mut self, conn: &std::sync::Arc<ChannelConnection>) -> Result<()> {
         tracing::info!(
             session_id = ?conn.session_id(),
@@ -571,10 +634,11 @@ impl TerminalComponent {
                 // TransportSender timer: flush pending input when timing allows
                 _ = tokio::time::sleep_until(self.transport_sender.next_send_time().into()),
                     if self.transport_sender.has_pending() => {
-                    if self.transport_sender.tick().is_some() {
-                        tracing::trace!("TransportSender timer flush");
+                    // Timer fired with pending data - should be ready to send
+                    if self.transport_sender.should_send_now() {
                         return SessionEvent::TransportFlush;
                     }
+                    // Spurious wakeup or timing race - continue loop
                 }
 
                 // Handle terminal events (output or state sync)
@@ -712,11 +776,8 @@ impl TerminalComponent {
         // Determine if we should flush now
         let should_flush = is_paste || has_quit_signal;
 
-        if should_flush {
-            SessionEvent::TransportFlush
-        } else if let Some(_data) = self.transport_sender.tick() {
-            // Timer-based flush (Mosh timing algorithm) - inline check
-            tracing::trace!("TransportSender tick flush (inline)");
+        if should_flush || self.transport_sender.should_send_now() {
+            // Ready to send: paste/quit signal or timer satisfied
             SessionEvent::TransportFlush
         } else {
             // Input queued, will flush on timer
@@ -1179,6 +1240,27 @@ impl Session {
         }
 
         Ok(Self::new(connection, SessionParts { terminal, forwards }))
+    }
+
+    /// Construct session for bootstrap/responder mode.
+    ///
+    /// In bootstrap mode, stdin/stdout come from an attach pipe (Unix socket)
+    /// rather than the real terminal. The attach client connects and provides
+    /// the actual terminal I/O.
+    pub fn from_bootstrap(
+        connection: std::sync::Arc<ReconnectableConnection>,
+        stdin_fd: std::os::unix::io::RawFd,
+        stdout_fd: std::os::unix::io::RawFd,
+        output_mode: qsh_core::protocol::OutputMode,
+    ) -> Result<Self> {
+        let terminal = TerminalComponent::new_bootstrap(stdin_fd, stdout_fd, output_mode)?;
+        Ok(Self::new(
+            connection,
+            SessionParts {
+                terminal: Some(terminal),
+                forwards: None,
+            },
+        ))
     }
 
     /// Run the unified session event loop.

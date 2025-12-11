@@ -194,7 +194,7 @@
 
           export CC="clang"
           export RUSTFLAGS="-C link-arg=-fuse-ld=mold"
-          export CARGO_INCREMENTAL="0"
+          export CARGO_INCREMENTAL="1"
           export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
           export LD_LIBRARY_PATH="${pkgs.zlib}/lib:${pkgs.stdenv.cc.cc.lib}/lib:${pkgs.openssl.out}/lib"
           export OPENSSL_NO_VENDOR="1"

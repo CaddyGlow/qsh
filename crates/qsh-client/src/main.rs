@@ -6,13 +6,9 @@ use std::net::ToSocketAddrs;
 use std::time::Duration;
 
 use clap::Parser;
-use tokio::time::MissedTickBehavior;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
-use qsh_client::cli::{NotificationStyle as CliNotificationStyle, SshBootstrapMode};
-use qsh_client::overlay::{NotificationEngine, NotificationStyle, PredictionOverlay};
-use qsh_client::prediction::{DisplayPreference, Prediction};
-use qsh_client::render::StateRenderer;
+use qsh_client::cli::SshBootstrapMode;
 use qsh_client::{
     BootstrapMode, ChannelConnection, Cli, ConnectionConfig, EscapeCommand, EscapeHandler,
     EscapeResult, ForwarderHandle, HeartbeatTracker, LocalForwarder, ProxyHandle, RawModeGuard,
@@ -23,7 +19,7 @@ use qsh_client::{
 };
 use qsh_core::protocol::Message;
 use qsh_core::terminal::TerminalParser;
-use qsh_core::transport::{Connection, TransportSender};
+use qsh_core::transport::TransportSender;
 
 #[cfg(feature = "standalone")]
 use qsh_client::standalone::authenticate as standalone_authenticate;
@@ -71,6 +67,22 @@ fn main() {
         }
     }
 
+    // Check for attach mode
+    if let Some(ref pipe_path) = cli.attach {
+        // Run in attach mode - connect to existing bootstrap session
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        let result = rt.block_on(async { run_attach_mode(pipe_path).await });
+
+        match result {
+            Ok(exit_code) => std::process::exit(exit_code),
+            Err(e) => {
+                error!(error = %e, "Attach mode failed");
+                eprintln!("qsh: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Extract connection info
     let Some(host) = cli.host() else {
         error!("No destination specified");
@@ -112,18 +124,26 @@ fn main() {
 /// Run client in bootstrap/responder mode.
 ///
 /// This is invoked by a remote qsh-server via SSH. The client:
-/// 1. Creates a BootstrapEndpoint (generates session key, cert, binds port)
-/// 2. Prints bootstrap JSON to stdout (with connect_mode = Respond)
-/// 3. Creates a QUIC acceptor and waits for a single connection
-/// 4. Performs handshake as responder
-/// 5. Transitions to normal terminal session mode
+/// 1. Creates a named pipe for attach (stdin/stdout/stderr)
+/// 2. Creates a BootstrapEndpoint (generates session key, cert, binds port)
+/// 3. Prints bootstrap JSON to stdout (with attach_pipe path)
+/// 4. Creates a QUIC acceptor and waits for a single connection
+/// 5. Performs handshake as responder
+/// 6. Waits for attach client to connect to pipe
+/// 7. Runs the Session with pipe as stdin/stdout
 async fn run_bootstrap_mode(cli: &Cli) -> qsh_core::Result<i32> {
     use std::net::IpAddr;
+    use qsh_client::attach::{create_pipe, pipe_path, accept_attach};
     use qsh_core::bootstrap::{BootstrapEndpoint, BootstrapOptions};
     use qsh_core::ConnectMode;
     use qsh_core::transport::{ListenerConfig, QuicAcceptor};
 
     info!("Starting bootstrap/responder mode");
+
+    // Create named pipe for attach (handles stdin, stdout, stderr)
+    let attach_pipe_path = pipe_path();
+    let (_pipe_guard, pipe_listener) = create_pipe(&attach_pipe_path)?;
+    info!(pipe = %attach_pipe_path.display(), "Created attach pipe");
 
     // Parse bind IP
     let bind_ip: IpAddr = cli
@@ -142,8 +162,11 @@ async fn run_bootstrap_mode(cli: &Cli) -> qsh_core::Result<i32> {
     let endpoint = BootstrapEndpoint::new(bind_ip, &bootstrap_options).await?;
     info!(addr = %endpoint.bind_addr, "Bootstrap endpoint created");
 
-    // Print bootstrap response to stdout (with connect_mode = Respond)
-    endpoint.print_response(ConnectMode::Respond)?;
+    // Print bootstrap response to stdout (with attach_pipe path)
+    endpoint.print_response_with_pipe(
+        ConnectMode::Respond,
+        attach_pipe_path.to_string_lossy().as_ref(),
+    )?;
     info!("Bootstrap response sent");
 
     // Create QUIC acceptor with the endpoint's certificate and key
@@ -157,7 +180,7 @@ async fn run_bootstrap_mode(cli: &Cli) -> qsh_core::Result<i32> {
     let mut acceptor = QuicAcceptor::bind(endpoint.bind_addr, listener_config).await?;
     info!(local_addr = %acceptor.local_addr(), "QUIC acceptor bound, waiting for connection");
 
-    // Accept a single connection with timeout
+    // Accept a single QUIC connection with timeout
     let timeout = Duration::from_secs(cli.bootstrap_timeout_secs);
     let (quic_conn, peer_addr) = tokio::time::timeout(timeout, acceptor.accept())
         .await
@@ -165,17 +188,17 @@ async fn run_bootstrap_mode(cli: &Cli) -> qsh_core::Result<i32> {
             message: format!("bootstrap timeout after {}s", cli.bootstrap_timeout_secs),
         })??;
 
-    info!(peer = %peer_addr, "Accepted QUIC connection from initiator");
+    info!(peer = %peer_addr, "Accepted QUIC connection from initiator (server)");
 
     // Build connection config for responder mode
     let config = ConnectionConfig {
-        server_addr: peer_addr, // Not really used in responder mode
+        server_addr: peer_addr,
         session_key: endpoint.session_key,
         cert_hash: None,
-        term_size: get_term_size(),
-        term_type: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
-        env: collect_terminal_env(),
-        predictive_echo: !cli.no_prediction,
+        term_size: TermSize { cols: 80, rows: 24 }, // Placeholder, will be set by attach client
+        term_type: "xterm-256color".to_string(),
+        env: vec![],
+        predictive_echo: false, // No prediction in bootstrap mode
         connect_timeout: Duration::from_secs(5),
         zero_rtt_available: false,
         keep_alive_interval: cli.keep_alive_interval(),
@@ -185,26 +208,301 @@ async fn run_bootstrap_mode(cli: &Cli) -> qsh_core::Result<i32> {
         connect_mode: ConnectMode::Respond,
     };
 
-    // Complete qsh protocol handshake
-    let conn = ChannelConnection::from_quic(quic_conn, config.clone()).await?;
+    // Complete qsh protocol handshake as responder
+    let conn = std::sync::Arc::new(ChannelConnection::from_quic(quic_conn, config.clone()).await?);
     info!(
         rtt = ?conn.rtt().await,
         session_id = ?conn.session_id(),
-        "Bootstrap handshake complete, transitioning to session mode"
+        "Bootstrap handshake complete"
     );
 
-    // Create session context for reconnection support
-    let context = SessionContext::new(config, conn.session_id());
+    // Open terminal channel IMMEDIATELY after handshake
+    // This starts the shell on the server side so it's ready when attach connects
+    let terminal_params = qsh_core::protocol::TerminalParams {
+        term_size: TermSize { cols: 80, rows: 24 }, // Default size, attach client can resize
+        term_type: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
+        env: vec![],
+        shell: None,
+        command: None,
+        allocate_pty: true,
+        last_generation: 0,
+        last_input_seq: 0,
+        output_mode: cli.output_mode(),
+    };
 
-    // Create reconnectable connection wrapper
-    let reconnectable = std::sync::Arc::new(ReconnectableConnection::new(conn, context));
+    let terminal = conn.open_terminal(terminal_params).await?;
+    info!(channel_id = ?terminal.channel_id(), "Terminal channel opened, shell is running");
 
-    // Cache session data for 0-RTT reconnection
-    reconnectable.store_session_data().await;
+    // Buffer for terminal output received before attach connects
+    let mut output_buffer: Vec<u8> = Vec::new();
 
-    // Build and run unified session (handles both terminal and forwards)
-    let session = Session::from_cli(reconnectable, cli, None)?;
-    session.run().await
+    // Wait for attach client to connect.
+    // We must process control messages (heartbeats) AND terminal output from the server
+    // to keep the connection alive and buffer any shell output.
+    info!("Waiting for attach client on {}", attach_pipe_path.display());
+
+    // Use a channel to signal when attach client connects
+    let (attach_tx, attach_rx) = tokio::sync::oneshot::channel();
+
+    // Spawn task to accept attach client
+    let attach_task = tokio::spawn(async move {
+        let result = accept_attach(&pipe_listener).await;
+        let _ = attach_tx.send(result);
+    });
+
+    // Process control messages and terminal output until attach client connects
+    let mut attach_rx = attach_rx;
+    let attach_result = loop {
+        tokio::select! {
+            biased;
+
+            // Check if attach client connected
+            result = &mut attach_rx => {
+                match result {
+                    Ok(r) => break r,
+                    Err(_) => {
+                        return Err(qsh_core::Error::Transport {
+                            message: "attach accept task failed".to_string(),
+                        });
+                    }
+                }
+            }
+
+            // Read terminal output and buffer it
+            event = terminal.recv_event() => {
+                match event {
+                    Ok(qsh_client::channel::TerminalEvent::Output(output)) => {
+                        debug!(len = output.data.len(), "Buffering terminal output while waiting for attach");
+                        output_buffer.extend_from_slice(&output.data);
+                    }
+                    Ok(qsh_client::channel::TerminalEvent::StateSync(_)) => {
+                        debug!("Received state sync while waiting for attach");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Terminal output error while waiting for attach");
+                        // Terminal may have closed - continue waiting for attach
+                    }
+                }
+            }
+
+            // Process control messages from server (mainly heartbeats)
+            msg = conn.recv_control() => {
+                match msg {
+                    Ok(Message::Heartbeat(hb)) => {
+                        // Echo heartbeat back to server
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| (d.as_millis() % 65536) as u16)
+                            .unwrap_or(0);
+                        let reply = Message::Heartbeat(qsh_core::protocol::HeartbeatPayload::reply(
+                            now_ms,
+                            hb.timestamp,
+                            hb.seq,
+                        ));
+                        if let Err(e) = conn.send_control(&reply).await {
+                            warn!(error = %e, "Failed to send heartbeat reply while waiting for attach");
+                        } else {
+                            debug!(seq = hb.seq, "Replied to heartbeat while waiting for attach");
+                        }
+                    }
+                    Ok(msg) => {
+                        debug!(?msg, "Received control message while waiting for attach");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Control stream error while waiting for attach");
+                    }
+                }
+            }
+        }
+    };
+
+    // Clean up attach task if it's still running
+    attach_task.abort();
+
+    let attach_stream = attach_result?;
+    info!(
+        buffered_output = output_buffer.len(),
+        "Attach client connected"
+    );
+
+    // Flush buffered output to attach client
+    use tokio::io::AsyncWriteExt;
+    let (mut attach_rx, mut attach_tx) = attach_stream.into_split();
+    if !output_buffer.is_empty() {
+        info!(len = output_buffer.len(), "Flushing buffered terminal output to attach client");
+        attach_tx.write_all(&output_buffer).await.map_err(|e| qsh_core::Error::Io(e))?;
+    }
+
+    // Simple relay loop: attach <-> terminal channel
+    // Also process heartbeats to keep connection alive
+    info!("Starting bootstrap relay loop");
+
+    let mut attach_buf = [0u8; 4096];
+    let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(5));
+    heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            biased;
+
+            // Attach client input -> terminal channel
+            result = tokio::io::AsyncReadExt::read(&mut attach_rx, &mut attach_buf) => {
+                match result {
+                    Ok(0) => {
+                        info!("Attach client disconnected");
+                        break;
+                    }
+                    Ok(n) => {
+                        // send_input takes (data, predictable) - not predictable for bootstrap relay
+                        if let Err(e) = terminal.send_input(&attach_buf[..n], false).await {
+                            warn!(error = %e, "Failed to send to terminal channel");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to read from attach client");
+                        break;
+                    }
+                }
+            }
+
+            // Terminal channel output -> attach client
+            event = terminal.recv_event() => {
+                match event {
+                    Ok(qsh_client::channel::TerminalEvent::Output(output)) => {
+                        if let Err(e) = attach_tx.write_all(&output.data).await {
+                            warn!(error = %e, "Failed to write to attach client");
+                            break;
+                        }
+                    }
+                    Ok(qsh_client::channel::TerminalEvent::StateSync(_)) => {
+                        // State sync is for reconnection, not relevant for bootstrap relay
+                        debug!("Ignoring state sync in bootstrap relay");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Terminal channel closed");
+                        break;
+                    }
+                }
+            }
+
+            // Process control messages (heartbeats)
+            msg = conn.recv_control() => {
+                match msg {
+                    Ok(Message::Heartbeat(hb)) => {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| (d.as_millis() % 65536) as u16)
+                            .unwrap_or(0);
+                        let reply = Message::Heartbeat(qsh_core::protocol::HeartbeatPayload::reply(
+                            now_ms,
+                            hb.timestamp,
+                            hb.seq,
+                        ));
+                        if let Err(e) = conn.send_control(&reply).await {
+                            warn!(error = %e, "Failed to send heartbeat reply");
+                        }
+                    }
+                    Ok(Message::ChannelClose(_)) => {
+                        info!("Server closed terminal channel");
+                        break;
+                    }
+                    Ok(msg) => {
+                        debug!(?msg, "Received control message");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Control stream error");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    info!("Bootstrap session ended");
+    Ok(0)
+}
+
+/// Run client in attach mode.
+///
+/// Connects to an existing bootstrap session via named pipe.
+/// Provides stdin/stdout/stderr access to the remote shell.
+async fn run_attach_mode(pipe_path: &str) -> qsh_core::Result<i32> {
+    use std::path::Path;
+    use qsh_client::attach::connect_attach;
+    use qsh_client::terminal::RawModeGuard;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    info!(pipe = %pipe_path, "Attaching to bootstrap session");
+
+    // Connect to the pipe
+    let mut pipe = connect_attach(Path::new(pipe_path)).await?;
+    info!("Connected to bootstrap session");
+
+    // Put terminal in raw mode
+    let _raw_guard = RawModeGuard::enter()?;
+
+    // Get stdin and stdout/stderr
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    let mut stderr = tokio::io::stderr();
+
+    // Relay I/O between local terminal and pipe
+    // Pipe output goes to both stdout and stderr (PTY merges them)
+    let mut stdin_buf = [0u8; 4096];
+    let mut pipe_buf = [0u8; 4096];
+
+    loop {
+        tokio::select! {
+            // Local stdin -> Pipe
+            result = stdin.read(&mut stdin_buf) => {
+                match result {
+                    Ok(0) => {
+                        info!("Stdin closed");
+                        break;
+                    }
+                    Ok(n) => {
+                        if let Err(e) = pipe.write_all(&stdin_buf[..n]).await {
+                            warn!(error = %e, "Failed to write to pipe");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to read from stdin");
+                        break;
+                    }
+                }
+            }
+
+            // Pipe -> Local stdout (PTY output includes both stdout and stderr)
+            result = pipe.read(&mut pipe_buf) => {
+                match result {
+                    Ok(0) => {
+                        info!("Pipe closed");
+                        break;
+                    }
+                    Ok(n) => {
+                        // Write to stdout (PTY merges stdout/stderr)
+                        if let Err(e) = stdout.write_all(&pipe_buf[..n]).await {
+                            warn!(error = %e, "Failed to write to stdout");
+                            break;
+                        }
+                        let _ = stdout.flush().await;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to read from pipe");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Suppress unused variable warning
+    let _ = stderr;
+
+    info!("Attach session ended");
+    Ok(0)
 }
 
 #[cfg(feature = "standalone")]
@@ -473,10 +771,3 @@ fn format_user_host(user: Option<&str>, host: &str) -> String {
     }
 }
 
-/// Convert CLI notification style to overlay module style.
-fn map_notification_style(cli_style: CliNotificationStyle) -> NotificationStyle {
-    match cli_style {
-        CliNotificationStyle::Minimal => NotificationStyle::Minimal,
-        CliNotificationStyle::Enhanced => NotificationStyle::Enhanced,
-    }
-}

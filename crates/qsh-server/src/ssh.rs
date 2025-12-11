@@ -71,6 +71,18 @@ pub struct SshConfig {
     /// Passed to `qsh --bootstrap --port-range START-END`. Typically Mosh-style
     /// range (60001-60999) for firewall compatibility.
     pub port_range: Option<(u16, u16)>,
+
+    /// Extra arguments to pass to the bootstrap client.
+    ///
+    /// Appended to the `qsh --bootstrap` command. Can include logging flags,
+    /// debug options, etc. Example: "--log-file /tmp/qsh.log -vvv"
+    pub extra_args: Option<String>,
+
+    /// Extra environment variables for the bootstrap client.
+    ///
+    /// Set as env vars in the remote shell before running the bootstrap command.
+    /// Example: [("RUST_LOG", "debug")]
+    pub extra_env: Vec<(String, String)>,
 }
 
 impl Default for SshConfig {
@@ -80,6 +92,8 @@ impl Default for SshConfig {
             identity_file: None,
             skip_host_key_check: false,
             port_range: None,
+            extra_args: None,
+            extra_env: Vec::new(),
         }
     }
 }
@@ -142,11 +156,36 @@ async fn bootstrap_via_ssh_cli(
         cmd.arg("-o").arg("UserKnownHostsFile=/dev/null");
     }
 
+    // Force no TTY allocation - we're running a bootstrap command that outputs JSON
+    cmd.arg("-T");
+
     cmd.arg(remote);
-    cmd.arg("qsh").arg("--bootstrap");
+
+    // Build the remote command: either just "qsh --bootstrap ..." or with env vars prefix
+    let mut bootstrap_cmd = String::from("qsh --bootstrap");
 
     if let Some((start, end)) = config.port_range {
-        cmd.arg("--port-range").arg(format!("{}-{}", start, end));
+        bootstrap_cmd.push_str(&format!(" --bootstrap-port-range {}-{}", start, end));
+    }
+
+    // Add extra arguments if provided
+    if let Some(ref extra_args) = config.extra_args {
+        bootstrap_cmd.push(' ');
+        bootstrap_cmd.push_str(extra_args);
+    }
+
+    // If we have env vars, prefix the command with them
+    if !config.extra_env.is_empty() {
+        let env_prefix: String = config
+            .extra_env
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, shell_escape(v)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        cmd.arg(format!("{} {}", env_prefix, bootstrap_cmd));
+    } else {
+        // No env vars, pass command and args directly
+        cmd.args(bootstrap_cmd.split_whitespace());
     }
 
     cmd.stdin(Stdio::null());
@@ -160,6 +199,7 @@ async fn bootstrap_via_ssh_cli(
             .identity_file
             .as_ref()
             .map(|p| p.display().to_string()),
+        command = ?cmd.as_std(),
         "Executing ssh bootstrap via CLI"
     );
 
@@ -236,6 +276,18 @@ async fn bootstrap_via_ssh_cli(
         endpoint_info,
         _ssh_process: Some(child),
     })
+}
+
+/// Simple shell escaping for environment variable values.
+/// Wraps values with special characters in single quotes.
+fn shell_escape(s: &str) -> String {
+    if s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '/' || c == '.') {
+        s.to_string()
+    } else {
+        // Escape single quotes by ending the string, adding escaped quote, and restarting
+        let escaped = s.replace('\'', "'\"'\"'");
+        format!("'{}'", escaped)
+    }
 }
 
 fn parse_bootstrap_response(output: Vec<u8>) -> Result<EndpointInfo> {

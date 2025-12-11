@@ -200,6 +200,9 @@ impl TransportSender {
     /// `Some(data)` if the timing conditions are met, `None` otherwise.
     ///
     /// Equivalent to Mosh's `tick()` from `transportsender-impl.h:136-187`.
+    ///
+    /// **Warning**: If you use this method and it returns `Some`, the buffer is
+    /// cleared. Don't call this if you plan to call `flush()` separately later.
     pub fn tick(&mut self) -> Option<Vec<u8>> {
         if self.should_send_now() {
             Some(self.flush())

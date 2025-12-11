@@ -200,6 +200,16 @@ pub struct Cli {
     #[arg(long = "skip-host-key-check")]
     pub skip_host_key_check: bool,
 
+    /// Extra arguments to pass to the bootstrap client (qsh --bootstrap).
+    /// Example: --bootstrap-client-args "--log-file /tmp/qsh.log -vvv"
+    #[arg(long = "bootstrap-client-args", value_name = "ARGS")]
+    pub bootstrap_client_args: Option<String>,
+
+    /// Environment variables to set for the bootstrap client process.
+    /// Can be specified multiple times. Example: --bootstrap-client-env RUST_LOG=debug
+    #[arg(long = "bootstrap-client-env", action = ArgAction::Append, value_name = "VAR=VALUE")]
+    pub bootstrap_client_env: Vec<String>,
+
     // Standalone mode options (feature-gated)
     /// Run in standalone mode with SSH key authentication
     #[cfg(feature = "standalone")]
@@ -328,6 +338,17 @@ impl Cli {
         }
     }
 
+    /// Parse bootstrap client environment variables from --bootstrap-client-env arguments.
+    pub fn parse_bootstrap_client_env(&self) -> Vec<(String, String)> {
+        self.bootstrap_client_env
+            .iter()
+            .filter_map(|s| {
+                let (name, value) = s.split_once('=')?;
+                Some((name.to_string(), value.to_string()))
+            })
+            .collect()
+    }
+
     /// Parse target destination for initiator mode.
     ///
     /// Returns (host, port, user) from target string like `[user@]host[:port]`.
@@ -415,6 +436,8 @@ impl Default for Cli {
             ssh_port: 22,
             identity_file: None,
             skip_host_key_check: false,
+            bootstrap_client_args: None,
+            bootstrap_client_env: Vec::new(),
             #[cfg(feature = "standalone")]
             standalone: false,
             #[cfg(feature = "standalone")]

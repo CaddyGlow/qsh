@@ -155,8 +155,14 @@ impl StdinReader {
     ///
     /// Sets stdin to non-blocking mode and wraps it in AsyncFd.
     pub fn new() -> Self {
-        let fd = io::stdin().as_raw_fd();
+        Self::from_fd(io::stdin().as_raw_fd())
+    }
 
+    /// Create a reader from an arbitrary file descriptor.
+    ///
+    /// Sets the fd to non-blocking mode and wraps it in AsyncFd.
+    /// Useful for bootstrap mode where input comes from a pipe instead of stdin.
+    pub fn from_fd(fd: RawFd) -> Self {
         // Set non-blocking mode
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFL);
@@ -166,7 +172,7 @@ impl StdinReader {
         }
 
         // AsyncFd requires the fd to be non-blocking
-        let async_fd = AsyncFd::new(fd).expect("failed to create AsyncFd for stdin");
+        let async_fd = AsyncFd::new(fd).expect("failed to create AsyncFd for fd");
 
         Self { async_fd, fd }
     }
@@ -255,14 +261,39 @@ impl Default for StdinReader {
 
 /// Async stdout writer with retry handling for WouldBlock.
 pub struct StdoutWriter {
-    stdout: tokio::io::Stdout,
+    inner: StdoutWriterInner,
+}
+
+enum StdoutWriterInner {
+    Stdout(tokio::io::Stdout),
+    Fd(AsyncFd<RawFd>, RawFd),
 }
 
 impl StdoutWriter {
     /// Create a new stdout writer.
     pub fn new() -> Self {
         Self {
-            stdout: tokio::io::stdout(),
+            inner: StdoutWriterInner::Stdout(tokio::io::stdout()),
+        }
+    }
+
+    /// Create a writer from an arbitrary file descriptor.
+    ///
+    /// Sets the fd to non-blocking mode and wraps it in AsyncFd.
+    /// Useful for bootstrap mode where output goes to a pipe instead of stdout.
+    pub fn from_fd(fd: RawFd) -> Self {
+        // Set non-blocking mode
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+
+        let async_fd = AsyncFd::new(fd).expect("failed to create AsyncFd for fd");
+
+        Self {
+            inner: StdoutWriterInner::Fd(async_fd, fd),
         }
     }
 
@@ -271,6 +302,13 @@ impl StdoutWriter {
     /// Handles EAGAIN/WouldBlock by yielding and retrying up to a limit.
     /// This can happen when the terminal buffer is full (e.g., during fast output).
     pub async fn write(&mut self, data: &[u8]) -> Result<()> {
+        match &mut self.inner {
+            StdoutWriterInner::Stdout(stdout) => Self::write_stdout_impl(stdout, data).await,
+            StdoutWriterInner::Fd(async_fd, fd) => Self::write_fd_impl(async_fd, *fd, data).await,
+        }
+    }
+
+    async fn write_stdout_impl(stdout: &mut tokio::io::Stdout, data: &[u8]) -> Result<()> {
         use tokio::io::AsyncWriteExt;
 
         let mut written = 0;
@@ -279,7 +317,7 @@ impl StdoutWriter {
         const RETRY_DELAY_US: u64 = 100; // 100 microseconds
 
         while written < data.len() {
-            match self.stdout.write(&data[written..]).await {
+            match stdout.write(&data[written..]).await {
                 Ok(0) => {
                     // No progress - shouldn't happen but treat as error
                     return Err(Error::Io(std::io::Error::new(
@@ -316,9 +354,76 @@ impl StdoutWriter {
         }
 
         // Best effort flush - don't fail on WouldBlock
-        if let Err(e) = self.stdout.flush().await {
+        if let Err(e) = stdout.flush().await {
             if e.kind() != std::io::ErrorKind::WouldBlock {
                 return Err(Error::Io(e));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn write_fd_impl(async_fd: &AsyncFd<RawFd>, fd: RawFd, data: &[u8]) -> Result<()> {
+        let mut written = 0;
+        let mut retries = 0;
+        const MAX_RETRIES: u32 = 10;
+        const RETRY_DELAY_US: u64 = 100;
+
+        while written < data.len() {
+            // Wait for fd to be writable
+            let mut guard = match async_fd.writable().await {
+                Ok(guard) => guard,
+                Err(e) => {
+                    tracing::error!(error = %e, "fd writable error");
+                    return Err(Error::Io(e));
+                }
+            };
+
+            match guard.try_io(|_| {
+                let n = unsafe {
+                    libc::write(
+                        fd,
+                        data[written..].as_ptr() as *const libc::c_void,
+                        data.len() - written,
+                    )
+                };
+                if n < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }) {
+                Ok(Ok(0)) => {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "fd write returned 0 bytes",
+                    )));
+                }
+                Ok(Ok(n)) => {
+                    written += n;
+                    retries = 0;
+                }
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    retries += 1;
+                    if retries > MAX_RETRIES {
+                        tracing::trace!(
+                            written,
+                            total = data.len(),
+                            "fd WouldBlock after max retries, partial write"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_micros(RETRY_DELAY_US)).await;
+                }
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    continue;
+                }
+                Ok(Err(e)) => {
+                    return Err(Error::Io(e));
+                }
+                Err(_would_block) => {
+                    continue;
+                }
             }
         }
 

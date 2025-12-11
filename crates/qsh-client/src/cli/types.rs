@@ -127,7 +127,7 @@ impl FromStr for TunnelArg {
 )]
 pub struct Cli {
     /// Remote host (user@host or host)
-    #[arg(required_unless_present_any = ["bootstrap"])]
+    #[arg(required_unless_present_any = ["bootstrap", "attach"])]
     pub destination: Option<String>,
 
     /// Command to execute on remote host (optional)
@@ -380,6 +380,11 @@ pub struct Cli {
     /// Bootstrap mode bind IP (default: 0.0.0.0)
     #[arg(long = "bootstrap-bind-ip", default_value = "0.0.0.0", value_name = "IP")]
     pub bootstrap_bind_ip: String,
+
+    /// Attach to a bootstrap session via named pipe.
+    /// The pipe path is output in the bootstrap JSON response.
+    #[arg(long = "attach", value_name = "PIPE", conflicts_with_all = ["destination", "bootstrap"])]
+    pub attach: Option<String>,
 }
 
 impl Cli {

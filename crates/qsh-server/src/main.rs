@@ -13,7 +13,8 @@ const ENABLE_BOOTSTRAP_SINGLETON: bool = false;
 use clap::Parser;
 use tracing::{debug, error, info, warn};
 
-use qsh_core::protocol::Capabilities;
+use qsh_core::error::Error;
+use qsh_core::protocol::{Capabilities, HeartbeatPayload, Message};
 use qsh_core::transport::generate_self_signed_cert;
 use qsh_server::listener::{QshListener, ServerConfig};
 use qsh_server::{BootstrapServer, Cli, ConnectionConfig, SessionAuthorizer, SessionConfig};
@@ -31,7 +32,7 @@ fn main() {
     let cli = Cli::parse();
 
     // Validate CLI arguments and infer connect mode before doing anything else
-    let _effective_connect_mode = match cli.validate_and_infer_connect_mode() {
+    let effective_connect_mode = match cli.validate_and_infer_connect_mode() {
         Ok(mode) => mode,
         Err(e) => {
             eprintln!("qsh-server: {}", e);
@@ -82,8 +83,8 @@ fn main() {
     // Log startup
     info!(version = env!("CARGO_PKG_VERSION"), "qsh-server starting");
 
-    // Check for initiator mode
-    if cli.connect_mode == qsh_server::cli::ConnectModeArg::Initiate {
+    // Check for initiator mode (using inferred mode, not cli.connect_mode directly)
+    if effective_connect_mode == qsh_server::cli::ConnectModeArg::Initiate {
         info!("Running in initiator mode (SSH-out to client)");
 
         // Create tokio runtime for initiator mode
@@ -100,7 +101,7 @@ fn main() {
         return;
     }
 
-    debug!(connect_mode = ?cli.connect_mode, "Connect mode");
+    debug!(connect_mode = ?effective_connect_mode, "Connect mode");
 
     // Check TLS configuration
     if !cli.has_tls_config() && !cli.self_signed {
@@ -344,6 +345,8 @@ async fn run_server_initiate(cli: &Cli) -> qsh_core::Result<()> {
         identity_file: cli.identity_file.clone(),
         skip_host_key_check: cli.skip_host_key_check,
         port_range: Some(cli.port_range),
+        extra_args: cli.bootstrap_client_args.clone(),
+        extra_env: cli.parse_bootstrap_client_env(),
     };
 
     // Bootstrap via SSH to get client's QUIC endpoint
@@ -457,7 +460,7 @@ async fn run_server_initiate(cli: &Cli) -> qsh_core::Result<()> {
 
     // Create connection handler
     // Note: control_stream is moved here; ConnectionHandler will manage it
-    let (_handler, mut shutdown_rx) = ConnectionHandler::new(
+    let (handler, mut shutdown_rx) = ConnectionHandler::new(
         quic_conn,
         control_stream,
         handshake_result.session_id,
@@ -469,20 +472,113 @@ async fn run_server_initiate(cli: &Cli) -> qsh_core::Result<()> {
         "Server initiator mode active, handling connection"
     );
 
-    // Handle the connection - just wait for shutdown
-    // The ConnectionHandler will process control messages internally
-    // NOTE: We're not actively processing control messages here because
-    // ConnectionHandler manages them internally through its channels mechanism.
-    // In a full implementation, we would spawn a task to call handler methods.
-    match shutdown_rx.recv().await {
-        Some(reason) => {
-            info!(?reason, "Shutdown signal received");
-        }
-        None => {
-            info!("Shutdown channel closed");
+    // Heartbeat timer to keep connection alive (server sends heartbeats in initiator mode)
+    let mut heartbeat_timer = tokio::time::interval(std::time::Duration::from_secs(5));
+    heartbeat_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut heartbeat_seq: u32 = 0;
+
+    // Run the control message processing loop (same as listener.rs)
+    loop {
+        tokio::select! {
+            biased;
+
+            // Handle shutdown signal
+            reason = shutdown_rx.recv() => {
+                match reason {
+                    Some(reason) => {
+                        info!(?reason, "Shutdown signal received");
+                    }
+                    None => {
+                        info!("Shutdown channel closed");
+                    }
+                }
+                break;
+            }
+
+            // Handle control messages from the client
+            msg = handler.recv_control() => {
+                match msg {
+                    Ok(Message::ChannelOpen(payload)) => {
+                        if let Err(e) = handler.handle_channel_open(payload).await {
+                            error!(error = %e, "Failed to handle ChannelOpen");
+                        }
+                    }
+                    Ok(Message::ChannelClose(payload)) => {
+                        if let Err(e) = handler.handle_channel_close(payload).await {
+                            error!(error = %e, "Failed to handle ChannelClose");
+                        }
+                    }
+                    Ok(Message::ChannelAccept(payload)) => {
+                        if let Err(e) = handler.handle_channel_accept(payload).await {
+                            error!(error = %e, "Failed to handle ChannelAccept");
+                        }
+                    }
+                    Ok(Message::ChannelReject(payload)) => {
+                        if let Err(e) = handler.handle_channel_reject(payload).await {
+                            error!(error = %e, "Failed to handle ChannelReject");
+                        }
+                    }
+                    Ok(Message::GlobalRequest(payload)) => {
+                        if let Err(e) = handler.handle_global_request(payload).await {
+                            error!(error = %e, "Failed to handle GlobalRequest");
+                        }
+                    }
+                    Ok(Message::Resize(payload)) => {
+                        if let Err(e) = handler.handle_resize(payload).await {
+                            warn!(error = %e, "Failed to handle Resize");
+                        }
+                    }
+                    Ok(Message::StateAck(payload)) => {
+                        if let Err(e) = handler.handle_state_ack(payload).await {
+                            warn!(error = %e, "Failed to handle StateAck");
+                        }
+                    }
+                    Ok(Message::Heartbeat(payload)) => {
+                        // Echo heartbeat immediately for RTT measurement
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| (d.as_millis() % 65536) as u16)
+                            .unwrap_or(0);
+                        let reply = Message::Heartbeat(HeartbeatPayload::reply(now_ms, payload.timestamp, payload.seq));
+                        if let Err(e) = handler.send_control(&reply).await {
+                            warn!(error = %e, "Failed to send heartbeat reply");
+                        }
+                    }
+                    Ok(Message::Shutdown(payload)) => {
+                        info!(reason = ?payload.reason, "Client requested shutdown");
+                        break;
+                    }
+                    Ok(other) => {
+                        warn!(msg = ?other, "Unexpected control message");
+                    }
+                    Err(Error::ConnectionClosed) => {
+                        info!("Connection closed");
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Control stream error");
+                        break;
+                    }
+                }
+            }
+
+            // Send heartbeat to keep connection alive
+            _ = heartbeat_timer.tick() => {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| (d.as_millis() % 65536) as u16)
+                    .unwrap_or(0);
+                let heartbeat = Message::Heartbeat(HeartbeatPayload::new(now_ms, heartbeat_seq as u16));
+                heartbeat_seq = heartbeat_seq.wrapping_add(1);
+                if let Err(e) = handler.send_control(&heartbeat).await {
+                    warn!(error = %e, "Failed to send heartbeat");
+                }
+            }
         }
     }
 
+    // Cleanup
+    handler.shutdown().await;
     info!("Server initiator mode connection closed");
 
     Ok(())

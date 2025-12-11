@@ -34,7 +34,7 @@ pub fn random_local_port() -> u16 {
 use qsh_core::ConnectMode;
 use qsh_core::constants::{DEFAULT_MAX_FORWARDS, FORWARD_BUFFER_SIZE, IDLE_TIMEOUT};
 use qsh_core::error::{Error, Result};
-use qsh_core::handshake::{HandshakeConfig, handshake_initiate};
+use qsh_core::handshake::{HandshakeConfig, handshake_initiate, handshake_respond};
 use qsh_core::protocol::{
     Capabilities, Message, ResizePayload, SessionId, ShutdownPayload, ShutdownReason,
     TermSize,
@@ -258,18 +258,36 @@ impl ChannelConnection {
     ) -> Result<Self> {
         info!(
             resume = resume_session.is_some(),
+            connect_mode = ?config.connect_mode,
             "QUIC connection established (channel model)"
         );
         let quic = Arc::new(conn);
 
-        // Open control stream
-        let mut control = quic
-            .open_stream(qsh_core::transport::StreamType::Control)
-            .await?;
+        // Open or accept control stream based on connect mode
+        let mut control = match config.connect_mode {
+            ConnectMode::Initiate => {
+                // Initiator opens the control stream
+                quic.open_stream(qsh_core::transport::StreamType::Control)
+                    .await?
+            }
+            ConnectMode::Respond => {
+                // Responder accepts the control stream opened by initiator
+                let (stream_type, stream) = quic.accept_stream().await?;
+                if !matches!(stream_type, qsh_core::transport::StreamType::Control) {
+                    return Err(Error::Protocol {
+                        message: format!("expected Control stream, got {:?}", stream_type),
+                    });
+                }
+                stream
+            }
+        };
 
-        // Perform handshake using shared helper
+        // Perform handshake based on connect mode
         let handshake_config = config.to_handshake_config(resume_session);
-        let handshake_result = handshake_initiate(&mut control, &handshake_config).await?;
+        let handshake_result = match config.connect_mode {
+            ConnectMode::Initiate => handshake_initiate(&mut control, &handshake_config).await?,
+            ConnectMode::Respond => handshake_respond(&mut control, &handshake_config, None).await?,
+        };
 
         let has_existing = !handshake_result.existing_channels.is_empty();
         info!(
@@ -403,13 +421,57 @@ impl ChannelConnection {
         ChannelId::client(id)
     }
 
+    /// Wait for a ChannelAccept or ChannelReject for the given channel ID.
+    ///
+    /// Reads control messages until the expected response arrives.
+    /// Other messages are dispatched to their respective handlers.
+    async fn wait_for_channel_accept(&self, channel_id: ChannelId) -> Result<ChannelAcceptData> {
+        let mut control = self.control.lock().await;
+        loop {
+            let msg = control.recv().await?;
+            match msg {
+                Message::ChannelAccept(accept) if accept.channel_id == channel_id => {
+                    return Ok(accept.data);
+                }
+                Message::ChannelReject(reject) if reject.channel_id == channel_id => {
+                    return Err(Error::Protocol {
+                        message: format!("Channel rejected: {}", reject.message),
+                    });
+                }
+                Message::ChannelAccept(accept) => {
+                    // Different channel - dispatch to pending accepts
+                    if let Some(tx) = self.pending_channel_accepts.lock().await.remove(&accept.channel_id) {
+                        let _ = tx.send(Ok(accept.data));
+                    }
+                }
+                Message::ChannelReject(reject) => {
+                    // Different channel - dispatch to pending accepts
+                    if let Some(tx) = self.pending_channel_accepts.lock().await.remove(&reject.channel_id) {
+                        let _ = tx.send(Err(Error::Protocol {
+                            message: format!("Channel rejected: {}", reject.message),
+                        }));
+                    }
+                }
+                Message::GlobalReply(reply) => {
+                    // Dispatch to pending global requests
+                    if let Some(tx) = self.pending_global_requests.lock().await.remove(&reply.request_id) {
+                        let _ = tx.send(reply.result);
+                    }
+                }
+                Message::Heartbeat(_) => {
+                    // Ignore heartbeats during channel open
+                    // The Session event loop will handle them later
+                }
+                other => {
+                    debug!(?other, "Ignoring control message while waiting for ChannelAccept");
+                }
+            }
+        }
+    }
+
     /// Open a terminal channel.
     pub async fn open_terminal(&self, params: TerminalParams) -> Result<TerminalChannel> {
         let channel_id = self.allocate_channel_id();
-
-        // Register oneshot channel BEFORE sending ChannelOpen (avoid race)
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending_channel_accepts.lock().await.insert(channel_id, tx);
 
         // Send ChannelOpen
         let open = ChannelOpenPayload {
@@ -418,16 +480,9 @@ impl ChannelConnection {
         };
         self.send_control(&Message::ChannelOpen(open)).await?;
 
-        // Wait for ChannelAccept or ChannelReject
-        let accept_data = match rx.await {
-            Ok(Ok(data)) => data,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                return Err(qsh_core::Error::Protocol {
-                    message: format!("Channel accept sender dropped for {:?}", channel_id),
-                });
-            }
-        };
+        // Wait for ChannelAccept or ChannelReject by reading control messages
+        // This is necessary because the Session event loop hasn't started yet
+        let accept_data = self.wait_for_channel_accept(channel_id).await?;
 
         // Open input/output streams
         let input_stream = self
@@ -467,10 +522,6 @@ impl ChannelConnection {
         let channel_id = self.allocate_channel_id();
         let resume_offset = params.resume_from;
 
-        // Register oneshot channel BEFORE sending ChannelOpen (avoid race)
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending_channel_accepts.lock().await.insert(channel_id, tx);
-
         // Send ChannelOpen
         let open = ChannelOpenPayload {
             channel_id,
@@ -479,15 +530,7 @@ impl ChannelConnection {
         self.send_control(&Message::ChannelOpen(open)).await?;
 
         // Wait for ChannelAccept or ChannelReject
-        let accept_data = match rx.await {
-            Ok(Ok(data)) => data,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                return Err(qsh_core::Error::Protocol {
-                    message: format!("Channel accept sender dropped for {:?}", channel_id),
-                });
-            }
-        };
+        let accept_data = self.wait_for_channel_accept(channel_id).await?;
 
         // Open bidirectional stream for file data
         let stream = self
@@ -518,10 +561,6 @@ impl ChannelConnection {
         let target_host = params.target_host.clone();
         let target_port = params.target_port;
 
-        // Register oneshot channel BEFORE sending ChannelOpen (avoid race)
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending_channel_accepts.lock().await.insert(channel_id, tx);
-
         // Send ChannelOpen
         let open = ChannelOpenPayload {
             channel_id,
@@ -530,15 +569,7 @@ impl ChannelConnection {
         self.send_control(&Message::ChannelOpen(open)).await?;
 
         // Wait for ChannelAccept or ChannelReject
-        let accept_data = match rx.await {
-            Ok(Ok(data)) => data,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                return Err(qsh_core::Error::Protocol {
-                    message: format!("Channel accept sender dropped for {:?}", channel_id),
-                });
-            }
-        };
+        let _accept_data = self.wait_for_channel_accept(channel_id).await?;
 
         // Open bidirectional stream for forwarded data
         let stream = self
