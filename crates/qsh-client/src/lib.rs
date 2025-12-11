@@ -43,7 +43,10 @@ pub use forward::{
     Socks5Proxy, parse_dynamic_forward, parse_local_forward, parse_remote_forward,
 };
 pub use reconnectable::ReconnectableConnection;
-pub use session::{ConnectionState, SessionContext, TerminalSessionState};
+pub use session::{
+    ConnectionState, ForwardComponent, Session, SessionContext, SessionParts, TerminalComponent,
+    TerminalSessionState,
+};
 pub use ssh::{BootstrapHandle, BootstrapMode, SshConfig, bootstrap};
 pub use terminal::{RawModeGuard, StdinReader, StdoutWriter, get_terminal_size, restore_terminal};
 

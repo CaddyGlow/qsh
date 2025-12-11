@@ -81,29 +81,78 @@ fn main() {
     }
 }
 
-/// Spawn a control message handler task for server-initiated channels.
+/// Run the event loop for forwarding-only mode with heartbeat support.
 ///
-/// Returns a JoinHandle that processes ForwardedTcpIp and shutdown requests.
-fn spawn_control_handler(conn: std::sync::Arc<ChannelConnection>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        info!("Control message handler started");
-        loop {
-            debug!("Waiting for control message...");
-            match conn.recv_control().await {
-                Ok(msg) => {
-                    info!(?msg, "Received control message");
-                    if let Err(e) = handle_control_message(&conn, msg).await {
-                        warn!(error = %e, "Error handling control message");
-                        break;
+/// This keeps the QUIC connection alive by sending periodic heartbeats,
+/// handles server-initiated channels (ForwardedTcpIp), and waits for Ctrl+C.
+async fn run_forwarding_only_loop(
+    conn: std::sync::Arc<ChannelConnection>,
+) -> qsh_core::Result<()> {
+    use qsh_core::connection::HeartbeatTracker;
+    use qsh_core::protocol::Message;
+
+    info!("Press Ctrl+C to exit");
+
+    let mut heartbeat_tracker = HeartbeatTracker::new();
+    let mut next_heartbeat = tokio::time::Instant::now() + heartbeat_tracker.send_interval();
+
+    loop {
+        tokio::select! {
+            // Ctrl+C handler
+            _ = tokio::signal::ctrl_c() => {
+                info!("Shutting down...");
+                conn.shutdown().await?;
+                return Ok(());
+            }
+
+            // Send heartbeat to keep connection alive
+            _ = tokio::time::sleep_until(next_heartbeat) => {
+                let hb = heartbeat_tracker.send_heartbeat();
+                tracing::trace!(seq = hb.seq, interval_ms = heartbeat_tracker.send_interval().as_millis(), "Sending heartbeat");
+                if let Err(e) = conn.send_control(&Message::Heartbeat(hb)).await {
+                    warn!(error = %e, "Failed to send heartbeat");
+                    if e.is_transient() {
+                        return Err(e);
                     }
                 }
-                Err(e) => {
-                    warn!(error = %e, "Control stream ended");
-                    break;
+                // Schedule next heartbeat using adaptive interval (SRTT/2)
+                next_heartbeat = tokio::time::Instant::now() + heartbeat_tracker.send_interval();
+            }
+
+            // Handle control messages (including heartbeat replies and server-initiated channels)
+            result = conn.recv_control() => {
+                match result {
+                    Ok(msg) => {
+                        trace!(?msg, "Received control message");
+                        match msg {
+                            Message::Heartbeat(hb) => {
+                                if let Some(_rtt) = heartbeat_tracker.receive_heartbeat(&hb) {
+                                    // Heartbeat RTT sample recorded
+                                }
+                            }
+                            Message::ChannelOpen(open) => {
+                                info!(?open, "Received ChannelOpen");
+                                if let Err(e) = handle_control_message(&conn, Message::ChannelOpen(open)).await {
+                                    warn!(error = %e, "Error handling ChannelOpen");
+                                }
+                            }
+                            Message::Shutdown(payload) => {
+                                info!(reason = ?payload.reason, "Server requested shutdown");
+                                return Err(qsh_core::Error::ConnectionClosed);
+                            }
+                            other => {
+                                debug!(?other, "Ignoring control message in forward-only mode");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Control stream ended");
+                        return Err(e);
+                    }
                 }
             }
         }
-    })
+    }
 }
 
 /// Handle control messages in forwarding-only mode.
@@ -137,7 +186,7 @@ async fn handle_control_message(
 }
 
 #[cfg(feature = "standalone")]
-async fn run_client_direct(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Result<()> {
+async fn run_client_standalone(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Result<()> {
     use rand::RngCore;
 
     // Determine server address for direct mode
@@ -221,16 +270,8 @@ async fn run_client_direct(cli: &Cli, host: &str, user: Option<&str>) -> qsh_cor
         // Start forwards
         let _forward_handles = start_forwards(cli, &conn).await?;
 
-        // Spawn control message handler for server-initiated channels (remote forwards)
-        let control_task = spawn_control_handler(std::sync::Arc::clone(&conn));
-
-        // Wait for Ctrl+C
-        info!("Press Ctrl+C to exit");
-        tokio::signal::ctrl_c().await.map_err(qsh_core::Error::Io)?;
-
-        info!("Shutting down...");
-        control_task.abort();
-        conn.shutdown().await?;
+        // Run forwarding-only event loop with heartbeat to keep connection alive
+        run_forwarding_only_loop(conn).await?;
         return Ok(());
     }
 
@@ -249,11 +290,12 @@ async fn run_client_direct(cli: &Cli, host: &str, user: Option<&str>) -> qsh_cor
     run_reconnectable_session(reconnectable, cli, Some(user_host)).await
 }
 
-/// Run client using the SSH-style channel model (experimental).
+/// Run client using SSH bootstrap mode.
 ///
-/// This uses `ChannelConnection` which does not open a terminal automatically.
+/// This uses SSH to bootstrap the qsh server, then connects via QUIC.
+/// Uses `ChannelConnection` which does not open a terminal automatically.
 /// Instead, we explicitly open a terminal channel after the handshake.
-async fn run_client_channel_model(
+async fn run_client_ssh_bootstrap(
     cli: &Cli,
     host: &str,
     user: Option<&str>,
@@ -357,16 +399,8 @@ async fn run_client_channel_model(
         // Start forwards
         let _forward_handles = start_forwards(cli, &conn).await?;
 
-        // Spawn control message handler for server-initiated channels (remote forwards)
-        let control_task = spawn_control_handler(std::sync::Arc::clone(&conn));
-
-        // Wait for Ctrl+C
-        info!("Press Ctrl+C to exit");
-        tokio::signal::ctrl_c().await.map_err(qsh_core::Error::Io)?;
-
-        info!("Shutting down...");
-        control_task.abort();
-        conn.shutdown().await?;
+        // Run forwarding-only event loop with heartbeat to keep connection alive
+        run_forwarding_only_loop(conn).await?;
         return Ok(());
     }
 
@@ -387,11 +421,11 @@ async fn run_client_channel_model(
 async fn run_client(cli: &Cli, host: &str, user: Option<&str>) -> qsh_core::Result<()> {
     #[cfg(feature = "standalone")]
     if cli.direct {
-        return run_client_direct(cli, host, user).await;
+        return run_client_standalone(cli, host, user).await;
     }
 
-    // Use channel model (SSH-style multiplexing)
-    run_client_channel_model(cli, host, user).await
+    // Use SSH bootstrap mode
+    run_client_ssh_bootstrap(cli, host, user).await
 }
 
 /// Render the mosh-style notification bar.
