@@ -450,6 +450,18 @@ pub struct TerminalState {
     pub current_bg: Color,
     /// Current attributes for new cells.
     pub current_attrs: CellAttrs,
+    /// Mouse reporting mode (DECSET 9/1000/1002/1003).
+    #[serde(default)]
+    pub mouse_reporting_mode: MouseReportingMode,
+    /// Mouse focus event reporting (DECSET 1004).
+    #[serde(default)]
+    pub mouse_focus_event: bool,
+    /// Mouse alternate scroll mode (DECSET 1007).
+    #[serde(default)]
+    pub mouse_alternate_scroll: bool,
+    /// Mouse encoding mode (DECSET 1005/1006/1015).
+    #[serde(default)]
+    pub mouse_encoding_mode: MouseEncodingMode,
 }
 
 impl TerminalState {
@@ -468,6 +480,10 @@ impl TerminalState {
             current_fg: Color::Default,
             current_bg: Color::Default,
             current_attrs: CellAttrs::default(),
+            mouse_reporting_mode: MouseReportingMode::default(),
+            mouse_focus_event: false,
+            mouse_alternate_scroll: false,
+            mouse_encoding_mode: MouseEncodingMode::default(),
         }
     }
 
@@ -585,6 +601,20 @@ impl TerminalState {
         output.push_str("\x1b[H"); // Move cursor to home position
         output.push_str("\x1b[0m"); // Reset all attributes
 
+        // Mouse modes (best-effort on resync)
+        if let Some(code) = self.mouse_reporting_mode.as_dec_private() {
+            let _ = write!(output, "\x1b[?{}h", code);
+        }
+        if self.mouse_focus_event {
+            output.push_str("\x1b[?1004h");
+        }
+        if self.mouse_alternate_scroll {
+            output.push_str("\x1b[?1007h");
+        }
+        if let Some(code) = self.mouse_encoding_mode.as_dec_private() {
+            let _ = write!(output, "\x1b[?{}h", code);
+        }
+
         let screen = self.screen();
         let mut last_fg = Color::Default;
         let mut last_bg = Color::Default;
@@ -688,6 +718,83 @@ impl TerminalState {
         }
 
         output.into_bytes()
+    }
+}
+
+/// Mouse reporting modes (DECSET 9/1000/1002/1003).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MouseReportingMode {
+    None,
+    /// X10 reporting (DECSET 9) - no button motion
+    X10,
+    /// X11 normal tracking (DECSET 1000)
+    NormalTracking,
+    /// Button-event tracking (DECSET 1002)
+    ButtonTracking,
+    /// Any-motion tracking (DECSET 1003)
+    AnyEventTracking,
+}
+
+impl Default for MouseReportingMode {
+    fn default() -> Self {
+        MouseReportingMode::None
+    }
+}
+
+impl MouseReportingMode {
+    pub fn from_dec_private(code: u16) -> Self {
+        match code {
+            9 => MouseReportingMode::X10,
+            1000 => MouseReportingMode::NormalTracking,
+            1002 => MouseReportingMode::ButtonTracking,
+            1003 => MouseReportingMode::AnyEventTracking,
+            _ => MouseReportingMode::None,
+        }
+    }
+
+    pub fn as_dec_private(self) -> Option<u16> {
+        match self {
+            MouseReportingMode::None => None,
+            MouseReportingMode::X10 => Some(9),
+            MouseReportingMode::NormalTracking => Some(1000),
+            MouseReportingMode::ButtonTracking => Some(1002),
+            MouseReportingMode::AnyEventTracking => Some(1003),
+        }
+    }
+}
+
+/// Mouse encoding modes (DECSET 1005/1006/1015).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MouseEncodingMode {
+    Default,
+    Utf8,  // 1005
+    Sgr,   // 1006
+    Urxvt, // 1015
+}
+
+impl Default for MouseEncodingMode {
+    fn default() -> Self {
+        MouseEncodingMode::Default
+    }
+}
+
+impl MouseEncodingMode {
+    pub fn from_dec_private(code: u16) -> Self {
+        match code {
+            1005 => MouseEncodingMode::Utf8,
+            1006 => MouseEncodingMode::Sgr,
+            1015 => MouseEncodingMode::Urxvt,
+            _ => MouseEncodingMode::Default,
+        }
+    }
+
+    pub fn as_dec_private(self) -> Option<u16> {
+        match self {
+            MouseEncodingMode::Default => None,
+            MouseEncodingMode::Utf8 => Some(1005),
+            MouseEncodingMode::Sgr => Some(1006),
+            MouseEncodingMode::Urxvt => Some(1015),
+        }
     }
 }
 

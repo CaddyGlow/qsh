@@ -2,9 +2,8 @@
 //!
 //! Manages an interactive PTY session within a channel.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -64,27 +63,6 @@ struct TerminalChannelInner {
 /// Real PTY control implementation.
 struct RealPtyControl {
     pty: Arc<Pty>,
-}
-
-fn debug_rows_enabled() -> bool {
-    static DEBUG_ROWS: OnceLock<bool> = OnceLock::new();
-    *DEBUG_ROWS.get_or_init(|| {
-        std::env::var("QSH_MOSH_DEBUG_ROWS")
-            .ok()
-            .map(|v| {
-                let v = v.trim();
-                !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
-            })
-            .unwrap_or(false)
-    })
-}
-
-fn take_debug_budget() -> bool {
-    static DEBUG_BUDGET: OnceLock<AtomicUsize> = OnceLock::new();
-    let budget = DEBUG_BUDGET.get_or_init(|| AtomicUsize::new(16));
-    budget
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| (v > 0).then_some(v - 1))
-        .is_ok()
 }
 
 impl PtyControl for RealPtyControl {
@@ -535,7 +513,6 @@ async fn mosh_relay_loop(
                     Some(data) => {
                         // Update terminal state from raw PTY output
                         inner.update_state_and_broadcast(&data).await;
-                        inner.maybe_debug_log_state("mosh_update").await;
 
                         // Accumulate raw bytes for timing (use dummy byte)
                         output_sender.push(&[0]);
@@ -754,36 +731,6 @@ impl TerminalChannelInner {
 
         // Broadcast to any local subscribers
         let _ = self.output_tx.send(data.to_vec());
-    }
-
-    async fn maybe_debug_log_state(&self, label: &str) {
-        if !debug_rows_enabled() || !take_debug_budget() {
-            return;
-        }
-
-        let state = self.parser.lock().await.state().clone();
-        let cursor = state.cursor;
-        let rows = state.rows().min(8);
-        for r in 0..rows {
-            if let Some(row) = state.screen().row(r) {
-                let preview: String = row
-                    .iter()
-                    .take(state.cols() as usize)
-                    .map(|c| {
-                        let ch = c.ch;
-                        if ch.is_control() { ' ' } else { ch }
-                    })
-                    .collect();
-                tracing::debug!(
-                    label,
-                    row = r,
-                    cursor_row = cursor.row,
-                    cursor_col = cursor.col,
-                    preview = ?preview,
-                    "server parser row"
-                );
-            }
-        }
     }
 
     /// Send state update to client (used in statediff mode).

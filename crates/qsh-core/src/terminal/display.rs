@@ -7,7 +7,7 @@ use std::fmt::Write;
 
 use terminfo::{Database, capability as cap};
 
-use super::state::{Cell, Color, TerminalState};
+use super::state::{Cell, Color, MouseEncodingMode, MouseReportingMode, TerminalState};
 
 /// Terminal capability flags sourced from terminfo.
 #[derive(Debug, Clone)]
@@ -374,11 +374,79 @@ impl Display {
             self.append_osc_clipboard(&mut frame.output, selection, content);
         }
 
-        // Render each row in full (no diff skipping to avoid off-by-one artifacts).
-        Self::debug_dump_rows(new_state);
+        // Mouse reporting mode changes
+        let last_mouse_mode = self
+            .last_state
+            .as_ref()
+            .map(|s| s.mouse_reporting_mode)
+            .unwrap_or(MouseReportingMode::None);
+        if !initialized || new_state.mouse_reporting_mode != last_mouse_mode {
+            match new_state.mouse_reporting_mode.as_dec_private() {
+                Some(code) => frame.append_str(&format!("\x1b[?{}h", code)),
+                None => {
+                    if let Some(code) = last_mouse_mode.as_dec_private() {
+                        frame.append_str(&format!("\x1b[?{}l", code));
+                    }
+                }
+            }
+        }
+
+        // Mouse focus events (1004)
+        let last_focus = self
+            .last_state
+            .as_ref()
+            .map(|s| s.mouse_focus_event)
+            .unwrap_or(false);
+        if !initialized || new_state.mouse_focus_event != last_focus {
+            frame.append_str(if new_state.mouse_focus_event {
+                "\x1b[?1004h"
+            } else {
+                "\x1b[?1004l"
+            });
+        }
+
+        // Mouse alternate scroll (1007)
+        let last_alt_scroll = self
+            .last_state
+            .as_ref()
+            .map(|s| s.mouse_alternate_scroll)
+            .unwrap_or(false);
+        if !initialized || new_state.mouse_alternate_scroll != last_alt_scroll {
+            frame.append_str(if new_state.mouse_alternate_scroll {
+                "\x1b[?1007h"
+            } else {
+                "\x1b[?1007l"
+            });
+        }
+
+        // Mouse encoding mode (1005/1006/1015)
+        let last_mouse_encoding = self
+            .last_state
+            .as_ref()
+            .map(|s| s.mouse_encoding_mode)
+            .unwrap_or(MouseEncodingMode::Default);
+        if !initialized || new_state.mouse_encoding_mode != last_mouse_encoding {
+            match new_state.mouse_encoding_mode.as_dec_private() {
+                Some(code) => frame.append_str(&format!("\x1b[?{}h", code)),
+                None => {
+                    if let Some(code) = last_mouse_encoding.as_dec_private() {
+                        frame.append_str(&format!("\x1b[?{}l", code));
+                    }
+                }
+            }
+        }
+
+        // Render rows, diffing against last frame when available.
         for row in 0..rows {
             let new_row = new_state.screen().row(row);
-            self.put_row(&mut frame, false, row, new_row, None, cols);
+            let old_row = if initialized {
+                self.last_state
+                    .as_ref()
+                    .and_then(|last| last.screen().row(row))
+            } else {
+                None
+            };
+            self.put_row(&mut frame, initialized, row, new_row, old_row, cols);
         }
 
         // Cursor position.
@@ -399,30 +467,6 @@ impl Display {
 
         self.last_state = Some(new_state.clone());
         frame.into_bytes()
-    }
-
-    /// Debug helper: dump the first few rows to tracing when enabled via env.
-    fn debug_dump_rows(state: &TerminalState) {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let enabled = *ENABLED.get_or_init(|| std::env::var("QSH_MOSH_DEBUG_ROWS").is_ok());
-        if !enabled {
-            return;
-        }
-
-        let rows = state.rows().min(4);
-        for r in 0..rows {
-            if let Some(row) = state.screen().row(r) {
-                let preview: String = row
-                    .iter()
-                    .take(state.cols() as usize)
-                    .map(|c| {
-                        let ch = c.ch;
-                        if ch.is_control() { ' ' } else { ch }
-                    })
-                    .collect();
-                tracing::debug!(row = r, preview = ?preview, "mosh debug row");
-            }
-        }
     }
 
     /// Update a single row with minimal escape sequences (mosh's put_row()).

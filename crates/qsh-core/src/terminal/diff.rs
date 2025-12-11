@@ -47,6 +47,14 @@ pub enum StateDiff {
         clipboard: Option<Option<(String, String)>>,
         /// Whether alternate screen became active/inactive.
         alternate_active: Option<bool>,
+        /// Mouse reporting mode change.
+        mouse_reporting_mode: Option<super::state::MouseReportingMode>,
+        /// Mouse focus event change.
+        mouse_focus_event: Option<bool>,
+        /// Mouse alternate scroll change.
+        mouse_alternate_scroll: Option<bool>,
+        /// Mouse encoding mode change.
+        mouse_encoding_mode: Option<super::state::MouseEncodingMode>,
     },
 
     /// Only cursor changed (common case for cursor movement).
@@ -111,6 +119,30 @@ impl TerminalState {
             None
         };
 
+        let mouse_reporting_mode = if self.mouse_reporting_mode != other.mouse_reporting_mode {
+            Some(other.mouse_reporting_mode)
+        } else {
+            None
+        };
+
+        let mouse_focus_event = if self.mouse_focus_event != other.mouse_focus_event {
+            Some(other.mouse_focus_event)
+        } else {
+            None
+        };
+
+        let mouse_alternate_scroll = if self.mouse_alternate_scroll != other.mouse_alternate_scroll {
+            Some(other.mouse_alternate_scroll)
+        } else {
+            None
+        };
+
+        let mouse_encoding_mode = if self.mouse_encoding_mode != other.mouse_encoding_mode {
+            Some(other.mouse_encoding_mode)
+        } else {
+            None
+        };
+
         StateDiff::Incremental {
             from_gen: self.generation,
             to_gen: other.generation,
@@ -120,6 +152,10 @@ impl TerminalState {
             cwd,
             clipboard,
             alternate_active,
+            mouse_reporting_mode,
+            mouse_focus_event,
+            mouse_alternate_scroll,
+            mouse_encoding_mode,
         }
     }
 
@@ -144,6 +180,10 @@ impl TerminalState {
                 cwd,
                 clipboard,
                 alternate_active,
+                mouse_reporting_mode,
+                mouse_focus_event,
+                mouse_alternate_scroll,
+                mouse_encoding_mode,
             } => {
                 // Verify we're applying to the correct base state
                 if self.generation != *from_gen {
@@ -159,6 +199,19 @@ impl TerminalState {
                 // Apply alternate screen change first (affects which screen we modify)
                 if let Some(alt) = alternate_active {
                     new_state.alternate_active = *alt;
+                }
+
+                if let Some(mode) = mouse_reporting_mode {
+                    new_state.mouse_reporting_mode = *mode;
+                }
+                if let Some(focus) = mouse_focus_event {
+                    new_state.mouse_focus_event = *focus;
+                }
+                if let Some(alt_scroll) = mouse_alternate_scroll {
+                    new_state.mouse_alternate_scroll = *alt_scroll;
+                }
+                if let Some(enc) = mouse_encoding_mode {
+                    new_state.mouse_encoding_mode = *enc;
                 }
 
                 // Apply cell changes
@@ -204,6 +257,10 @@ impl TerminalState {
             && self.title == other.title
             && self.cwd == other.cwd
             && self.clipboard == other.clipboard
+            && self.mouse_reporting_mode == other.mouse_reporting_mode
+            && self.mouse_focus_event == other.mouse_focus_event
+            && self.mouse_alternate_scroll == other.mouse_alternate_scroll
+            && self.mouse_encoding_mode == other.mouse_encoding_mode
             && self.screens_equal(other)
     }
 
@@ -386,6 +443,10 @@ mod tests {
             cwd: None,
             clipboard: None,
             alternate_active: None,
+            mouse_reporting_mode: None,
+            mouse_focus_event: None,
+            mouse_alternate_scroll: None,
+            mouse_encoding_mode: None,
         };
 
         let result = state.apply_diff(&diff).unwrap();
@@ -459,6 +520,10 @@ mod tests {
             cwd: None,
             clipboard: None,
             alternate_active: None,
+            mouse_reporting_mode: None,
+            mouse_focus_event: None,
+            mouse_alternate_scroll: None,
+            mouse_encoding_mode: None,
         };
 
         let result = state.apply_diff(&diff);

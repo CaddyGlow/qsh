@@ -10,7 +10,9 @@
 use unicode_width::UnicodeWidthChar;
 use vte::{Params, Parser, Perform};
 
-use super::state::{Cell, Color, Cursor, CursorShape, TerminalState};
+use super::state::{
+    Cell, Color, Cursor, CursorShape, MouseEncodingMode, MouseReportingMode, TerminalState,
+};
 
 /// Terminal parser that processes raw bytes and updates state.
 pub struct TerminalParser {
@@ -227,6 +229,26 @@ impl Perform for Performer<'_> {
                             if let Some(cursor) = saved_cursor.take() {
                                 state.cursor = cursor;
                             }
+                        }
+                    }
+                    // Mouse reporting modes
+                    9 | 1000 | 1002 | 1003 => {
+                        if enable {
+                            state.mouse_reporting_mode = MouseReportingMode::from_dec_private(param0);
+                        } else {
+                            state.mouse_reporting_mode = MouseReportingMode::None;
+                        }
+                    }
+                    // Mouse focus event
+                    1004 => state.mouse_focus_event = enable,
+                    // Mouse alternate scroll
+                    1007 => state.mouse_alternate_scroll = enable,
+                    // Mouse encoding modes
+                    1005 | 1006 | 1015 => {
+                        if enable {
+                            state.mouse_encoding_mode = MouseEncodingMode::from_dec_private(param0);
+                        } else {
+                            state.mouse_encoding_mode = MouseEncodingMode::Default;
                         }
                     }
                     _ => {}
@@ -748,6 +770,47 @@ mod tests {
 
         parser.process(b"\x1b[?25h");
         assert!(parser.state().cursor.visible);
+    }
+
+    #[test]
+    fn mouse_modes_toggle() {
+        let mut parser = TerminalParser::new(80, 24);
+
+        parser.process(b"\x1b[?1000h");
+        assert_eq!(
+            parser.state().mouse_reporting_mode,
+            MouseReportingMode::NormalTracking
+        );
+
+        parser.process(b"\x1b[?1002h");
+        assert_eq!(
+            parser.state().mouse_reporting_mode,
+            MouseReportingMode::ButtonTracking
+        );
+
+        parser.process(b"\x1b[?1006h");
+        assert_eq!(
+            parser.state().mouse_encoding_mode,
+            MouseEncodingMode::Sgr
+        );
+
+        parser.process(b"\x1b[?1004h");
+        assert!(parser.state().mouse_focus_event);
+
+        parser.process(b"\x1b[?1004l");
+        assert!(!parser.state().mouse_focus_event);
+
+        parser.process(b"\x1b[?1000l");
+        assert_eq!(
+            parser.state().mouse_reporting_mode,
+            MouseReportingMode::None
+        );
+
+        parser.process(b"\x1b[?1006l");
+        assert_eq!(
+            parser.state().mouse_encoding_mode,
+            MouseEncodingMode::Default
+        );
     }
 
     #[test]
