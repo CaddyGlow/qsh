@@ -214,12 +214,6 @@ impl StdinReader {
                     return None;
                 }
                 Ok(Ok(n)) => {
-                    tracing::debug!(
-                        len = n,
-                        data = ?&buf[..n.min(16)],
-                        fd = self.fd,
-                        "stdin read"
-                    );
                     return Some(buf[..n].to_vec());
                 }
                 Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => {

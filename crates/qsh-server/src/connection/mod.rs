@@ -150,8 +150,39 @@ impl ConnectionHandler {
     }
 
     /// Signal connection shutdown.
+    ///
+    /// Sends a shutdown message to the client before closing all channels.
     pub async fn shutdown(&self) {
-        use qsh_core::protocol::ChannelCloseReason;
+        self.shutdown_with_reason(
+            qsh_core::protocol::ShutdownReason::ServerShutdown,
+            Some("Server shutting down".to_string()),
+        )
+        .await;
+    }
+
+    /// Signal connection shutdown with a specific reason.
+    ///
+    /// Sends a shutdown message to the client before closing all channels.
+    pub async fn shutdown_with_reason(
+        &self,
+        reason: qsh_core::protocol::ShutdownReason,
+        message: Option<String>,
+    ) {
+        use qsh_core::protocol::{ChannelCloseReason, Message, ShutdownPayload};
+        use tracing::{info, warn};
+
+        info!(session_id = ?self.session_id, ?reason, "Sending shutdown to client");
+
+        // Send shutdown notification to the client
+        let shutdown_msg = Message::Shutdown(ShutdownPayload { reason, message });
+        match self.send_control(&shutdown_msg).await {
+            Ok(()) => {
+                info!(session_id = ?self.session_id, "Shutdown message sent to client");
+            }
+            Err(e) => {
+                warn!(session_id = ?self.session_id, error = %e, "Failed to send shutdown message to client");
+            }
+        }
 
         let _ = self
             .shutdown_tx

@@ -6,29 +6,31 @@
 
 use std::process::Command;
 
-#[allow(dead_code)]
-use std::process::Stdio;
-#[allow(dead_code)]
-use std::time::Duration;
-
 /// Get the path to the qsh binary.
 fn qsh_binary() -> String {
     // CARGO_MANIFEST_DIR points to crates/qsh-client
-    // Binaries are in {workspace}/target/debug/
+    // Binaries are in {workspace}/target/{target}/debug/ or {workspace}/target/debug/
     let manifest = env!("CARGO_MANIFEST_DIR");
     let workspace = std::path::Path::new(manifest)
         .parent()
         .and_then(|p| p.parent())
         .expect("Could not find workspace root");
 
-    let debug_path = workspace.join("target/debug/qsh");
-    if debug_path.exists() {
-        return debug_path.to_string_lossy().to_string();
-    }
+    // Check target-specific paths first (e.g., musl builds)
+    let targets = ["x86_64-unknown-linux-musl", "x86_64-unknown-linux-gnu", ""];
+    let profiles = ["debug", "release"];
 
-    let release_path = workspace.join("target/release/qsh");
-    if release_path.exists() {
-        return release_path.to_string_lossy().to_string();
+    for target in &targets {
+        for profile in &profiles {
+            let path = if target.is_empty() {
+                workspace.join("target").join(profile).join("qsh")
+            } else {
+                workspace.join("target").join(target).join(profile).join("qsh")
+            };
+            if path.exists() {
+                return path.to_string_lossy().to_string();
+            }
+        }
     }
 
     // Fall back to PATH
@@ -43,14 +45,21 @@ fn qsh_server_binary() -> String {
         .and_then(|p| p.parent())
         .expect("Could not find workspace root");
 
-    let debug_path = workspace.join("target/debug/qsh-server");
-    if debug_path.exists() {
-        return debug_path.to_string_lossy().to_string();
-    }
+    // Check target-specific paths first (e.g., musl builds)
+    let targets = ["x86_64-unknown-linux-musl", "x86_64-unknown-linux-gnu", ""];
+    let profiles = ["debug", "release"];
 
-    let release_path = workspace.join("target/release/qsh-server");
-    if release_path.exists() {
-        return release_path.to_string_lossy().to_string();
+    for target in &targets {
+        for profile in &profiles {
+            let path = if target.is_empty() {
+                workspace.join("target").join(profile).join("qsh-server")
+            } else {
+                workspace.join("target").join(target).join(profile).join("qsh-server")
+            };
+            if path.exists() {
+                return path.to_string_lossy().to_string();
+            }
+        }
     }
 
     // Fall back to PATH

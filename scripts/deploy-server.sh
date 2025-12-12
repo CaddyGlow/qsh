@@ -69,6 +69,23 @@ copy_bin() {
   pv "$src" | ssh -C "$SSH_USER@$HOST" "sudo tee $dst >/dev/null && sudo chmod +x $dst"
 }
 
+# Graceful stop: SIGTERM with timeout, then SIGKILL
+graceful_stop() {
+  local proc="$1" timeout="${2:-10}"
+  ssh "$SSH_USER@$HOST" "
+    if pgrep -x '$proc' >/dev/null 2>&1; then
+      echo 'Stopping $proc (SIGTERM)...'
+      sudo pkill -TERM -x '$proc' || true
+      for i in \$(seq 1 $timeout); do
+        pgrep -x '$proc' >/dev/null 2>&1 || { echo '$proc stopped'; exit 0; }
+        sleep 1
+      done
+      echo '$proc did not stop, sending SIGKILL...'
+      sudo pkill -KILL -x '$proc' || true
+    fi
+  "
+}
+
 server_path="target/$TARGET/$profile_dir/qsh-server"
 client_path="target/$TARGET/$profile_dir/qsh"
 
@@ -78,11 +95,9 @@ echo "Building binaries..."
 build
 
 echo "Stopping old binaries on $HOST..."
-ssh "$SSH_USER@$HOST" "\
-  sudo pkill -9 qsh-server || true; \
-  sudo pkill -9 qsh || true; \
-  sudo rm -f /tmp/qsh-server.log /usr/local/bin/qsh-server /usr/local/bin/qsh \
-"
+graceful_stop qsh-server 10
+graceful_stop qsh 10
+ssh "$SSH_USER@$HOST" "sudo rm -f /tmp/qsh-server.log /usr/local/bin/qsh-server /usr/local/bin/qsh"
 
 if [[ "$SKIP_SERVER" != "1" ]]; then
   echo "Deploying qsh-server..."

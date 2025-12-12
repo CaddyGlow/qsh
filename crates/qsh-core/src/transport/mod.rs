@@ -105,6 +105,11 @@ pub struct ConnectConfig {
     pub max_idle_timeout: Duration,
     /// Timeout for the initial connection handshake.
     pub connect_timeout: Duration,
+    /// QUIC keep-alive interval (None disables).
+    ///
+    /// When enabled, the transport will send occasional ack-eliciting frames
+    /// during idle periods to keep NAT mappings alive and avoid idle timeouts.
+    pub keep_alive_interval: Option<Duration>,
     /// Expected certificate hash for pinning (None = no pinning, skip verification).
     pub cert_hash: Option<Vec<u8>>,
     /// Cached session data for 0-RTT resumption.
@@ -124,6 +129,7 @@ impl Default for ConnectConfig {
             local_port: None,
             max_idle_timeout: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(10),
+            keep_alive_interval: None,
             cert_hash: None,
             session_data: None,
             // Default to Client (normal mode: QUIC client = logical client)
@@ -153,6 +159,8 @@ pub struct ListenerConfig {
     pub key_pem: Vec<u8>,
     /// Maximum idle timeout for connections.
     pub idle_timeout: Duration,
+    /// QUIC keep-alive interval for accepted connections (None disables).
+    pub keep_alive_interval: Option<Duration>,
     /// Optional session ticket key for 0-RTT (None = auto-generated).
     pub ticket_key: Option<Vec<u8>>,
     /// Logical role for stream direction mapping.

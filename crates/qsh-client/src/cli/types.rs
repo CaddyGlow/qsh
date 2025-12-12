@@ -591,7 +591,7 @@ pub struct Cli {
     /// QUIC keep-alive interval in milliseconds (0 disables).
     #[arg(
         long = "keep-alive",
-        default_value = "500",
+        default_value = "5000",
         value_name = "MILLISECONDS"
     )]
     pub keep_alive_ms: u64,

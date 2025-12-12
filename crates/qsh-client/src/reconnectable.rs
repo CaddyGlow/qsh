@@ -18,15 +18,37 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use rand::Rng;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 use tracing::{debug, error, info, warn};
 
 use qsh_core::error::{Error, Result};
 use qsh_core::protocol::SessionId;
 use qsh_core::session::ReconnectionHandler;
+use qsh_core::transport::QuicAcceptor;
 
 use crate::connection::ChannelConnection;
 use crate::session::{ConnectionState, SessionContext};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconnectStrategy {
+    /// Initiate an outbound reconnection to the peer.
+    DialPeer,
+    /// Wait for the peer to connect back (bootstrap/reverse responder mode).
+    AwaitInbound,
+}
+
+fn choose_reconnect_strategy(context: &SessionContext, acceptor_present: bool) -> Option<ReconnectStrategy> {
+    match context.config.connect_mode {
+        qsh_core::ConnectMode::Initiate => Some(ReconnectStrategy::DialPeer),
+        qsh_core::ConnectMode::Respond => {
+            if acceptor_present {
+                Some(ReconnectStrategy::AwaitInbound)
+            } else {
+                None
+            }
+        }
+    }
+}
 
 /// Mosh-style port hopping constants.
 /// Mosh hops every 10s without response; we hop after this many failed attempts.
@@ -55,6 +77,11 @@ pub struct ReconnectableConnection {
     session_data: RwLock<Option<Vec<u8>>>,
     /// Last known RTT before disconnect (for Mosh-style retry delay).
     last_rtt: RwLock<Option<Duration>>,
+    /// Optional acceptor for responder-mode reconnection (bootstrap/reverse mode).
+    ///
+    /// When present and connect_mode is Respond, reconnection waits for the peer
+    /// (server) to connect back instead of initiating an outbound connection.
+    acceptor: Option<Mutex<QuicAcceptor>>,
 }
 
 // Helper to read from std RwLock without panicking on poison
@@ -72,6 +99,15 @@ impl ReconnectableConnection {
         Self::from_arc(Arc::new(conn), context)
     }
 
+    /// Create a new reconnectable connection with a QUIC acceptor for responder-mode reconnects.
+    pub fn new_with_acceptor(
+        conn: ChannelConnection,
+        context: SessionContext,
+        acceptor: QuicAcceptor,
+    ) -> Self {
+        Self::from_arc_with_acceptor(Arc::new(conn), context, acceptor)
+    }
+
     /// Create a new reconnectable connection from an Arc'd connection.
     ///
     /// Use this when you already have an Arc<ChannelConnection>, e.g., when
@@ -85,6 +121,25 @@ impl ReconnectableConnection {
             reconnect_handler: RwLock::new(ReconnectionHandler::new()),
             session_data: RwLock::new(None),
             last_rtt: RwLock::new(None),
+            acceptor: None,
+        }
+    }
+
+    /// Create a new reconnectable connection from an Arc'd connection with acceptor support.
+    pub fn from_arc_with_acceptor(
+        conn: Arc<ChannelConnection>,
+        context: SessionContext,
+        acceptor: QuicAcceptor,
+    ) -> Self {
+        Self {
+            inner: RwLock::new(Some(conn)),
+            context: RwLock::new(context),
+            state: RwLock::new(ConnectionState::Connected),
+            state_changed: Notify::new(),
+            reconnect_handler: RwLock::new(ReconnectionHandler::new()),
+            session_data: RwLock::new(None),
+            last_rtt: RwLock::new(None),
+            acceptor: Some(Mutex::new(acceptor)),
         }
     }
 
@@ -229,6 +284,118 @@ impl ReconnectableConnection {
         let mut current_local_port: Option<u16> = None;
 
         loop {
+            let strategy = {
+                let context = read_lock(&self.context);
+                choose_reconnect_strategy(&context, self.acceptor.is_some())
+            };
+
+            if strategy.is_none() {
+                error!(
+                    "Responder-mode reconnection requested without an acceptor; cannot wait for inbound reconnect"
+                );
+                let mut state = write_lock(&self.state);
+                *state = ConnectionState::Disconnected;
+                self.state_changed.notify_waiters();
+                return;
+            }
+
+            if matches!(strategy, Some(ReconnectStrategy::AwaitInbound)) {
+                let acceptor = self.acceptor.as_ref().expect("checked above");
+
+                // Wait indefinitely for the server to reconnect.
+                let (quic_conn, peer_addr) = {
+                    info!("Waiting for server to reconnect (responder mode)");
+                    let mut guard = acceptor.lock().await;
+                    match guard.accept().await {
+                        Ok(v) => v,
+                        Err(e) if e.is_fatal() => {
+                            error!(error = %e, "Accept failed with fatal error");
+                            let mut state = write_lock(&self.state);
+                            *state = ConnectionState::Disconnected;
+                            self.state_changed.notify_waiters();
+                            return;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Accept failed, retrying");
+                            // Avoid tight-looping on persistent accept errors.
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    }
+                };
+
+                let (mut config, session_id) = {
+                    let context = read_lock(&self.context);
+                    (context.reconnect_config(), context.session_id())
+                };
+
+                // Peer may have changed address; update for logging/context.
+                config.server_addr = peer_addr;
+
+                let result = if let Some(sid) = session_id {
+                    ChannelConnection::resume_from_quic(quic_conn, config, sid).await
+                } else {
+                    warn!("No session ID for reconnection, trying fresh accept-handshake");
+                    ChannelConnection::from_quic(quic_conn, config).await
+                };
+
+                match result {
+                    Ok(conn) => {
+                        info!(peer = %peer_addr, session_id = ?conn.session_id(), "Reconnected (responder mode)");
+
+                        // Update context with new session ID and peer address.
+                        {
+                            let mut context = write_lock(&self.context);
+                            context.set_session_id(conn.session_id());
+                            context.server_addr = peer_addr;
+                            context.config.server_addr = peer_addr;
+                        }
+
+                        // Store new connection
+                        let conn = Arc::new(conn);
+                        {
+                            let mut inner = write_lock(&self.inner);
+                            *inner = Some(Arc::clone(&conn));
+                        }
+
+                        // Update session data for next reconnection (do this after storing connection)
+                        if let Some(data) = conn.quic().session_data().await {
+                            debug!(
+                                session_data_len = data.len(),
+                                "Updating session data for 0-RTT"
+                            );
+                            *write_lock(&self.session_data) = Some(data);
+                        }
+
+                        // Reset handler for next disconnect
+                        {
+                            let mut handler = write_lock(&self.reconnect_handler);
+                            handler.reset();
+                        }
+
+                        // Update state to connected
+                        {
+                            let mut state = write_lock(&self.state);
+                            *state = ConnectionState::Connected;
+                        }
+
+                        self.state_changed.notify_waiters();
+                        return;
+                    }
+                    Err(e) if e.is_fatal() => {
+                        error!(error = %e, "Reconnection failed with fatal error (responder mode)");
+                        let mut state = write_lock(&self.state);
+                        *state = ConnectionState::Disconnected;
+                        self.state_changed.notify_waiters();
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Handshake failed after accept, waiting for next reconnect");
+                        continue;
+                    }
+                }
+            }
+
             // Check if we should retry
             let should_retry = {
                 let handler = read_lock(&self.reconnect_handler);
@@ -412,5 +579,18 @@ mod tests {
         let _connected = ConnectionState::Connected;
         let _reconnecting = ConnectionState::Reconnecting;
         let _disconnected = ConnectionState::Disconnected;
+    }
+
+    #[test]
+    fn choose_strategy_responder_requires_acceptor() {
+        let mut config = crate::ConnectionConfig::default();
+        config.connect_mode = qsh_core::ConnectMode::Respond;
+        let ctx = SessionContext::new(config, qsh_core::protocol::SessionId::from_bytes([1u8; 16]));
+
+        assert_eq!(choose_reconnect_strategy(&ctx, false), None);
+        assert_eq!(
+            choose_reconnect_strategy(&ctx, true),
+            Some(ReconnectStrategy::AwaitInbound)
+        );
     }
 }

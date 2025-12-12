@@ -8,7 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::{Buf, BytesMut};
 use tokio::sync::{Mutex, RwLock};
@@ -25,12 +25,6 @@ use crate::transport::{Connection, StreamDirectionMapper, StreamPair, StreamType
 // =============================================================================
 // QuicheConnectionInner - Internal connection state
 // =============================================================================
-
-/// Mosh-style keepalive constants.
-/// Like Mosh's SRTT/2 approach: adaptive to network conditions.
-const KEEPALIVE_MIN_INTERVAL: Duration = Duration::from_millis(50); // Mosh MIN_RTO
-const KEEPALIVE_MAX_INTERVAL: Duration = Duration::from_millis(500); // Max keepalive rate
-const KEEPALIVE_DEFAULT_INTERVAL: Duration = Duration::from_millis(500); // When RTT unknown
 
 /// Internal state for a quiche connection.
 pub struct QuicheConnectionInner {
@@ -60,8 +54,10 @@ pub struct QuicheConnectionInner {
     readable_notify: tokio::sync::Notify,
     /// Notifier for writable streams.
     writable_notify: tokio::sync::Notify,
-    /// Last time we sent a keepalive ping.
-    last_keepalive: std::sync::Mutex<std::time::Instant>,
+    /// QUIC keep-alive interval (None disables).
+    keep_alive_interval: Option<Duration>,
+    /// Last time we sent any packet.
+    last_tx: std::sync::Mutex<Instant>,
 }
 
 impl QuicheConnectionInner {
@@ -82,6 +78,7 @@ impl QuicheConnectionInner {
         local_addr: SocketAddr,
         logical_role: crate::transport::config::EndpointRole,
         quic_role: crate::transport::config::EndpointRole,
+        keep_alive_interval: Option<Duration>,
     ) -> Self {
         use crate::transport::config::EndpointRole;
 
@@ -118,7 +115,8 @@ impl QuicheConnectionInner {
             closed: AtomicBool::new(false),
             readable_notify: tokio::sync::Notify::new(),
             writable_notify: tokio::sync::Notify::new(),
-            last_keepalive: std::sync::Mutex::new(std::time::Instant::now()),
+            keep_alive_interval,
+            last_tx: std::sync::Mutex::new(Instant::now()),
         }
     }
 
@@ -234,6 +232,10 @@ impl QuicheConnectionInner {
                 .send_to(&out[..write], send_info.to)
                 .await
                 .map_err(|e| classify_io_error(e))?;
+
+            // Any successfully sent packet counts as activity for keepalive purposes.
+            let mut last_tx = self.last_tx.lock().unwrap();
+            *last_tx = Instant::now();
         }
 
         Ok(())
@@ -241,11 +243,9 @@ impl QuicheConnectionInner {
 
     /// Drive I/O - receive packets and process them.
     ///
-    /// This implements mosh-style keepalive detection:
-    /// - Send periodic PING frames to keep the connection alive
+    /// This implements optional idle keepalives:
+    /// - Send periodic ack-eliciting frames during idle to keep the connection alive
     /// - If the peer stops responding, quiche's timeout mechanism detects it
-    /// - The connection stays alive during normal user idle periods
-    /// - Keepalive interval adapts to RTT (like Mosh's SRTT/2 approach)
     pub async fn drive_io(&self) -> Result<()> {
         // Check our closed flag first (set by close_connection())
         if self.closed.load(Ordering::SeqCst) {
@@ -255,39 +255,22 @@ impl QuicheConnectionInner {
 
         let mut buf = [0u8; 65535];
 
-        // Compute RTT-adaptive keepalive interval (Mosh-style: RTT/2)
-        let keepalive_interval = {
-            let conn = self.conn.lock().await;
-            // Prefer the active path's RTT if available.
-            let rtt = conn
-                .path_stats()
-                .find(|p| p.active)
-                .map(|p| p.rtt)
-                .or_else(|| conn.path_stats().next().map(|p| p.rtt));
-            match rtt {
-                Some(rtt) => {
-                    // Mosh-style: RTT/2, clamped to [50ms, 500ms]
-                    let interval = rtt / 2;
-                    interval.clamp(KEEPALIVE_MIN_INTERVAL, KEEPALIVE_MAX_INTERVAL)
-                }
-                None => KEEPALIVE_DEFAULT_INTERVAL,
+        // Check if we need to send a keepalive ping.
+        //
+        // Unlike Mosh's "send at RTT/2" transport cadence, QUIC already provides RTT
+        // measurements and pacing. Here we only keep idle connections alive.
+        if let Some(keepalive_interval) = self.keep_alive_interval {
+            let should_send_keepalive = {
+                let now = Instant::now();
+                let last_tx = self.last_tx.lock().unwrap();
+                now.duration_since(*last_tx) >= keepalive_interval
+            };
+
+            if should_send_keepalive {
+                let mut conn = self.conn.lock().await;
+                // Send a PING frame to keep the connection alive and detect peer liveness.
+                conn.send_ack_eliciting().ok();
             }
-        };
-
-        // Check if we need to send a keepalive ping (mosh-style heartbeat)
-        let should_send_keepalive = {
-            let now = std::time::Instant::now();
-            let last_keepalive = self.last_keepalive.lock().unwrap();
-            now.duration_since(*last_keepalive) >= keepalive_interval
-        };
-
-        if should_send_keepalive {
-            let mut conn = self.conn.lock().await;
-            // Send a PING frame to keep the connection alive and detect peer liveness
-            conn.send_ack_eliciting().ok();
-            // Update timestamp after sending
-            let mut last_keepalive = self.last_keepalive.lock().unwrap();
-            *last_keepalive = std::time::Instant::now();
         }
 
         // Determine quiche's requested timeout (if any).
@@ -617,6 +600,7 @@ impl QuicheConnection {
         local_addr: SocketAddr,
         logical_role: crate::transport::config::EndpointRole,
         quic_role: crate::transport::config::EndpointRole,
+        keep_alive_interval: Option<Duration>,
     ) -> Self {
         let inner = Arc::new(QuicheConnectionInner::new(
             conn,
@@ -625,6 +609,7 @@ impl QuicheConnection {
             local_addr,
             logical_role,
             quic_role,
+            keep_alive_interval,
         ));
 
         // Spawn I/O driver task

@@ -314,13 +314,6 @@ impl TerminalChannel {
             return Err(Error::ConnectionClosed);
         }
 
-        info!(
-            channel_id = %self.inner.channel_id,
-            seq = input.sequence,
-            len = input.data.len(),
-            "Received terminal input"
-        );
-
         self.inner
             .confirmed_input_seq
             .store(input.sequence, Ordering::SeqCst);
@@ -441,19 +434,39 @@ impl TerminalChannel {
     }
 }
 
-/// Direct relay loop: send raw PTY output immediately (no batching).
+/// Direct relay loop: send raw PTY output with 1ms window batching.
+///
+/// Batches PTY output within 1ms windows to reduce packet count while
+/// maintaining low latency. Data is sent when either:
+/// - 1ms has elapsed since first buffered byte, or
+/// - Buffer reaches 16KB
 async fn direct_relay_loop(
     inner: Arc<TerminalChannelInner>,
     mut output_rx: mpsc::Receiver<Vec<u8>>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
-    debug!(channel_id = %inner.channel_id, "Terminal relay: DIRECT mode (no batching)");
+    use std::time::Duration;
+    use tokio::time::{interval, Instant, MissedTickBehavior};
+
+    debug!(channel_id = %inner.channel_id, "Terminal relay: DIRECT mode (1ms batched)");
+
+    let mut buffer = Vec::with_capacity(8192);
+    let mut batch_start: Option<Instant> = None;
+    let batch_window = Duration::from_millis(1);
+
+    // 1ms tick interval for flush checks
+    let mut tick = interval(batch_window);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
             biased;
 
             _ = shutdown_rx.recv() => {
+                // Flush any remaining data before shutdown
+                if !buffer.is_empty() {
+                    let _ = inner.send_output_to_client(std::mem::take(&mut buffer)).await;
+                }
                 debug!(channel_id = %inner.channel_id, "Terminal relay shutdown");
                 break;
             }
@@ -461,21 +474,36 @@ async fn direct_relay_loop(
             output = output_rx.recv() => {
                 match output {
                     Some(data) => {
-                        // Update terminal state immediately (for accurate tracking)
-                        // This also broadcasts to local subscribers
-                        inner.update_state_and_broadcast(&data).await;
+                        if batch_start.is_none() {
+                            batch_start = Some(Instant::now());
+                        }
+                        buffer.extend_from_slice(&data);
 
-                        // Send immediately without batching
-                        trace!(
-                            channel_id = %inner.channel_id,
-                            len = data.len(),
-                            "Sending output immediately (no batching)"
-                        );
-                        let _ = inner.send_output_to_client(data).await;
+                        // Flush immediately if buffer is large enough
+                        if buffer.len() >= 16384 {
+                            let _ = inner.send_output_to_client(std::mem::take(&mut buffer)).await;
+                            batch_start = None;
+                        }
                     }
                     None => {
-                        info!(channel_id = %inner.channel_id, "PTY output_rx returned None - PTY exited, breaking relay loop");
+                        // Flush remaining before exit
+                        if !buffer.is_empty() {
+                            let _ = inner.send_output_to_client(std::mem::take(&mut buffer)).await;
+                        }
+                        info!(channel_id = %inner.channel_id, "PTY output_rx returned None - PTY exited");
                         break;
+                    }
+                }
+            }
+
+            _ = tick.tick() => {
+                // Flush if we have data and batch window elapsed
+                if !buffer.is_empty() {
+                    if let Some(start) = batch_start {
+                        if start.elapsed() >= batch_window {
+                            let _ = inner.send_output_to_client(std::mem::take(&mut buffer)).await;
+                            batch_start = None;
+                        }
                     }
                 }
             }
@@ -794,11 +822,11 @@ impl TerminalChannelInner {
             let confirmed_seq = self.confirmed_input_seq.load(Ordering::SeqCst);
             let channel_id = self.channel_id;
 
-            // Send raw output (batched)
+            // Send raw output
             let output = Message::ChannelDataMsg(ChannelData {
                 channel_id,
                 payload: ChannelPayload::TerminalOutput(TerminalOutputData {
-                    data: data.clone(),
+                    data, // Move data, no clone needed
                     confirmed_input_seq: confirmed_seq,
                 }),
             });

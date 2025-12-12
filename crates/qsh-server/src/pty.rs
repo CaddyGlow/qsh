@@ -410,12 +410,10 @@ impl PtyRelay {
         let pty_input = pty.clone();
         tokio::spawn(async move {
             while let Some(data) = input_rx.recv().await {
-                debug!(len = data.len(), data = ?&data[..data.len().min(32)], "PTY input received from channel");
                 if let Err(e) = pty_input.write(&data).await {
                     error!(error = %e, "Failed to write to PTY");
                     break;
                 }
-                debug!(len = data.len(), "PTY input written successfully");
             }
             debug!("PTY input task ended");
         });
@@ -428,7 +426,6 @@ impl PtyRelay {
             loop {
                 match pty_output.read(&mut buf).await {
                     Ok(Some(n)) => {
-                        trace!(len = n, data = ?&buf[..n.min(32)], "PTY output read");
                         if output_tx.send(buf[..n].to_vec()).await.is_err() {
                             warn!("Output channel closed");
                             break;

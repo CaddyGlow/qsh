@@ -222,6 +222,8 @@ pub struct Terminal {
     session_dir: Mutex<Option<PathBuf>>,
     /// Whether a client is currently attached (sync-safe flag for describe()).
     attached: Arc<AtomicBool>,
+    /// Whether the channel has closed (set by I/O relay when shell exits).
+    channel_closed: Arc<AtomicBool>,
 }
 
 
@@ -246,6 +248,7 @@ impl Terminal {
             io_client_task: Mutex::new(None),
             session_dir: Mutex::new(None),
             attached: Arc::new(AtomicBool::new(false)),
+            channel_closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -380,37 +383,70 @@ impl Terminal {
 
         let id = self.id.clone();
         let attached = self.attached.clone();
+        let channel_closed = self.channel_closed.clone();
+        let socket_path_for_task = socket_path.clone();
 
         // Spawn the listener task
         let listener_task = tokio::spawn(async move {
+            let mut close_check = tokio::time::interval(std::time::Duration::from_millis(250));
+            close_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
             loop {
-                match listener.accept().await {
-                    Ok((stream, _addr)) => {
-                        info!(terminal_id = %id, "Client connected to I/O socket");
-                        attached.store(true, Ordering::Relaxed);
-
-                        // Handle this client (blocking until disconnected)
-                        // Only one client at a time for MVP
-                        Self::handle_io_client(
-                            id.clone(),
-                            stream,
-                            channel.clone(),
-                            connection.clone(),
-                        )
-                        .await;
-
-                        attached.store(false, Ordering::Relaxed);
-                        info!(terminal_id = %id, "Client disconnected from I/O socket");
-                    }
-                    Err(e) => {
-                        if e.kind() == std::io::ErrorKind::Other {
-                            // Listener closed, exit gracefully
+                tokio::select! {
+                    _ = close_check.tick() => {
+                        if channel.is_closed() {
+                            info!(terminal_id = %id, "Terminal channel closed (shell exited), stopping I/O listener");
+                            channel_closed.store(true, Ordering::SeqCst);
                             break;
                         }
-                        warn!(terminal_id = %id, error = %e, "Error accepting I/O connection");
+                    }
+                    accept_res = listener.accept() => {
+                        match accept_res {
+                            Ok((stream, _addr)) => {
+                                if channel.is_closed() {
+                                    info!(terminal_id = %id, "Refusing I/O connection: terminal already closed");
+                                    channel_closed.store(true, Ordering::SeqCst);
+                                    break;
+                                }
+
+                                info!(terminal_id = %id, "Client connected to I/O socket");
+                                attached.store(true, Ordering::Relaxed);
+
+                                // Handle this client (blocking until disconnected)
+                                // Only one client at a time for MVP
+                                let closed = Self::handle_io_client(
+                                    id.clone(),
+                                    stream,
+                                    channel.clone(),
+                                    connection.clone(),
+                                )
+                                .await;
+
+                                attached.store(false, Ordering::Relaxed);
+
+                                if closed {
+                                    // Shell exited - set flag and stop accepting
+                                    info!(terminal_id = %id, "Shell exited, terminal closed");
+                                    channel_closed.store(true, Ordering::SeqCst);
+                                    break;
+                                }
+
+                                info!(terminal_id = %id, "Client disconnected from I/O socket");
+                            }
+                            Err(e) => {
+                                if e.kind() == std::io::ErrorKind::Other {
+                                    // Listener closed, exit gracefully
+                                    break;
+                                }
+                                warn!(terminal_id = %id, error = %e, "Error accepting I/O connection");
+                            }
+                        }
                     }
                 }
             }
+
+            // Best-effort cleanup of the socket file on exit (e.g., shell exited).
+            let _ = tokio::fs::remove_file(&socket_path_for_task).await;
             debug!(terminal_id = %id, "I/O listener task stopped");
         });
 
@@ -423,85 +459,87 @@ impl Terminal {
     ///
     /// Bridges raw bytes between the Unix socket and the TerminalChannel.
     /// Parses CSI 8 sequences (xterm window resize) and triggers PTY resize.
-    /// Returns when the client disconnects or an error occurs.
+    /// Returns true if the channel closed (shell exited), false if client just disconnected.
     async fn handle_io_client(
         id: String,
         stream: tokio::net::UnixStream,
         channel: TerminalChannel,
         connection: Arc<ChannelConnection>,
-    ) {
+    ) -> bool {
         let (mut reader, mut writer) = stream.into_split();
 
-        // Spawn output forwarding task (PTY -> client)
-        let channel_out = channel.clone();
-        let id_out = id.clone();
-        let output_task = tokio::spawn(async move {
-            loop {
-                match channel_out.recv_output().await {
-                    Ok(output) => {
-                        if let Err(e) = writer.write_all(&output.data).await {
-                            debug!(terminal_id = %id_out, error = %e, "Error writing to I/O client");
-                            break;
-                        }
-                        // Flush immediately for low latency
-                        if let Err(e) = writer.flush().await {
-                            debug!(terminal_id = %id_out, error = %e, "Error flushing to I/O client");
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        debug!(terminal_id = %id_out, error = %e, "Error receiving from PTY");
-                        break;
-                    }
-                }
-            }
-        });
-
-        // Handle input in the current task (client -> PTY)
-        // We need to parse CSI 8 sequences for resize
+        // Relay input and output in a single task so we can promptly detect when the
+        // terminal channel closes even while a client is attached.
         let mut buf = [0u8; 4096];
         let mut parser = Csi8Parser::new();
         let channel_id = channel.channel_id();
 
+        let mut channel_closed = false;
+
         loop {
-            match reader.read(&mut buf).await {
-                Ok(0) => {
-                    // Client disconnected
-                    debug!(terminal_id = %id, "I/O client EOF");
-                    break;
-                }
-                Ok(n) => {
-                    // Parse for CSI 8 resize sequences
-                    let (filtered, resizes) = parser.parse(&buf[..n]);
-
-                    // Handle any resize commands
-                    for (rows, cols) in resizes {
-                        debug!(terminal_id = %id, cols, rows, "CSI 8 resize detected");
-                        if let Err(e) = connection
-                            .send_resize(channel_id, cols as u16, rows as u16)
-                            .await
-                        {
-                            warn!(terminal_id = %id, error = %e, "Failed to send resize");
+            tokio::select! {
+                read_res = reader.read(&mut buf) => {
+                    match read_res {
+                        Ok(0) => {
+                            // Client disconnected
+                            debug!(terminal_id = %id, "I/O client EOF");
+                            break;
                         }
-                    }
+                        Ok(n) => {
+                            // Parse for CSI 8 resize sequences
+                            let (filtered, resizes) = parser.parse(&buf[..n]);
 
-                    // Send filtered input to PTY (with CSI 8 sequences removed)
-                    if !filtered.is_empty() {
-                        if let Err(e) = channel.queue_input(&filtered, false) {
-                            debug!(terminal_id = %id, error = %e, "Error sending input to PTY");
+                            // Handle any resize commands
+                            for (rows, cols) in resizes {
+                                debug!(terminal_id = %id, cols, rows, "CSI 8 resize detected");
+                                if let Err(e) = connection
+                                    .send_resize(channel_id, cols as u16, rows as u16)
+                                    .await
+                                {
+                                    warn!(terminal_id = %id, error = %e, "Failed to send resize");
+                                }
+                            }
+
+                            // Send filtered input to PTY (with CSI 8 sequences removed)
+                            if !filtered.is_empty() {
+                                if let Err(e) = channel.queue_input(&filtered, false) {
+                                    debug!(terminal_id = %id, error = %e, "Error sending input to PTY");
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug!(terminal_id = %id, error = %e, "Error reading from I/O client");
                             break;
                         }
                     }
                 }
-                Err(e) => {
-                    debug!(terminal_id = %id, error = %e, "Error reading from I/O client");
-                    break;
+                out_res = channel.recv_output() => {
+                    match out_res {
+                        Ok(output) => {
+                            if let Err(e) = writer.write_all(&output.data).await {
+                                debug!(terminal_id = %id, error = %e, "Error writing to I/O client");
+                                break;
+                            }
+                            // Flush immediately for low latency
+                            if let Err(e) = writer.flush().await {
+                                debug!(terminal_id = %id, error = %e, "Error flushing to I/O client");
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            // Typically means the channel closed (shell exited / server closed channel).
+                            debug!(terminal_id = %id, error = %e, "Terminal channel output stream ended");
+                            channel_closed = true;
+                            break;
+                        }
+                    }
                 }
             }
         }
 
-        // Stop the output task
-        output_task.abort();
+        // Return true if the terminal channel closed (shell exited), false if only the client disconnected.
+        channel_closed || channel.is_closed()
     }
 
     /// Stop the I/O listener and clean up the socket.
@@ -551,6 +589,9 @@ impl Resource for Terminal {
         // Store the channel and connection
         *self.channel.write().await = Some(channel);
         *self.connection.write().await = Some(conn.clone());
+
+        // Reset channel_closed flag
+        self.channel_closed.store(false, Ordering::SeqCst);
 
         // Start the I/O socket listener
         self.start_io_listener().await?;
@@ -610,7 +651,12 @@ impl Resource for Terminal {
     }
 
     fn describe(&self) -> ResourceInfo {
-        let state = self.state.clone();
+        // Check if channel closed (shell exited) - report as Closed
+        let state = if self.channel_closed.load(Ordering::SeqCst) {
+            ResourceState::Closed
+        } else {
+            self.state.clone()
+        };
         let stats = self.stats.clone();
         let (cols, rows) = *self.term_size.read().unwrap();
         let attached = self.is_attached();

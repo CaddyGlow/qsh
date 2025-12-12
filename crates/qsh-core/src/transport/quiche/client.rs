@@ -201,6 +201,7 @@ pub async fn connect_quic(config: &ConnectConfig) -> Result<ConnectResult<Quiche
         local_addr,
         config.logical_role, // logical role from config
         EndpointRole::Client, // quic_role = Client for connect_quic
+        config.keep_alive_interval,
     );
 
     // Get session data for future 0-RTT resumption

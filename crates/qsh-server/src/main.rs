@@ -315,6 +315,7 @@ async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
     // Create listener with authorizer
     let listener = QshListener::bind(server_config).await?.with_authorizer(Arc::clone(&authorizer));
     let local_addr = listener.local_addr();
+    let registry = Arc::clone(listener.registry());
     info!("Server listening on {}", local_addr);
 
     // Compute certificate hash for enrollment responses
@@ -330,7 +331,7 @@ async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
 
     // Try to bind control socket (non-fatal if it fails)
     let control_handler = match ServerControlHandler::bind(
-        Arc::clone(listener.registry()),
+        Arc::clone(&registry),
         authorizer,
         server_info,
     ) {
@@ -341,9 +342,27 @@ async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
         }
     };
 
-    // Run listener and control handler concurrently
-    if let Some(control) = control_handler {
+    // Set up signal handlers for graceful shutdown
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| qsh_core::Error::Transport {
+            message: format!("failed to install SIGTERM handler: {}", e),
+        })?;
+
+    // Run listener and control handler concurrently with signal handling
+    let result = if let Some(control) = control_handler {
         tokio::select! {
+            biased;
+
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("qsh-server: received SIGINT, shutting down...");
+                info!("Received SIGINT (Ctrl-C), initiating graceful shutdown");
+                Ok(())
+            }
+            _ = sigterm.recv() => {
+                eprintln!("qsh-server: received SIGTERM, shutting down...");
+                info!("Received SIGTERM, initiating graceful shutdown");
+                Ok(())
+            }
             result = listener.run(false) => result,
             result = control.run() => {
                 // Control handler exiting is unexpected but not fatal
@@ -352,8 +371,32 @@ async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
             }
         }
     } else {
-        listener.run(false).await
-    }
+        tokio::select! {
+            biased;
+
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("qsh-server: received SIGINT, shutting down...");
+                info!("Received SIGINT (Ctrl-C), initiating graceful shutdown");
+                Ok(())
+            }
+            _ = sigterm.recv() => {
+                eprintln!("qsh-server: received SIGTERM, shutting down...");
+                info!("Received SIGTERM, initiating graceful shutdown");
+                Ok(())
+            }
+            result = listener.run(false) => result,
+        }
+    };
+
+    // Graceful shutdown: notify all connected clients and close sessions
+    let session_count = registry.session_count().await;
+    eprintln!("qsh-server: notifying {} connected client(s)...", session_count);
+    info!(session_count, "Shutting down server, notifying connected clients");
+    registry.shutdown().await;
+    eprintln!("qsh-server: shutdown complete");
+    info!("Server shutdown complete");
+
+    result
 }
 
 /// Run the server in initiator mode (SSH-out to client).
@@ -445,39 +488,6 @@ async fn run_server_initiate(cli: &Cli) -> qsh_core::Result<()> {
     let session_key = endpoint_info.decode_session_key()?;
     let cert_hash = endpoint_info.decode_cert_hash().ok();
 
-    info!(addr = %server_addr, "Connecting to client via QUIC");
-
-    // Establish QUIC connection as initiator
-    // In reverse-attach mode: QUIC client (us) = logical server
-    let connect_config = ConnectConfig {
-        server_addr,
-        local_port: None,
-        max_idle_timeout: std::time::Duration::from_secs(300),
-        connect_timeout: std::time::Duration::from_secs(30),
-        cert_hash,
-        session_data: None,
-        // Reverse mode: server initiates connection, so QUIC client = logical server
-        logical_role: qsh_core::transport::EndpointRole::Server,
-    };
-
-    let connect_result = connect_quic(&connect_config).await?;
-    let quic_conn = connect_result.connection;
-
-    use qsh_core::transport::{Connection, StreamType};
-
-    info!(
-        addr = ?quic_conn.remote_addr(),
-        "QUIC connection established, performing handshake"
-    );
-
-    // Open control stream for handshake (using StreamType::Control)
-    let mut control_stream = quic_conn
-        .open_stream(StreamType::Control)
-        .await
-        .map_err(|e| qsh_core::Error::Transport {
-            message: format!("failed to open control stream: {}", e),
-        })?;
-
     // Perform handshake as initiator
     let capabilities = Capabilities {
         predictive_echo: true,
@@ -486,23 +496,67 @@ async fn run_server_initiate(cli: &Cli) -> qsh_core::Result<()> {
         tunnel: false,
     };
 
-    let handshake_config = HandshakeConfig::new_initiate(
-        session_key,
-        capabilities.clone(),
-        qsh_core::protocol::TermSize { cols: 80, rows: 24 }, // Dummy size, server doesn't have terminal
-        "server".to_string(),
-        vec![],
-        false,
-    );
+    use qsh_core::transport::{Connection, StreamType};
 
-    let handshake_result = handshake_initiate(&mut control_stream, &handshake_config).await?;
+    async fn connect_and_handshake(
+        server_addr: SocketAddr,
+        cert_hash: Option<Vec<u8>>,
+        session_key: [u8; 32],
+        capabilities: &Capabilities,
+    ) -> qsh_core::Result<(
+        qsh_core::transport::QuicConnection,
+        qsh_core::transport::QuicStream,
+        qsh_core::protocol::SessionId,
+    )> {
+        info!(addr = %server_addr, "Connecting to client via QUIC");
 
-    info!(
-        session_id = ?handshake_result.session_id,
-        "Handshake complete as initiator"
-    );
-    // Keep the bootstrap SSH session alive for the lifetime of this connection so
-    // the remote `qsh --bootstrap` process (and its attach pipe) stay available.
+        // Establish QUIC connection as initiator
+        // In reverse-attach mode: QUIC client (us) = logical server
+        let connect_config = ConnectConfig {
+            server_addr,
+            local_port: None,
+            max_idle_timeout: std::time::Duration::from_secs(300),
+            connect_timeout: std::time::Duration::from_secs(30),
+            keep_alive_interval: None,
+            cert_hash,
+            session_data: None,
+            // Reverse mode: server initiates connection, so QUIC client = logical server
+            logical_role: qsh_core::transport::EndpointRole::Server,
+        };
+
+        let connect_result = connect_quic(&connect_config).await?;
+        let quic_conn = connect_result.connection;
+
+        info!(
+            addr = ?quic_conn.remote_addr(),
+            "QUIC connection established, performing handshake"
+        );
+
+        // Open control stream for handshake (using StreamType::Control)
+        let mut control_stream = quic_conn
+            .open_stream(StreamType::Control)
+            .await
+            .map_err(|e| qsh_core::Error::Transport {
+                message: format!("failed to open control stream: {}", e),
+            })?;
+
+        let handshake_config = HandshakeConfig::new_initiate(
+            session_key,
+            capabilities.clone(),
+            qsh_core::protocol::TermSize { cols: 80, rows: 24 }, // Dummy size, server doesn't have terminal
+            "server".to_string(),
+            vec![],
+            false,
+        );
+
+        let handshake_result = handshake_initiate(&mut control_stream, &handshake_config).await?;
+        info!(
+            session_id = ?handshake_result.session_id,
+            "Handshake complete as initiator"
+        );
+
+        Ok((quic_conn, control_stream, handshake_result.session_id))
+    }
 
     // Build connection config
     let conn_config = ConnectionConfig {
@@ -512,151 +566,204 @@ async fn run_server_initiate(cli: &Cli) -> qsh_core::Result<()> {
         ..Default::default()
     };
 
-    // Create connection handler
+    // Keep the bootstrap SSH session alive for the lifetime of this function so
+    // the remote `qsh --bootstrap` process (and its attach pipe) stay available.
+    let _bootstrap_handle = bootstrap_handle;
+
+    // Initial connect/handshake
+    let (quic_conn, control_stream, initial_session_id) =
+        connect_and_handshake(server_addr, cert_hash.clone(), session_key, &capabilities).await?;
+
+    // Create connection handler (persists across reconnects)
     // Note: control_stream is moved here; ConnectionHandler will manage it
     let (handler, mut shutdown_rx) = ConnectionHandler::new(
         quic_conn,
         control_stream,
-        handshake_result.session_id,
+        initial_session_id,
         conn_config,
     );
 
-    info!(
-        session_id = ?handshake_result.session_id,
-        "Server initiator mode active, handling connection"
-    );
+    info!("Server initiator mode active, handling connection");
 
-    // Spawn stream acceptor (mirrors listener.rs) so we consume ChannelOut/ChannelBidi
-    // streams sent by the responder. Without this, the responder sees resets on its
-    // output streams and the terminal never shows up.
-    let quic_for_accept = handler.quic().await;
-    let accept_handler = handler.clone();
-    let accept_task = tokio::spawn(async move {
-        loop {
-            match quic_for_accept.accept_stream().await {
-                Ok((stream_type, stream)) => {
-                    let h = accept_handler.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = h.handle_incoming_stream(stream_type, stream).await {
-                            warn!(error = %e, "Failed to handle incoming stream");
-                        }
-                    });
-                }
-                Err(Error::ConnectionClosed) => break,
-                Err(e) => {
-                    warn!(error = %e, "Failed to accept stream");
-                    break;
-                }
-            }
-        }
-    });
+    let mut reconnect_handler = qsh_core::session::ReconnectionHandler::new();
+    reconnect_handler.start(0, 0, false);
+    let mut last_rtt: Option<std::time::Duration> = None;
 
-    // Heartbeat timer to keep connection alive (server sends heartbeats in initiator mode)
-    let mut heartbeat_timer = tokio::time::interval(std::time::Duration::from_secs(5));
-    heartbeat_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut heartbeat_seq: u32 = 0;
+    enum LoopExit {
+        Reconnect,
+        Shutdown,
+    }
 
-    // Run the control message processing loop (same as listener.rs)
     loop {
-        tokio::select! {
-            biased;
-
-            // Handle shutdown signal
-            reason = shutdown_rx.recv() => {
-                match reason {
-                    Some(reason) => {
-                        info!(?reason, "Shutdown signal received");
+        // Spawn stream acceptor (mirrors listener.rs) so we consume streams sent by the responder.
+        let quic_for_accept = handler.quic().await;
+        let accept_handler = handler.clone();
+        let accept_task = tokio::spawn(async move {
+            loop {
+                match quic_for_accept.accept_stream().await {
+                    Ok((stream_type, stream)) => {
+                        let h = accept_handler.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = h.handle_incoming_stream(stream_type, stream).await {
+                                warn!(error = %e, "Failed to handle incoming stream");
+                            }
+                        });
                     }
-                    None => {
-                        info!("Shutdown channel closed");
-                    }
-                }
-                break;
-            }
-
-            // Handle control messages from the client
-            msg = handler.recv_control() => {
-                match msg {
-                    Ok(Message::ChannelOpen(payload)) => {
-                        if let Err(e) = handler.handle_channel_open(payload).await {
-                            error!(error = %e, "Failed to handle ChannelOpen");
-                        }
-                    }
-                    Ok(Message::ChannelClose(payload)) => {
-                        if let Err(e) = handler.handle_channel_close(payload).await {
-                            error!(error = %e, "Failed to handle ChannelClose");
-                        }
-                    }
-                    Ok(Message::ChannelAccept(payload)) => {
-                        if let Err(e) = handler.handle_channel_accept(payload).await {
-                            error!(error = %e, "Failed to handle ChannelAccept");
-                        }
-                    }
-                    Ok(Message::ChannelReject(payload)) => {
-                        if let Err(e) = handler.handle_channel_reject(payload).await {
-                            error!(error = %e, "Failed to handle ChannelReject");
-                        }
-                    }
-                    Ok(Message::GlobalRequest(payload)) => {
-                        if let Err(e) = handler.handle_global_request(payload).await {
-                            error!(error = %e, "Failed to handle GlobalRequest");
-                        }
-                    }
-                    Ok(Message::Resize(payload)) => {
-                        if let Err(e) = handler.handle_resize(payload).await {
-                            warn!(error = %e, "Failed to handle Resize");
-                        }
-                    }
-                    Ok(Message::StateAck(payload)) => {
-                        if let Err(e) = handler.handle_state_ack(payload).await {
-                            warn!(error = %e, "Failed to handle StateAck");
-                        }
-                    }
-                    Ok(Message::Heartbeat(payload)) => {
-                        // Echo heartbeat immediately for RTT measurement
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| (d.as_millis() % 65536) as u16)
-                            .unwrap_or(0);
-                        let reply = Message::Heartbeat(HeartbeatPayload::reply(now_ms, payload.timestamp, payload.seq));
-                        if let Err(e) = handler.send_control(&reply).await {
-                            warn!(error = %e, "Failed to send heartbeat reply");
-                        }
-                    }
-                    Ok(Message::Shutdown(payload)) => {
-                        info!(reason = ?payload.reason, "Client requested shutdown");
-                        break;
-                    }
-                    Ok(other) => {
-                        warn!(msg = ?other, "Unexpected control message");
-                    }
-                    Err(Error::ConnectionClosed) => {
-                        info!("Connection closed");
-                        break;
-                    }
+                    Err(Error::ConnectionClosed) => break,
                     Err(e) => {
-                        warn!(error = %e, "Control stream error");
+                        warn!(error = %e, "Failed to accept stream");
                         break;
                     }
                 }
             }
+        });
 
-            // Send heartbeat to keep connection alive
-            _ = heartbeat_timer.tick() => {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| (d.as_millis() % 65536) as u16)
-                    .unwrap_or(0);
-                let heartbeat = Message::Heartbeat(HeartbeatPayload::new(now_ms, heartbeat_seq as u16));
-                heartbeat_seq = heartbeat_seq.wrapping_add(1);
-                if let Err(e) = handler.send_control(&heartbeat).await {
-                    warn!(error = %e, "Failed to send heartbeat");
+        // Heartbeat timer to keep connection alive (server sends heartbeats in initiator mode)
+        let mut heartbeat_timer = tokio::time::interval(std::time::Duration::from_secs(5));
+        heartbeat_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut heartbeat_seq: u32 = 0;
+
+        // Run the control message processing loop (same as listener.rs)
+        let exit_reason: LoopExit = loop {
+            tokio::select! {
+                biased;
+
+                // Handle shutdown signal
+                reason = shutdown_rx.recv() => {
+                    match reason {
+                        Some(reason) => {
+                            info!(?reason, "Shutdown signal received");
+                        }
+                        None => {
+                            info!("Shutdown channel closed");
+                        }
+                    }
+                    break LoopExit::Shutdown;
+                }
+
+                // Handle control messages from the client
+                msg = handler.recv_control() => {
+                    match msg {
+                        Ok(Message::ChannelOpen(payload)) => {
+                            if let Err(e) = handler.handle_channel_open(payload).await {
+                                error!(error = %e, "Failed to handle ChannelOpen");
+                            }
+                        }
+                        Ok(Message::ChannelClose(payload)) => {
+                            if let Err(e) = handler.handle_channel_close(payload).await {
+                                error!(error = %e, "Failed to handle ChannelClose");
+                            }
+                        }
+                        Ok(Message::ChannelAccept(payload)) => {
+                            if let Err(e) = handler.handle_channel_accept(payload).await {
+                                error!(error = %e, "Failed to handle ChannelAccept");
+                            }
+                        }
+                        Ok(Message::ChannelReject(payload)) => {
+                            if let Err(e) = handler.handle_channel_reject(payload).await {
+                                error!(error = %e, "Failed to handle ChannelReject");
+                            }
+                        }
+                        Ok(Message::GlobalRequest(payload)) => {
+                            if let Err(e) = handler.handle_global_request(payload).await {
+                                error!(error = %e, "Failed to handle GlobalRequest");
+                            }
+                        }
+                        Ok(Message::Resize(payload)) => {
+                            if let Err(e) = handler.handle_resize(payload).await {
+                                warn!(error = %e, "Failed to handle Resize");
+                            }
+                        }
+                        Ok(Message::StateAck(payload)) => {
+                            if let Err(e) = handler.handle_state_ack(payload).await {
+                                warn!(error = %e, "Failed to handle StateAck");
+                            }
+                        }
+                        Ok(Message::Heartbeat(payload)) => {
+                            // Echo heartbeat immediately for RTT measurement
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| (d.as_millis() % 65536) as u16)
+                                .unwrap_or(0);
+                            let reply = Message::Heartbeat(HeartbeatPayload::reply(now_ms, payload.timestamp, payload.seq));
+                            if let Err(e) = handler.send_control(&reply).await {
+                                warn!(error = %e, "Failed to send heartbeat reply");
+                                break LoopExit::Reconnect;
+                            }
+                        }
+                        Ok(Message::Shutdown(payload)) => {
+                            info!(reason = ?payload.reason, "Client requested shutdown");
+                            break LoopExit::Shutdown;
+                        }
+                        Ok(other) => {
+                            warn!(msg = ?other, "Unexpected control message");
+                        }
+                        Err(Error::ConnectionClosed) => {
+                            info!("Connection closed, reconnecting");
+                            break LoopExit::Reconnect;
+                        }
+                        Err(e) if e.is_transient() => {
+                            warn!(error = %e, "Transient control stream error, reconnecting");
+                            break LoopExit::Reconnect;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Control stream error");
+                            break LoopExit::Shutdown;
+                        }
+                    }
+                }
+
+                // Send heartbeat to keep connection alive
+                _ = heartbeat_timer.tick() => {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| (d.as_millis() % 65536) as u16)
+                        .unwrap_or(0);
+                    let heartbeat = Message::Heartbeat(HeartbeatPayload::new(now_ms, heartbeat_seq as u16));
+                    heartbeat_seq = heartbeat_seq.wrapping_add(1);
+                    if let Err(e) = handler.send_control(&heartbeat).await {
+                        warn!(error = %e, "Failed to send heartbeat");
+                        break LoopExit::Reconnect;
+                    }
+                }
+            }
+        };
+
+        accept_task.abort();
+
+        match exit_reason {
+            LoopExit::Shutdown => break,
+            LoopExit::Reconnect => {
+                // Cache RTT for Mosh-style retry delay.
+                last_rtt = Some(handler.rtt().await);
+
+                loop {
+                    let delay = reconnect_handler.next_delay(last_rtt);
+                    let attempt = reconnect_handler.attempt();
+                    info!(attempt, delay_ms = delay.as_millis(), "Reconnection attempt (initiator mode)");
+                    tokio::time::sleep(delay).await;
+
+                    match connect_and_handshake(server_addr, cert_hash.clone(), session_key, &capabilities).await {
+                        Ok((new_quic, new_control, _new_session_id)) => {
+                            let (shutdown_tx, new_shutdown_rx) = tokio::sync::mpsc::channel::<qsh_server::connection::ShutdownReason>(1);
+                            handler.reconnect(new_quic, new_control, shutdown_tx).await;
+                            shutdown_rx = new_shutdown_rx;
+                            reconnect_handler.reset();
+                            break;
+                        }
+                        Err(e) if e.is_fatal() => {
+                            error!(error = %e, "Reconnection failed with fatal error");
+                            return Err(e);
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Reconnection attempt failed");
+                            continue;
+                        }
+                    }
                 }
             }
         }
     }
-
-    accept_task.abort();
 
     // Cleanup
     handler.shutdown().await;

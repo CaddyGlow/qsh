@@ -91,6 +91,7 @@ impl QshListener {
             cert_pem: config.cert_pem.clone(),
             key_pem: config.key_pem.clone(),
             idle_timeout,
+            keep_alive_interval: None,
             ticket_key: None,
             // Normal mode: server is listening, so QUIC server = logical server
             logical_role: qsh_core::transport::EndpointRole::Server,
@@ -129,6 +130,7 @@ impl QshListener {
             cert_pem: config.cert_pem.clone(),
             key_pem: config.key_pem.clone(),
             idle_timeout,
+            keep_alive_interval: None,
             ticket_key: None,
             // Normal mode: server is listening, so QUIC server = logical server
             logical_role: qsh_core::transport::EndpointRole::Server,

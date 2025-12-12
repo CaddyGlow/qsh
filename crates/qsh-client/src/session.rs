@@ -289,6 +289,7 @@ impl TerminalComponent {
         let is_interactive = cli.should_allocate_pty();
 
         // Enter raw terminal mode only for interactive sessions
+        // Non-fatal if raw mode fails (e.g., in bootstrap mode where stdin may not be a TTY)
         let _raw_guard = if is_interactive {
             match crate::RawModeGuard::enter() {
                 Ok(guard) => {
@@ -296,8 +297,8 @@ impl TerminalComponent {
                     Some(guard)
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "Failed to enter raw mode");
-                    return Err(e.into());
+                    tracing::warn!(error = %e, "Failed to enter raw mode, continuing without");
+                    None
                 }
             }
         } else {
@@ -345,69 +346,6 @@ impl TerminalComponent {
             is_interactive,
             cli_command: cli.command_string(),
             cli_output_mode: cli.output_mode(),
-            _raw_guard,
-        })
-    }
-
-    /// Create a terminal component for bootstrap/responder mode.
-    ///
-    /// In bootstrap mode, stdin/stdout are replaced with a Unix socket (attach pipe).
-    /// The attach client connects and provides the actual terminal I/O.
-    pub fn new_bootstrap(
-        stdin_fd: std::os::unix::io::RawFd,
-        stdout_fd: std::os::unix::io::RawFd,
-        output_mode: qsh_core::protocol::OutputMode,
-    ) -> Result<Self> {
-        use std::time::Duration;
-        use tokio::time::MissedTickBehavior;
-
-        // No escape key in bootstrap mode (pass-through)
-        let escape_handler = crate::EscapeHandler::new(None);
-
-        // Bootstrap mode is always interactive (PTY on remote side)
-        let is_interactive = true;
-
-        // No raw mode guard needed - the attach client handles raw mode
-        let _raw_guard = None;
-
-        // No prediction in bootstrap mode (server is the one with the shell)
-        let prediction_enabled = false;
-        let prediction_mode = crate::cli::PredictionMode::Off;
-
-        // Overlay refresh interval
-        let mut overlay_refresh = tokio::time::interval(Duration::from_secs(2));
-        overlay_refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
-        let mut escape_info_refresh = tokio::time::interval(Duration::from_millis(250));
-        escape_info_refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
-        // Minimal notification engine (default style is Minimal)
-        let notification = crate::overlay::NotificationEngine::new();
-
-        Ok(Self {
-            channel: None,
-            stdin: crate::StdinReader::from_fd(stdin_fd),
-            stdout: crate::StdoutWriter::from_fd(stdout_fd),
-            prediction_enabled,
-            prediction_mode,
-            renderer: crate::render::StateRenderer::new(),
-            prediction_overlay: crate::overlay::PredictionOverlay::new(),
-            client_parser: None,
-            terminal_state: TerminalSessionState::new(),
-            notification,
-            escape_handler,
-            transport_sender: TransportSender::new(qsh_core::transport::SenderConfig::client()),
-            pending_seq: None,
-            pending_predictable: false,
-            paste_threshold: 64,
-            overlay_refresh,
-            escape_info_refresh,
-            is_first_connection: true,
-            reconnect_error: None,
-            disconnect_requested: false,
-            is_interactive,
-            cli_command: None,
-            cli_output_mode: output_mode,
             _raw_guard,
         })
     }
@@ -761,12 +699,6 @@ impl TerminalComponent {
 
         // Accumulate in TransportSender (Mosh-style batching)
         self.transport_sender.push(&data);
-        tracing::trace!(
-            input_len = data.len(),
-            pending_len = self.transport_sender.pending_len(),
-            seq = seq,
-            "Pushed input to TransportSender"
-        );
 
         // Check for quit/suspend sequences that should flush immediately
         let has_quit_signal = data.iter().any(|&b| b == 0x03 || b == 0x1A);
@@ -794,12 +726,6 @@ impl TerminalComponent {
         let terminal = self.channel.as_mut().expect("Terminal channel not initialized");
         match event {
             crate::TerminalEvent::Output(output) => {
-                tracing::trace!(
-                    len = output.data.len(),
-                    confirmed_seq = output.confirmed_input_seq,
-                    "Received terminal output"
-                );
-
                 // Update notification engine (mosh-style)
                 let now = std::time::Instant::now();
                 self.notification.server_heard(now);
@@ -1490,25 +1416,47 @@ impl Session {
         Ok(session)
     }
 
-    /// Construct session for bootstrap/responder mode.
+    /// Construct session for control-socket-only mode.
     ///
-    /// In bootstrap mode, stdin/stdout come from an attach pipe (Unix socket)
-    /// rather than the real terminal. The attach client connects and provides
-    /// the actual terminal I/O.
-    pub fn from_bootstrap(
+    /// This creates a session with no terminal or forwards - just the control socket
+    /// infrastructure. Terminals and forwards can be added dynamically via the control socket.
+    ///
+    /// Used for bootstrap/responder mode where the client is started by the server
+    /// and has no attached terminal.
+    pub fn for_control_only(
         connection: std::sync::Arc<ReconnectableConnection>,
-        stdin_fd: std::os::unix::io::RawFd,
-        stdout_fd: std::os::unix::io::RawFd,
-        output_mode: qsh_core::protocol::OutputMode,
+        session_name: String,
     ) -> Result<Self> {
-        let terminal = TerminalComponent::new_bootstrap(stdin_fd, stdout_fd, output_mode)?;
-        Ok(Self::new(
+        // Create session with no terminal or forwards
+        let mut session = Self::new(
             connection,
             SessionParts {
-                terminal: Some(terminal),
+                terminal: None,
                 forwards: None,
             },
-        ))
+        );
+
+        // Create resource manager for unified resource tracking
+        let (resource_manager, event_rx) = crate::control::ResourceManager::new();
+        session.resource_manager = Some(resource_manager);
+        session.resource_event_rx = Some(event_rx);
+
+        // Create control socket for session management
+        let socket_path = crate::control::socket_path(&session_name);
+
+        match crate::control::ControlSocket::new(&socket_path) {
+            Ok(control_socket) => {
+                tracing::info!(path = %socket_path.display(), name = %session_name, "Control socket created");
+                session.control = Some(control_socket);
+                session.session_name = Some(session_name);
+            }
+            Err(e) => {
+                // Non-fatal: log warning but continue without control socket
+                tracing::warn!(error = %e, path = %socket_path.display(), "Failed to create control socket");
+            }
+        }
+
+        Ok(session)
     }
 
     /// Run the unified session event loop.
@@ -1529,7 +1477,9 @@ impl Session {
                 fwd.on_connect(&conn).await?;
             }
 
-            let mut heartbeat = HeartbeatState::new(Duration::from_secs(1));
+            // Mosh inspiration: avoid RTT/2 cadence for application heartbeats.
+            // Use a small initial delay to get one RTT sample, then a low fixed cadence.
+            let mut heartbeat = HeartbeatState::new(Duration::from_secs(1), Duration::from_secs(3));
 
             // Create channel for forward commands from control socket
             let (_forward_cmd_tx, mut forward_cmd_rx) = tokio::sync::mpsc::channel::<crate::control::ForwardAddCommand>(16);
@@ -1744,11 +1694,10 @@ impl Session {
                     // Heartbeat timer
                     _ = tokio::time::sleep_until(heartbeat.next_deadline) => {
                         let hb = heartbeat.tracker.send_heartbeat();
-                        trace!(seq = hb.seq, "Sending heartbeat");
 
                         match conn.send_control(&Message::Heartbeat(hb)).await {
                             Ok(_) => {
-                                heartbeat.next_deadline = tokio::time::Instant::now() + heartbeat.tracker.send_interval();
+                                heartbeat.next_deadline = tokio::time::Instant::now() + heartbeat.interval;
                             }
                             Err(e) if e.is_transient() => break Err(e.into()),
                             Err(e) => return Err(e.into()),
@@ -1759,8 +1708,6 @@ impl Session {
                     msg = conn.recv_control() => {
                         match msg {
                             Ok(msg) => {
-                                trace!(?msg, "Received control message");
-
                                 // Update heartbeat tracker
                                 if let Message::Heartbeat(ref hb) = msg {
                                     if let Some(_rtt) = heartbeat.tracker.receive_heartbeat(hb) {
@@ -1779,7 +1726,34 @@ impl Session {
                                 // Handle session-level messages
                                 match msg {
                                     Message::Shutdown(payload) => {
+                                        use qsh_core::protocol::ShutdownReason;
+
                                         info!(reason = ?payload.reason, "Server requested shutdown");
+
+                                        // Print user-visible message for server shutdown
+                                        match payload.reason {
+                                            ShutdownReason::ServerShutdown => {
+                                                let msg = payload.message.as_deref().unwrap_or("Server is shutting down");
+                                                eprintln!("\r\nqsh: {}", msg);
+                                            }
+                                            ShutdownReason::IdleTimeout => {
+                                                eprintln!("\r\nqsh: Server closed connection due to idle timeout");
+                                            }
+                                            ShutdownReason::ShellExited => {
+                                                // Shell exited normally, no message needed
+                                            }
+                                            ShutdownReason::ProtocolError => {
+                                                let msg = payload.message.as_deref().unwrap_or("Protocol error");
+                                                eprintln!("\r\nqsh: Connection closed: {}", msg);
+                                            }
+                                            ShutdownReason::AuthFailure => {
+                                                eprintln!("\r\nqsh: Connection closed: authentication failure");
+                                            }
+                                            ShutdownReason::UserRequested => {
+                                                // User requested, no message needed
+                                            }
+                                        }
+
                                         break Ok(0);
                                     }
                                     Message::ChannelAccept(ref accept) => {
@@ -2120,15 +2094,17 @@ impl Session {
 /// Helper struct for heartbeat tracking.
 struct HeartbeatState {
     tracker: HeartbeatTracker,
+    interval: Duration,
     next_deadline: tokio::time::Instant,
 }
 
 impl HeartbeatState {
-    fn new(interval: Duration) -> Self {
+    fn new(initial_delay: Duration, interval: Duration) -> Self {
         let tracker = HeartbeatTracker::new();
         Self {
             tracker,
-            next_deadline: tokio::time::Instant::now() + interval,
+            interval,
+            next_deadline: tokio::time::Instant::now() + initial_delay,
         }
     }
 }

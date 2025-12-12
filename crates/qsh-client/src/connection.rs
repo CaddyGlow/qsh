@@ -94,8 +94,8 @@ impl Default for ConnectionConfig {
             predictive_echo: true,
             connect_timeout: Duration::from_secs(5),
             zero_rtt_available: false,
-            // Aggressive keepalive (500ms) for fast disconnection detection (mosh uses RTT/2)
-            keep_alive_interval: Some(Duration::from_millis(500)),
+            // Keep idle connections alive without being overly chatty.
+            keep_alive_interval: Some(Duration::from_secs(5)),
             max_idle_timeout: IDLE_TIMEOUT,
             session_data: None,
             // Mosh-style: use random port from 60001-60999 range
@@ -140,6 +140,7 @@ pub async fn establish_quic_connection(config: &ConnectionConfig) -> Result<Quic
         local_port: config.local_port,
         max_idle_timeout: config.max_idle_timeout,
         connect_timeout: config.connect_timeout,
+        keep_alive_interval: config.keep_alive_interval,
         cert_hash: config.cert_hash.clone(),
         session_data: config.session_data.clone(),
         // For normal client mode, QUIC client = logical client
@@ -240,6 +241,18 @@ impl ChannelConnection {
     /// Complete the qsh protocol handshake on an existing QUIC connection.
     pub async fn from_quic(conn: QuicConnection, config: ConnectionConfig) -> Result<Self> {
         Self::from_quic_with_resume(conn, config, None).await
+    }
+
+    /// Complete the qsh protocol handshake on an existing QUIC connection, resuming a session.
+    ///
+    /// This is used for responder-mode reconnection flows where the peer reconnects to us
+    /// and we must resume state using the provided session ID.
+    pub async fn resume_from_quic(
+        conn: QuicConnection,
+        config: ConnectionConfig,
+        session_id: SessionId,
+    ) -> Result<Self> {
+        Self::from_quic_with_resume(conn, config, Some(session_id)).await
     }
 
     /// Reconnect to an existing session using the session ID.

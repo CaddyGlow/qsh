@@ -34,6 +34,8 @@ pub struct QuicheAcceptor {
     quiche_config: quiche::Config,
     /// Logical role for accepted connections.
     logical_role: crate::transport::config::EndpointRole,
+    /// QUIC keep-alive interval for accepted connections.
+    keep_alive_interval: Option<Duration>,
     /// Pending connections (connection ID -> (connection, peer address)).
     connections: HashMap<Vec<u8>, (quiche::Connection, Option<std::net::SocketAddr>)>,
     /// Receive buffer.
@@ -74,6 +76,7 @@ impl QuicheAcceptor {
             local_addr,
             quiche_config,
             logical_role: config.logical_role,
+            keep_alive_interval: config.keep_alive_interval,
             connections: HashMap::new(),
             recv_buf: [0u8; 65535],
             send_buf: [0u8; 65535],
@@ -103,6 +106,7 @@ impl QuicheAcceptor {
             local_addr,
             quiche_config,
             logical_role: config.logical_role,
+            keep_alive_interval: config.keep_alive_interval,
             connections: HashMap::new(),
             recv_buf: [0u8; 65535],
             send_buf: [0u8; 65535],
@@ -216,6 +220,7 @@ impl QuicheAcceptor {
                                 self.local_addr,
                                 self.logical_role, // logical role from config
                                 EndpointRole::Server, // quic_role = Server for accept
+                                self.keep_alive_interval,
                             );
 
                             return Ok((quic_conn, peer));

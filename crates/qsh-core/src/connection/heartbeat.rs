@@ -129,19 +129,16 @@ impl HeartbeatTracker {
                 let (seq, sent_at) = self.pending.remove(idx);
                 let rtt_ms = sent_at.elapsed().as_secs_f64() * 1000.0;
 
-                // Ignore large values (> 5 seconds) - likely stale
-                if rtt_ms < 5000.0 {
-                    tracing::trace!(
-                        seq_reply = payload.seq_reply,
-                        seq,
-                        rtt_ms,
-                        srtt = self.srtt,
-                        pending_count = self.pending.len(),
-                        "Heartbeat RTT sample"
-                    );
-                    self.update_srtt(rtt_ms);
-                    return Some(Duration::from_secs_f64(rtt_ms / 1000.0));
-                }
+                tracing::trace!(
+                    seq_reply = payload.seq_reply,
+                    seq,
+                    rtt_ms,
+                    srtt = self.srtt,
+                    pending_count = self.pending.len(),
+                    "Heartbeat RTT sample"
+                );
+                self.update_srtt(rtt_ms);
+                return Some(Duration::from_secs_f64(rtt_ms / 1000.0));
             }
         }
 
