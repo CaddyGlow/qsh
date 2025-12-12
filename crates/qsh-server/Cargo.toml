@@ -23,6 +23,8 @@ compression = ["qsh-core/compression"]
 
 [dependencies]
 qsh-core = { workspace = true, default-features = false }
+qsh-control = { workspace = true }
+prost = "0.13"
 tokio = { workspace = true }
 tokio-quiche = { workspace = true, optional = true }
 quiche = { workspace = true, optional = true }

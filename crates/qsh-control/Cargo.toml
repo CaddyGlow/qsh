@@ -1,0 +1,31 @@
+[package]
+name = "qsh-control"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Shared control protocol for qsh - Unix socket IPC and resource management"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+qsh-core = { workspace = true, default-features = false }
+tokio = { workspace = true, features = ["net", "io-util", "sync", "time"] }
+bytes = { workspace = true }
+tracing = { workspace = true }
+libc = { workspace = true }
+async-trait = { workspace = true }
+prost = "0.13"
+prost-types = "0.13"
+thiserror = "2.0"
+
+[build-dependencies]
+prost-build = "0.13"
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tempfile = { workspace = true }

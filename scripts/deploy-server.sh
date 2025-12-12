@@ -61,7 +61,7 @@ if [[ "$PROFILE" == "debug" ]]; then
 fi
 
 build() {
-  "${NIX_PREFIX[@]}" cargo build -p qsh-server -p qsh-client --bin qsh --target "$TARGET" "${profile_flag[@]}"
+  "${NIX_PREFIX[@]}" cargo build -p qsh-server -p qsh-client --bin qsh --bin qsh-server --target "$TARGET" "${profile_flag[@]}"
 }
 
 copy_bin() {

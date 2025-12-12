@@ -1,0 +1,393 @@
+syntax = "proto3";
+package qsh.control;
+
+// ============================================================================
+// Unified Resource Control Protocol
+// ============================================================================
+//
+// Envelope format for resource-based control. Carries commands, events,
+// and streams over a single control socket with namespaced endpoints.
+// Wire format: u32 LE length prefix + protobuf Message.
+
+// Top-level envelope for all control messages
+message Message {
+  oneof kind {
+    Command command = 1;
+    Event event = 2;
+    Stream stream = 3;
+  }
+}
+
+// Commands from client to supervisor
+message Command {
+  uint32 request_id = 1;
+  oneof cmd {
+    // Session commands
+    StatusCmd status = 10;
+    PingCmd ping = 11;
+    SessionsCmd sessions = 12;
+    ExitCmd exit = 13;
+
+    // Generic resource commands
+    ResourceCreate resource_create = 20;
+    ResourceList resource_list = 21;
+    ResourceDescribe resource_describe = 22;
+    ResourceDrain resource_drain = 23;
+    ResourceClose resource_close = 24;
+    ResourceForceClose resource_force_close = 25;
+
+    // Terminal-specific commands
+    TerminalAttachCmd terminal_attach = 30;
+    TerminalDetachCmd terminal_detach = 31;
+    TerminalResizeCmd terminal_resize = 32;
+
+    // File transfer commands
+    FileUploadCmd file_upload = 40;
+    FileDownloadCmd file_download = 41;
+    FileCancelCmd file_cancel = 42;
+
+    // Server control commands (used by qsh-server control socket)
+    EnrollCmd enroll = 50;  // Request a new session enrollment (for bootstrap reuse)
+  }
+}
+
+// Events from supervisor to clients
+message Event {
+  uint64 event_seq = 1;  // Monotonic per session for reconciliation
+  oneof evt {
+    CommandResult command_result = 10;
+    ResourceEvent resource_event = 20;
+  }
+}
+
+// Streaming data (bidirectional)
+message Stream {
+  string resource_id = 1;
+  StreamKind stream_kind = 2;
+  StreamDirection direction = 3;
+  bytes data = 4;
+}
+
+enum StreamKind {
+  STREAM_KIND_UNSPECIFIED = 0;
+  TERMINAL_IO = 1;
+  CONTROL = 2;
+  CUSTOM = 3;
+}
+
+enum StreamDirection {
+  STREAM_DIRECTION_UNSPECIFIED = 0;
+  IN = 1;   // To server (from client's perspective)
+  OUT = 2;  // From server (from client's perspective)
+}
+
+// ============================================================================
+// Command Messages
+// ============================================================================
+
+message StatusCmd {}
+message PingCmd { uint64 timestamp = 1; }
+message SessionsCmd {}
+message ExitCmd { bool force = 1; }
+
+message ResourceCreate {
+  ResourceKind kind = 1;
+  oneof params {
+    TerminalCreateParams terminal = 10;
+    ForwardCreateParams forward = 11;
+    FileTransferCreateParams file_transfer = 12;
+  }
+}
+
+message ResourceList {
+  ResourceKind kind = 1;  // UNSPECIFIED = all kinds
+}
+
+message ResourceDescribe {
+  string resource_id = 1;
+}
+
+message ResourceDrain {
+  string resource_id = 1;
+  uint64 deadline_ms = 2;  // 0 = default timeout
+}
+
+message ResourceClose {
+  string resource_id = 1;
+}
+
+message ResourceForceClose {
+  string resource_id = 1;
+}
+
+message TerminalAttachCmd {
+  string resource_id = 1;
+}
+
+message TerminalDetachCmd {
+  string resource_id = 1;
+}
+
+message TerminalResizeCmd {
+  string resource_id = 1;
+  uint32 cols = 2;
+  uint32 rows = 3;
+}
+
+message FileUploadCmd {
+  string local_path = 1;
+  string remote_path = 2;
+  FileTransferOptions options = 3;
+}
+
+message FileDownloadCmd {
+  string remote_path = 1;
+  string local_path = 2;
+  FileTransferOptions options = 3;
+}
+
+message FileCancelCmd {
+  string resource_id = 1;
+}
+
+// Request a new session enrollment from a running server.
+// Used by `qsh-server --bootstrap` to reuse an existing server instance.
+message EnrollCmd {}
+
+// ============================================================================
+// Resource Types and Parameters
+// ============================================================================
+
+enum ResourceKind {
+  RESOURCE_KIND_UNSPECIFIED = 0;
+  TERMINAL = 1;
+  FORWARD = 2;
+  FILE_TRANSFER = 3;
+}
+
+enum ResourceState {
+  RESOURCE_STATE_UNSPECIFIED = 0;
+  PENDING = 1;
+  STARTING = 2;
+  RUNNING = 3;
+  DRAINING = 4;
+  CLOSED = 5;
+  FAILED = 6;
+}
+
+message TerminalCreateParams {
+  uint32 cols = 1;
+  uint32 rows = 2;
+  string term_type = 3;
+  string shell = 4;
+  string command = 5;
+  repeated EnvPair env = 6;
+  OutputMode output_mode = 7;
+  bool allocate_pty = 8;  // true = PTY (default), false = pipes (like ssh -T)
+}
+
+// Terminal output mode (maps to qsh_core::protocol::OutputMode)
+enum OutputMode {
+  OUTPUT_MODE_UNSPECIFIED = 0;  // Default: Direct
+  DIRECT = 1;                    // Raw PTY bytes immediately
+  MOSH = 2;                      // ANSI escape sequences from terminal state diffs
+  STATE_DIFF = 3;                // Binary StateDiff structs
+}
+
+message EnvPair {
+  string key = 1;
+  string value = 2;
+}
+
+message ForwardCreateParams {
+  ForwardType forward_type = 1;
+  string bind_addr = 2;
+  uint32 bind_port = 3;
+  string dest_host = 4;
+  uint32 dest_port = 5;
+}
+
+enum ForwardType {
+  FORWARD_TYPE_UNSPECIFIED = 0;
+  LOCAL = 1;
+  REMOTE = 2;
+  DYNAMIC = 3;
+}
+
+message FileTransferCreateParams {
+  string local_path = 1;
+  string remote_path = 2;
+  bool upload = 3;  // true = upload, false = download
+  FileTransferOptions options = 4;
+}
+
+message FileTransferOptions {
+  bool recursive = 1;
+  bool resume = 2;
+  bool delta = 3;
+  bool compress = 4;
+  uint32 parallel = 5;
+  bool skip_unchanged = 6;
+}
+
+// ============================================================================
+// Event Messages
+// ============================================================================
+
+message CommandResult {
+  uint32 request_id = 1;
+  oneof result {
+    CommandOk ok = 2;
+    CommandError error = 3;
+  }
+}
+
+message CommandOk {
+  oneof data {
+    StatusResult status = 1;
+    PongResult pong = 2;
+    SessionsResult sessions = 3;
+    ResourceCreateResult resource_created = 4;
+    ResourceListResult resource_list = 5;
+    ResourceDescribeResult resource_describe = 6;
+    TerminalAttachResult terminal_attach = 7;
+    EnrollResult enroll = 8;  // Response to EnrollCmd
+    // Drain/Close/ForceClose return empty ok
+  }
+}
+
+message CommandError {
+  ErrorCode code = 1;
+  string message = 2;
+  string details = 3;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  NOT_FOUND = 1;
+  INVALID_ARGUMENT = 2;
+  ALREADY_EXISTS = 3;
+  PERMISSION_DENIED = 4;
+  RESOURCE_EXHAUSTED = 5;
+  INTERNAL = 6;
+  UNAVAILABLE = 7;
+  BIND_FAILED = 8;
+  CONNECT_FAILED = 9;
+}
+
+message StatusResult {
+  string state = 1;
+  string server_addr = 2;
+  uint64 uptime_secs = 3;
+  uint64 bytes_sent = 4;
+  uint64 bytes_received = 5;
+  uint32 rtt_ms = 6;
+  uint32 resource_count = 7;
+}
+
+message PongResult {
+  uint64 timestamp = 1;
+  uint64 server_time = 2;
+}
+
+message SessionsResult {
+  repeated SessionSummary sessions = 1;
+}
+
+message SessionSummary {
+  string session_id = 1;
+  string socket_path = 2;
+  string server_addr = 3;
+  uint64 connected_at = 4;
+  uint32 resource_count = 5;
+}
+
+message ResourceCreateResult {
+  string resource_id = 1;
+  ResourceInfo info = 2;
+}
+
+message ResourceListResult {
+  repeated ResourceInfo resources = 1;
+}
+
+message ResourceDescribeResult {
+  ResourceInfo info = 1;
+}
+
+message TerminalAttachResult {
+  string resource_id = 1;
+  string io_socket_path = 2;  // Unix socket path for raw terminal I/O
+}
+
+// Response to EnrollCmd: contains all info needed to build a bootstrap response.
+// The server generates a new session key and authorizes it in its session registry.
+message EnrollResult {
+  string server_addr = 1;     // QUIC server address (e.g., "0.0.0.0:4433" or actual bind address)
+  uint32 server_port = 2;     // QUIC server port
+  bytes session_key = 3;      // 32-byte session key (base64-encoded by client for JSON output)
+  bytes cert_hash = 4;        // SHA-256 hash of server certificate (for pinning)
+  string connect_mode = 5;    // "respond" (client should connect to server)
+}
+
+message ResourceInfo {
+  string id = 1;
+  ResourceKind kind = 2;
+  ResourceState state = 3;
+  string reason = 4;  // Populated when state = FAILED
+  ResourceStats stats = 5;
+  oneof details {
+    TerminalDetails terminal = 10;
+    ForwardDetails forward = 11;
+    FileTransferDetails file_transfer = 12;
+  }
+}
+
+message ResourceStats {
+  uint64 created_at = 1;
+  uint64 bytes_in = 2;
+  uint64 bytes_out = 3;
+}
+
+message TerminalDetails {
+  uint32 cols = 1;
+  uint32 rows = 2;
+  string shell = 3;
+  bool attached = 4;
+  uint64 pid = 5;
+  string socket_path = 6;  // Unix socket for raw I/O (e.g., /run/user/1000/qsh/session/term-0.io.sock)
+  // Creation config
+  string term_type = 7;
+  string command = 8;      // Command if not shell
+  OutputMode output_mode = 9;
+  bool allocate_pty = 10;
+}
+
+message ForwardDetails {
+  ForwardType forward_type = 1;
+  string bind_addr = 2;
+  uint32 bind_port = 3;
+  string dest_host = 4;
+  uint32 dest_port = 5;
+  uint64 active_connections = 6;
+}
+
+message FileTransferDetails {
+  string local_path = 1;
+  string remote_path = 2;
+  bool upload = 3;
+  uint64 total_bytes = 4;
+  uint64 transferred_bytes = 5;
+  uint32 files_total = 6;
+  uint32 files_done = 7;
+  uint32 files_failed = 8;
+}
+
+// Resource lifecycle events broadcast to all control clients
+message ResourceEvent {
+  string id = 1;
+  ResourceKind kind = 2;
+  ResourceState state = 3;
+  string reason = 4;
+  ResourceStats stats = 5;
+}

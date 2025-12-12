@@ -12,7 +12,7 @@ use qsh_core::error::{Error, Result};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
-use super::client::ControlClient;
+use super::ControlClient;
 
 /// Run an interactive REPL for control commands.
 ///

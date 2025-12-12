@@ -495,6 +495,152 @@ async fn run_control_command(
                 }
             }
         }
+        Command::File(file_cmd) => {
+            use qsh_client::cli::{FileAction, FilePath};
+            use qsh_client::control::proto::FileTransferOptions;
+
+            let session_name = resolve_session_name(cli)?;
+            let mut client = ControlClient::connect(&session_name).await?;
+
+            match &file_cmd.action {
+                FileAction::Upload(args) => {
+                    let options = FileTransferOptions {
+                        recursive: args.recursive,
+                        resume: args.resume,
+                        delta: args.delta && !args.no_delta,
+                        compress: args.compress && !args.no_compress,
+                        parallel: args.parallel,
+                        skip_unchanged: args.skip_unchanged,
+                    };
+
+                    let info = client
+                        .upload_file(
+                            args.local_path.to_string_lossy().as_ref(),
+                            &args.remote_path,
+                            options,
+                        )
+                        .await?;
+
+                    println!("Started upload: {}", info.id);
+                    if let qsh_client::control::ResourceDetails::FileTransfer(f) = &info.details {
+                        println!("  {} -> {}", f.local_path, f.remote_path);
+                    }
+                    Ok(0)
+                }
+                FileAction::Download(args) => {
+                    let options = FileTransferOptions {
+                        recursive: args.recursive,
+                        resume: args.resume,
+                        delta: args.delta && !args.no_delta,
+                        compress: args.compress && !args.no_compress,
+                        parallel: args.parallel,
+                        skip_unchanged: args.skip_unchanged,
+                    };
+
+                    let info = client
+                        .download_file(
+                            &args.remote_path,
+                            args.local_path.to_string_lossy().as_ref(),
+                            options,
+                        )
+                        .await?;
+
+                    println!("Started download: {}", info.id);
+                    if let qsh_client::control::ResourceDetails::FileTransfer(f) = &info.details {
+                        println!("  {} -> {}", f.remote_path, f.local_path);
+                    }
+                    Ok(0)
+                }
+                FileAction::Cp(args) => {
+                    // Auto-detect direction from paths
+                    let source = FilePath::parse(&args.source);
+                    let dest = FilePath::parse(&args.dest);
+
+                    let options = FileTransferOptions {
+                        recursive: args.recursive,
+                        resume: args.resume,
+                        delta: args.delta && !args.no_delta,
+                        compress: args.compress && !args.no_compress,
+                        parallel: args.parallel,
+                        skip_unchanged: args.skip_unchanged,
+                    };
+
+                    match (&source, &dest) {
+                        (FilePath::Local(local), FilePath::Remote { path: remote, .. }) => {
+                            // Upload
+                            let info = client
+                                .upload_file(
+                                    local.to_string_lossy().as_ref(),
+                                    remote,
+                                    options,
+                                )
+                                .await?;
+                            println!("Started upload: {}", info.id);
+                        }
+                        (FilePath::Remote { path: remote, .. }, FilePath::Local(local)) => {
+                            // Download
+                            let info = client
+                                .download_file(
+                                    remote,
+                                    local.to_string_lossy().as_ref(),
+                                    options,
+                                )
+                                .await?;
+                            println!("Started download: {}", info.id);
+                        }
+                        (FilePath::Local(_), FilePath::Local(_)) => {
+                            eprintln!("Both source and destination are local paths");
+                            eprintln!("For local copy, use 'cp' command");
+                            return Ok(1);
+                        }
+                        (FilePath::Remote { .. }, FilePath::Remote { .. }) => {
+                            eprintln!("Remote-to-remote copy not supported");
+                            return Ok(1);
+                        }
+                    }
+                    Ok(0)
+                }
+                FileAction::List => {
+                    let transfers = client.list_file_transfers().await?;
+
+                    if transfers.is_empty() {
+                        println!("No active file transfers");
+                    } else {
+                        println!("Active file transfers:");
+                        for info in transfers {
+                            print!("  {} [{:?}]", info.id, info.state);
+                            if let qsh_client::control::ResourceDetails::FileTransfer(f) = &info.details {
+                                let direction = if f.upload { "upload" } else { "download" };
+                                print!(" {} ", direction);
+                                if f.upload {
+                                    print!("{} -> {}", f.local_path, f.remote_path);
+                                } else {
+                                    print!("{} -> {}", f.remote_path, f.local_path);
+                                }
+                                if f.total_bytes > 0 {
+                                    let pct = (f.transferred_bytes as f64 / f.total_bytes as f64) * 100.0;
+                                    print!(" ({:.1}%)", pct);
+                                }
+                            }
+                            println!();
+                        }
+                    }
+                    Ok(0)
+                }
+                FileAction::Cancel(args) => {
+                    // Use resource ID format
+                    let resource_id = if args.transfer_id.starts_with("xfer-") {
+                        args.transfer_id.clone()
+                    } else {
+                        format!("xfer-{}", args.transfer_id)
+                    };
+
+                    client.cancel_file_transfer(&resource_id).await?;
+                    println!("Canceled file transfer: {}", resource_id);
+                    Ok(0)
+                }
+            }
+        }
     }
 }
 

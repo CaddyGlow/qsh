@@ -2279,9 +2279,78 @@ async fn handle_unified_command(
 
                     command_error(request_id, event_seq, proto::ErrorCode::Internal, "Terminal created but info unavailable")
                 }
-                Some(proto::resource_create::Params::FileTransfer(_params)) => {
-                    // File transfer creation - not yet implemented
-                    command_error(request_id, event_seq, proto::ErrorCode::Unspecified, "File transfer creation not yet implemented")
+                Some(proto::resource_create::Params::FileTransfer(params)) => {
+                    use crate::control::resources::FileTransfer;
+                    use qsh_core::protocol::TransferDirection;
+
+                    // Parse options
+                    let opts = params.options.unwrap_or_default();
+                    let transfer_opts = qsh_core::protocol::TransferOptions {
+                        compress: opts.compress,
+                        delta: opts.delta,
+                        delta_algo: if opts.delta {
+                            qsh_core::protocol::DeltaAlgo::RollingStreaming
+                        } else {
+                            qsh_core::protocol::DeltaAlgo::None
+                        },
+                        recursive: opts.recursive,
+                        preserve_mode: false,
+                        parallel: opts.parallel.max(1) as usize,
+                        skip_if_unchanged: opts.skip_unchanged,
+                    };
+
+                    let direction = if params.upload {
+                        TransferDirection::Upload
+                    } else {
+                        TransferDirection::Download
+                    };
+
+                    let local_path = std::path::PathBuf::from(&params.local_path);
+                    let remote_path = params.remote_path;
+                    let resume_from = if opts.resume { None } else { None }; // Resume handled at transfer level
+
+                    // Create the file transfer resource
+                    let id = match rm.add_with_factory(ResourceKind::FileTransfer, |id| {
+                        Box::new(FileTransfer::new(
+                            id,
+                            local_path,
+                            remote_path.clone(),
+                            direction,
+                            transfer_opts,
+                            resume_from,
+                        ))
+                    }).await {
+                        Ok(id) => id,
+                        Err(e) => return command_error(request_id, event_seq, proto::ErrorCode::Internal, &format!("Failed to create file transfer: {}", e)),
+                    };
+
+                    // Start the transfer
+                    if let Err(e) = rm.start(&id, conn.clone()).await {
+                        let _ = rm.close(&id).await;
+                        return command_error(request_id, event_seq, proto::ErrorCode::Internal, &format!("Failed to start file transfer: {}", e));
+                    }
+
+                    // Get the resource info to return
+                    if let Some(info) = rm.describe(&id).await {
+                        return Message {
+                            kind: Some(proto::message::Kind::Event(proto::Event {
+                                event_seq,
+                                evt: Some(proto::event::Evt::CommandResult(proto::CommandResult {
+                                    request_id,
+                                    result: Some(proto::command_result::Result::Ok(proto::CommandOk {
+                                        data: Some(proto::command_ok::Data::ResourceCreated(
+                                            proto::ResourceCreateResult {
+                                                resource_id: id,
+                                                info: Some(resource_info_to_proto(&info)),
+                                            },
+                                        )),
+                                    })),
+                                })),
+                            })),
+                        };
+                    }
+
+                    command_error(request_id, event_seq, proto::ErrorCode::Internal, "File transfer created but info unavailable")
                 }
                 None => {
                     command_error(request_id, event_seq, proto::ErrorCode::InvalidArgument, "Missing resource create params")
@@ -2425,6 +2494,179 @@ async fn handle_unified_command(
         | proto::command::Cmd::TerminalDetach(_)
         | proto::command::Cmd::TerminalResize(_) => {
             unreachable!("Terminal attachment commands are handled in Session::handle_terminal_*")
+        }
+
+        // File transfer commands
+        proto::command::Cmd::FileUpload(upload) => {
+            use crate::control::resources::FileTransfer;
+            use qsh_core::protocol::TransferDirection;
+
+            let Some(rm) = resource_manager else {
+                return command_error(request_id, event_seq, proto::ErrorCode::Unavailable, "Resource manager not available");
+            };
+
+            // Parse options
+            let opts = upload.options.unwrap_or_default();
+            let transfer_opts = qsh_core::protocol::TransferOptions {
+                compress: opts.compress,
+                delta: opts.delta,
+                delta_algo: if opts.delta {
+                    qsh_core::protocol::DeltaAlgo::RollingStreaming
+                } else {
+                    qsh_core::protocol::DeltaAlgo::None
+                },
+                recursive: opts.recursive,
+                preserve_mode: false,
+                parallel: opts.parallel.max(1) as usize,
+                skip_if_unchanged: opts.skip_unchanged,
+            };
+
+            // Create the file transfer resource
+            let local_path = std::path::PathBuf::from(&upload.local_path);
+            let remote_path = upload.remote_path;
+            let resume_from = if opts.resume { None } else { None }; // Resume handled at transfer level
+
+            let id = match rm.add_with_factory(ResourceKind::FileTransfer, |id| {
+                Box::new(FileTransfer::new(
+                    id,
+                    local_path,
+                    remote_path.clone(),
+                    TransferDirection::Upload,
+                    transfer_opts,
+                    resume_from,
+                ))
+            }).await {
+                Ok(id) => id,
+                Err(e) => return command_error(request_id, event_seq, proto::ErrorCode::Internal, &format!("Failed to create file transfer: {}", e)),
+            };
+
+            // Start the transfer
+            if let Err(e) = rm.start(&id, conn.clone()).await {
+                let _ = rm.close(&id).await;
+                return command_error(request_id, event_seq, proto::ErrorCode::Internal, &format!("Failed to start file transfer: {}", e));
+            }
+
+            // Get the resource info to return
+            if let Some(info) = rm.describe(&id).await {
+                return Message {
+                    kind: Some(proto::message::Kind::Event(proto::Event {
+                        event_seq,
+                        evt: Some(proto::event::Evt::CommandResult(proto::CommandResult {
+                            request_id,
+                            result: Some(proto::command_result::Result::Ok(proto::CommandOk {
+                                data: Some(proto::command_ok::Data::ResourceCreated(
+                                    proto::ResourceCreateResult {
+                                        resource_id: id,
+                                        info: Some(resource_info_to_proto(&info)),
+                                    },
+                                )),
+                            })),
+                        })),
+                    })),
+                };
+            }
+
+            command_error(request_id, event_seq, proto::ErrorCode::Internal, "File transfer created but info unavailable")
+        }
+
+        proto::command::Cmd::FileDownload(download) => {
+            use crate::control::resources::FileTransfer;
+            use qsh_core::protocol::TransferDirection;
+
+            let Some(rm) = resource_manager else {
+                return command_error(request_id, event_seq, proto::ErrorCode::Unavailable, "Resource manager not available");
+            };
+
+            // Parse options
+            let opts = download.options.unwrap_or_default();
+            let transfer_opts = qsh_core::protocol::TransferOptions {
+                compress: opts.compress,
+                delta: opts.delta,
+                delta_algo: if opts.delta {
+                    qsh_core::protocol::DeltaAlgo::RollingStreaming
+                } else {
+                    qsh_core::protocol::DeltaAlgo::None
+                },
+                recursive: opts.recursive,
+                preserve_mode: false,
+                parallel: opts.parallel.max(1) as usize,
+                skip_if_unchanged: opts.skip_unchanged,
+            };
+
+            // Create the file transfer resource
+            let local_path = std::path::PathBuf::from(&download.local_path);
+            let remote_path = download.remote_path;
+            let resume_from = if opts.resume { None } else { None }; // Resume handled at transfer level
+
+            let id = match rm.add_with_factory(ResourceKind::FileTransfer, |id| {
+                Box::new(FileTransfer::new(
+                    id,
+                    local_path,
+                    remote_path.clone(),
+                    TransferDirection::Download,
+                    transfer_opts,
+                    resume_from,
+                ))
+            }).await {
+                Ok(id) => id,
+                Err(e) => return command_error(request_id, event_seq, proto::ErrorCode::Internal, &format!("Failed to create file transfer: {}", e)),
+            };
+
+            // Start the transfer
+            if let Err(e) = rm.start(&id, conn.clone()).await {
+                let _ = rm.close(&id).await;
+                return command_error(request_id, event_seq, proto::ErrorCode::Internal, &format!("Failed to start file transfer: {}", e));
+            }
+
+            // Get the resource info to return
+            if let Some(info) = rm.describe(&id).await {
+                return Message {
+                    kind: Some(proto::message::Kind::Event(proto::Event {
+                        event_seq,
+                        evt: Some(proto::event::Evt::CommandResult(proto::CommandResult {
+                            request_id,
+                            result: Some(proto::command_result::Result::Ok(proto::CommandOk {
+                                data: Some(proto::command_ok::Data::ResourceCreated(
+                                    proto::ResourceCreateResult {
+                                        resource_id: id,
+                                        info: Some(resource_info_to_proto(&info)),
+                                    },
+                                )),
+                            })),
+                        })),
+                    })),
+                };
+            }
+
+            command_error(request_id, event_seq, proto::ErrorCode::Internal, "File transfer created but info unavailable")
+        }
+
+        proto::command::Cmd::FileCancel(cancel) => {
+            // FileCancel is just a ResourceClose for file transfer resources
+            if let Some(ref rm) = resource_manager {
+                // Verify it's a file transfer
+                if let Some(info) = rm.describe(&cancel.resource_id).await {
+                    if info.kind != ResourceKind::FileTransfer {
+                        return command_error(request_id, event_seq, proto::ErrorCode::InvalidArgument, "Resource is not a file transfer");
+                    }
+                }
+
+                if rm.close(&cancel.resource_id).await.is_ok() {
+                    return Message {
+                        kind: Some(proto::message::Kind::Event(proto::Event {
+                            event_seq,
+                            evt: Some(proto::event::Evt::CommandResult(proto::CommandResult {
+                                request_id,
+                                result: Some(proto::command_result::Result::Ok(proto::CommandOk {
+                                    data: None,
+                                })),
+                            })),
+                        })),
+                    };
+                }
+            }
+
+            command_error(request_id, event_seq, proto::ErrorCode::NotFound, "File transfer not found")
         }
 
         // Commands not yet implemented

@@ -293,6 +293,50 @@ impl ConnectionRegistry {
         *self.session_count_rx.borrow()
     }
 
+    /// List all active sessions as summaries for the control interface.
+    pub async fn list_sessions(&self) -> Vec<qsh_control::proto::SessionSummary> {
+        use std::time::UNIX_EPOCH;
+
+        let sessions = self.sessions.lock().await;
+        let mut summaries = Vec::with_capacity(sessions.len());
+
+        for session in sessions.values() {
+            let connected_at = session
+                .created_at
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            let client_addr = session.client_addr.lock().await.to_string();
+
+            // Get channel counts if handler is attached
+            let resource_count = if let Some(handler) = session.handler.lock().await.as_ref() {
+                let counts = handler.channel_counts().await;
+                (counts.terminals + counts.forwards + counts.file_transfers) as u32
+            } else {
+                0
+            };
+
+            // Format session ID as hex string
+            let session_id = session
+                .session_id
+                .0
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>();
+
+            summaries.push(qsh_control::proto::SessionSummary {
+                session_id,
+                socket_path: String::new(),  // Server sessions don't have local sockets
+                server_addr: client_addr,    // Use client_addr as the connection source
+                connected_at,
+                resource_count,
+            });
+        }
+
+        summaries
+    }
+
     /// Shutdown the registry.
     pub async fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);

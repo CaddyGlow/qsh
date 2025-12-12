@@ -133,6 +133,8 @@ pub enum Command {
     Forward(ForwardCommand),
     /// Manage terminals
     Terminal(TerminalCommand),
+    /// Manage file transfers
+    File(FileCommand),
     /// Query session status
     Status(StatusArgs),
     /// Interactive control REPL
@@ -218,6 +220,168 @@ pub struct ForwardForceCloseArgs {
     /// Forward ID to force close
     #[arg(value_name = "ID")]
     pub forward_id: String,
+}
+
+/// File transfer subcommands.
+#[derive(Debug, Parser)]
+pub struct FileCommand {
+    #[command(subcommand)]
+    pub action: FileAction,
+}
+
+/// File transfer actions.
+#[derive(Debug, Subcommand)]
+pub enum FileAction {
+    /// Upload a file to remote
+    Upload(FileUploadArgs),
+    /// Download a file from remote
+    Download(FileDownloadArgs),
+    /// Copy files (upload or download based on paths)
+    Cp(FileCpArgs),
+    /// List active file transfers
+    List,
+    /// Cancel a file transfer
+    Cancel(FileCancelArgs),
+}
+
+/// Arguments for file upload.
+#[derive(Debug, Parser)]
+pub struct FileUploadArgs {
+    /// Local file path
+    #[arg(value_name = "LOCAL")]
+    pub local_path: PathBuf,
+
+    /// Remote destination path
+    #[arg(value_name = "REMOTE")]
+    pub remote_path: String,
+
+    /// Recursive transfer (for directories)
+    #[arg(short = 'r', long)]
+    pub recursive: bool,
+
+    /// Enable delta transfer (send only differences)
+    #[arg(long, default_value_t = true)]
+    pub delta: bool,
+
+    /// Disable delta transfer
+    #[arg(long = "no-delta")]
+    pub no_delta: bool,
+
+    /// Enable compression
+    #[arg(short = 'z', long, default_value_t = true)]
+    pub compress: bool,
+
+    /// Disable compression
+    #[arg(long = "no-compress")]
+    pub no_compress: bool,
+
+    /// Resume interrupted transfer
+    #[arg(long)]
+    pub resume: bool,
+
+    /// Number of parallel transfers
+    #[arg(short = 'j', long, default_value_t = 4)]
+    pub parallel: u32,
+
+    /// Skip files that haven't changed
+    #[arg(long)]
+    pub skip_unchanged: bool,
+}
+
+/// Arguments for file download.
+#[derive(Debug, Parser)]
+pub struct FileDownloadArgs {
+    /// Remote file path
+    #[arg(value_name = "REMOTE")]
+    pub remote_path: String,
+
+    /// Local destination path
+    #[arg(value_name = "LOCAL")]
+    pub local_path: PathBuf,
+
+    /// Recursive transfer (for directories)
+    #[arg(short = 'r', long)]
+    pub recursive: bool,
+
+    /// Enable delta transfer (send only differences)
+    #[arg(long, default_value_t = true)]
+    pub delta: bool,
+
+    /// Disable delta transfer
+    #[arg(long = "no-delta")]
+    pub no_delta: bool,
+
+    /// Enable compression
+    #[arg(short = 'z', long, default_value_t = true)]
+    pub compress: bool,
+
+    /// Disable compression
+    #[arg(long = "no-compress")]
+    pub no_compress: bool,
+
+    /// Resume interrupted transfer
+    #[arg(long)]
+    pub resume: bool,
+
+    /// Number of parallel transfers
+    #[arg(short = 'j', long, default_value_t = 4)]
+    pub parallel: u32,
+
+    /// Skip files that haven't changed
+    #[arg(long)]
+    pub skip_unchanged: bool,
+}
+
+/// Arguments for file copy (auto-detect direction).
+#[derive(Debug, Parser)]
+pub struct FileCpArgs {
+    /// Source path (local or remote with host:path syntax)
+    #[arg(value_name = "SOURCE")]
+    pub source: String,
+
+    /// Destination path (local or remote with host:path syntax)
+    #[arg(value_name = "DEST")]
+    pub dest: String,
+
+    /// Recursive transfer (for directories)
+    #[arg(short = 'r', long)]
+    pub recursive: bool,
+
+    /// Enable delta transfer (send only differences)
+    #[arg(long, default_value_t = true)]
+    pub delta: bool,
+
+    /// Disable delta transfer
+    #[arg(long = "no-delta")]
+    pub no_delta: bool,
+
+    /// Enable compression
+    #[arg(short = 'z', long, default_value_t = true)]
+    pub compress: bool,
+
+    /// Disable compression
+    #[arg(long = "no-compress")]
+    pub no_compress: bool,
+
+    /// Resume interrupted transfer
+    #[arg(long)]
+    pub resume: bool,
+
+    /// Number of parallel transfers
+    #[arg(short = 'j', long, default_value_t = 4)]
+    pub parallel: u32,
+
+    /// Skip files that haven't changed
+    #[arg(long)]
+    pub skip_unchanged: bool,
+}
+
+/// Arguments for canceling a file transfer.
+#[derive(Debug, Parser)]
+pub struct FileCancelArgs {
+    /// File transfer ID to cancel
+    #[arg(value_name = "ID")]
+    pub transfer_id: String,
 }
 
 /// Arguments for status query.

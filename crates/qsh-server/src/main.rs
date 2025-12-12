@@ -17,7 +17,7 @@ use qsh_core::error::Error;
 use qsh_core::protocol::{Capabilities, HeartbeatPayload, Message};
 use qsh_core::transport::generate_self_signed_cert;
 use qsh_server::listener::{QshListener, ServerConfig};
-use qsh_server::{BootstrapServer, Cli, ConnectionConfig, SessionAuthorizer, SessionConfig};
+use qsh_server::{BootstrapServer, Cli, ConnectionConfig, ServerControlHandler, ServerInfo, SessionAuthorizer, SessionConfig};
 
 #[cfg(feature = "standalone")]
 use qsh_server::{StandaloneAuthenticator, StandaloneConfig};
@@ -302,17 +302,58 @@ async fn run_server(cli: &Cli, bind_addr: SocketAddr) -> qsh_core::Result<()> {
     // Build server config
     let server_config = ServerConfig {
         bind_addr,
-        cert_pem,
+        cert_pem: cert_pem.clone(),
         key_pem,
         session_config,
         conn_config,
         bootstrap_mode: false,
     };
 
-    // Create and run listener
-    let listener = QshListener::bind(server_config).await?;
-    info!("Server listening on {}", listener.local_addr());
-    listener.run(false).await
+    // Create session authorizer for control socket enrollment
+    let authorizer = Arc::new(SessionAuthorizer::new());
+
+    // Create listener with authorizer
+    let listener = QshListener::bind(server_config).await?.with_authorizer(Arc::clone(&authorizer));
+    let local_addr = listener.local_addr();
+    info!("Server listening on {}", local_addr);
+
+    // Compute certificate hash for enrollment responses
+    let cert_hash = qsh_core::transport::cert_hash(&cert_pem);
+
+    // Build server info for control socket
+    let server_info = ServerInfo {
+        server_addr: local_addr.ip().to_string(),
+        server_port: local_addr.port() as u32,
+        cert_hash,
+        connect_mode: format!("{:?}", cli.connect_mode).to_lowercase(),
+    };
+
+    // Try to bind control socket (non-fatal if it fails)
+    let control_handler = match ServerControlHandler::bind(
+        Arc::clone(listener.registry()),
+        authorizer,
+        server_info,
+    ) {
+        Ok(handler) => Some(handler),
+        Err(e) => {
+            warn!("Failed to bind control socket: {} (continuing without control interface)", e);
+            None
+        }
+    };
+
+    // Run listener and control handler concurrently
+    if let Some(control) = control_handler {
+        tokio::select! {
+            result = listener.run(false) => result,
+            result = control.run() => {
+                // Control handler exiting is unexpected but not fatal
+                warn!("Control handler exited: {:?}", result);
+                Ok(())
+            }
+        }
+    } else {
+        listener.run(false).await
+    }
 }
 
 /// Run the server in initiator mode (SSH-out to client).

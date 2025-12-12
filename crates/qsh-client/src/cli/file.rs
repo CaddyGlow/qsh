@@ -17,9 +17,12 @@ pub enum FilePath {
     },
 }
 
-impl CpCli {
-    /// Parse a source/dest string into a FilePath.
-    pub fn parse_path(s: &str) -> FilePath {
+impl FilePath {
+    /// Parse a string into a FilePath.
+    ///
+    /// Remote paths use the format: `[user@]host:path`
+    /// Local paths are anything else.
+    pub fn parse(s: &str) -> FilePath {
         // Check for remote path: [user@]host:path
         // Be careful: Windows paths like C:\foo are not remote
         if let Some(colon_pos) = s.find(':') {
@@ -56,6 +59,13 @@ impl CpCli {
         }
 
         FilePath::Local(PathBuf::from(s))
+    }
+}
+
+impl CpCli {
+    /// Parse a source/dest string into a FilePath.
+    pub fn parse_path(s: &str) -> FilePath {
+        FilePath::parse(s)
     }
 
     /// Get parsed source path.

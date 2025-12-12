@@ -211,7 +211,7 @@ impl FileTransferOptions {
             },
             recursive: self.recursive,
             preserve_mode: false,
-            parallel: self.parallel.max(1),
+            parallel: self.parallel.max(1) as usize,
             skip_if_unchanged: self.skip_unchanged,
         }
     }
