@@ -9,6 +9,7 @@
 //! - `ResourceInfo`: Descriptive information about a resource
 //! - `ResourceKind`: Type discriminant for resources
 
+use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -360,6 +361,14 @@ pub trait Resource: Send + Sync + 'static {
     /// Resources can attempt to rebind/resume. Returns Ok if successful,
     /// Err if the resource should be marked as failed.
     async fn on_reconnect(&mut self, conn: Arc<ChannelConnection>) -> Result<(), ResourceError>;
+
+    /// Return self as Any for downcasting to concrete types.
+    ///
+    /// This allows accessing resource-specific methods like Terminal::attach().
+    fn as_any(&self) -> &dyn Any;
+
+    /// Return self as mutable Any for downcasting to concrete types.
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 /// Errors that can occur during resource operations.
@@ -604,6 +613,14 @@ impl Resource for StubResource {
             return Err(err);
         }
         Ok(())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 

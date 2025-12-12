@@ -361,16 +361,9 @@ impl ConnectionHandler {
             );
         }
 
-        // If no channels remain, trigger session shutdown
+        // Connection stays open - only close on explicit Shutdown message from client
         if remaining_count == 0 {
-            info!("All channels closed, triggering session shutdown");
-            // Close the QUIC connection to wake up any pending recv_control() call in the session loop
-            self.quic.read().await.close_connection().await;
-            let _ = self
-                .shutdown_tx
-                .lock()
-                .await
-                .try_send(super::ShutdownReason::AllChannelsClosed);
+            debug!("All channels closed, connection staying open for new channel requests");
         }
     }
 

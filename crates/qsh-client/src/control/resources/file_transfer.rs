@@ -3,6 +3,7 @@
 //! Wraps the transfer engine from `crate::transfer` as a Resource for the
 //! control plane.
 
+use std::any::Any;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
@@ -342,6 +343,14 @@ impl Resource for FileTransfer {
         Err(ResourceError::Internal(
             "file transfers cannot be automatically resumed after reconnection".to_string(),
         ))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 

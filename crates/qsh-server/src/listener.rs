@@ -375,7 +375,7 @@ async fn run_session_loop(
         session_id = ?handler.session_id(),
         addr = %remote_addr,
         rtt = ?rtt,
-        "Channel model session started"
+        "Session started"
     );
 
     let quic = handler.quic().await;

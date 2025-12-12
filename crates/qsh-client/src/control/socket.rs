@@ -43,6 +43,28 @@ pub fn socket_path(name: &str) -> PathBuf {
     PathBuf::from(format!("/tmp/qsh-{}-{}.sock", uid, name))
 }
 
+/// Get the session directory path where per-session sockets are stored.
+///
+/// For a session named "foo", returns the directory containing sockets like:
+/// - foo.sock (control socket)
+/// - foo/term-0.io.sock (terminal I/O socket)
+///
+/// Creates the directory if it doesn't exist.
+pub fn session_dir(name: &str) -> PathBuf {
+    if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        let dir = PathBuf::from(xdg_runtime).join("qsh").join(name);
+        if std::fs::create_dir_all(&dir).is_ok() {
+            return dir;
+        }
+    }
+
+    // Fallback to /tmp/<session>
+    let uid = unsafe { libc::geteuid() };
+    let dir = PathBuf::from(format!("/tmp/qsh-{}-{}", uid, name));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 /// Create a control socket and return a guard plus listener.
 ///
 /// The socket file is removed automatically when the guard is dropped.

@@ -78,16 +78,8 @@ fn test_describe() {
 // and are better suited for end-to-end tests. These tests focus on the
 // resource structure and state management.
 
-#[tokio::test]
-async fn test_attach_detach_without_connection() {
-    let params = make_params(80, 24, None);
-
-    let terminal = Terminal::new("term-3".to_string(), params);
-
-    // Attempting to attach to a terminal in Pending state should fail
-    let result = terminal.attach().await;
-    assert!(result.is_err());
-}
+// Note: attach/detach tests removed - with raw I/O sockets, attachment
+// happens automatically when a client connects to the terminal's socket.
 
 #[tokio::test]
 async fn test_resize_without_connection() {
@@ -105,5 +97,5 @@ async fn test_is_attached() {
     let params = make_params(80, 24, None);
 
     let terminal = Terminal::new("term-5".to_string(), params);
-    assert!(!terminal.is_attached().await);
+    assert!(!terminal.is_attached());
 }

@@ -3,6 +3,7 @@
 //! Wraps the existing forward module implementations (LocalForwarder, RemoteForwarder,
 //! Socks5Proxy) to integrate with the unified resource control plane.
 
+use std::any::Any;
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 
@@ -367,6 +368,14 @@ impl Resource for Forward {
                 Err(e)
             }
         }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 

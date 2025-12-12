@@ -179,11 +179,9 @@ async fn execute_command(client: &mut ControlClient, line: &str) -> Result<bool>
                 eprintln!("Usage: attach <resource_id>");
                 return Ok(false);
             }
-            let info = client.attach_terminal(parts[1]).await?;
-            println!("Attached to: {}", info.id);
-            if let crate::control::ResourceDetails::Terminal(t) = &info.details {
-                println!("Terminal size: {}x{}", t.cols, t.rows);
-            }
+            let socket_path = client.attach_terminal(parts[1]).await?;
+            println!("Terminal I/O socket: {}", socket_path.display());
+            println!("Connect with: socat - UNIX-CONNECT:{}", socket_path.display());
         }
         "detach" => {
             if parts.len() < 2 {

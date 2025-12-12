@@ -29,6 +29,7 @@
 //! - `Event`: Server-to-client notifications (including command results)
 //! - `Stream`: Bidirectional data (e.g., terminal I/O)
 
+pub mod attachment;
 pub mod client;
 pub mod commands;
 pub mod manager;
@@ -39,13 +40,14 @@ pub mod resources;
 pub mod socket;
 
 // Re-export main types
+pub use attachment::{AttachmentRegistry, AttachError};
 pub use client::ControlClient;
 pub use commands::{
     ConnectionState, ForwardAddCommand, SessionState, TerminalCommand, TerminalAttachChannels,
     TerminalState,
 };
 pub use repl::{run_repl, list_sessions, discover_latest_session, SessionInfo};
-pub use socket::{ControlSocket, ControlSocketGuard, ControlEvent, socket_path};
+pub use socket::{ControlSocket, ControlSocketGuard, ControlEvent, socket_path, session_dir};
 
 // Re-export new resource control types
 pub use manager::ResourceManager;

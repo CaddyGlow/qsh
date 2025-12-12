@@ -36,8 +36,7 @@ use qsh_core::constants::{DEFAULT_MAX_FORWARDS, FORWARD_BUFFER_SIZE, IDLE_TIMEOU
 use qsh_core::error::{Error, Result};
 use qsh_core::handshake::{HandshakeConfig, handshake_initiate, handshake_respond};
 use qsh_core::protocol::{
-    Capabilities, Message, ResizePayload, SessionId, ShutdownPayload, ShutdownReason,
-    TermSize,
+    Capabilities, Message, ResizePayload, SessionId, ShutdownPayload, ShutdownReason, TermSize,
 };
 use qsh_core::transport::{
     ConnectConfig, Connection, QuicConnection, QuicSender, QuicStream, StreamPair, connect_quic,
@@ -288,14 +287,16 @@ impl ChannelConnection {
         let handshake_config = config.to_handshake_config(resume_session);
         let handshake_result = match config.connect_mode {
             ConnectMode::Initiate => handshake_initiate(&mut control, &handshake_config).await?,
-            ConnectMode::Respond => handshake_respond(&mut control, &handshake_config, None).await?,
+            ConnectMode::Respond => {
+                handshake_respond(&mut control, &handshake_config, None).await?
+            }
         };
 
         let has_existing = !handshake_result.existing_channels.is_empty();
         info!(
             session_id = ?handshake_result.session_id,
             existing_channels = handshake_result.existing_channels.len(),
-            "Channel model session established"
+            "Session established"
         );
 
         // Extract sender before wrapping in Mutex (allows concurrent send/recv)
@@ -329,10 +330,18 @@ impl ChannelConnection {
                     let (_stream_type, output_stream) = loop {
                         let (ty, stream) = quic.accept_stream().await?;
                         match ty {
-                            StreamType::ChannelOut(id) if id == existing.channel_id => break (ty, stream),
-                            StreamType::ChannelIn(id) if id == existing.channel_id => break (ty, stream),
-                            StreamType::ChannelBidi(id) if id == existing.channel_id => break (ty, stream),
-                            other => debug!(?other, "Ignoring stream while restoring terminal output"),
+                            StreamType::ChannelOut(id) if id == existing.channel_id => {
+                                break (ty, stream);
+                            }
+                            StreamType::ChannelIn(id) if id == existing.channel_id => {
+                                break (ty, stream);
+                            }
+                            StreamType::ChannelBidi(id) if id == existing.channel_id => {
+                                break (ty, stream);
+                            }
+                            other => {
+                                debug!(?other, "Ignoring stream while restoring terminal output")
+                            }
                         }
                     };
 
@@ -442,13 +451,23 @@ impl ChannelConnection {
                 }
                 Message::ChannelAccept(accept) => {
                     // Different channel - dispatch to pending accepts
-                    if let Some(tx) = self.pending_channel_accepts.lock().await.remove(&accept.channel_id) {
+                    if let Some(tx) = self
+                        .pending_channel_accepts
+                        .lock()
+                        .await
+                        .remove(&accept.channel_id)
+                    {
                         let _ = tx.send(Ok(accept.data));
                     }
                 }
                 Message::ChannelReject(reject) => {
                     // Different channel - dispatch to pending accepts
-                    if let Some(tx) = self.pending_channel_accepts.lock().await.remove(&reject.channel_id) {
+                    if let Some(tx) = self
+                        .pending_channel_accepts
+                        .lock()
+                        .await
+                        .remove(&reject.channel_id)
+                    {
                         let _ = tx.send(Err(Error::Protocol {
                             message: format!("Channel rejected: {}", reject.message),
                         }));
@@ -456,7 +475,12 @@ impl ChannelConnection {
                 }
                 Message::GlobalReply(reply) => {
                     // Dispatch to pending global requests
-                    if let Some(tx) = self.pending_global_requests.lock().await.remove(&reply.request_id) {
+                    if let Some(tx) = self
+                        .pending_global_requests
+                        .lock()
+                        .await
+                        .remove(&reply.request_id)
+                    {
                         let _ = tx.send(reply.result);
                     }
                 }
@@ -465,7 +489,10 @@ impl ChannelConnection {
                     // The Session event loop will handle them later
                 }
                 other => {
-                    debug!(?other, "Ignoring control message while waiting for ChannelAccept");
+                    debug!(
+                        ?other,
+                        "Ignoring control message while waiting for ChannelAccept"
+                    );
                 }
             }
         }
@@ -604,7 +631,10 @@ impl ChannelConnection {
 
         // Register oneshot channel BEFORE sending ChannelOpen (avoid race)
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending_channel_accepts.lock().await.insert(channel_id, tx);
+        self.pending_channel_accepts
+            .lock()
+            .await
+            .insert(channel_id, tx);
 
         // Send ChannelOpen
         let open = ChannelOpenPayload {
@@ -662,13 +692,18 @@ impl ChannelConnection {
         };
 
         // Send the request (using control_sender to avoid locking recv)
-        self.control_sender.send(&Message::GlobalRequest(payload)).await?;
+        self.control_sender
+            .send(&Message::GlobalRequest(payload))
+            .await?;
 
         // Wait for the reply (will be sent by Session::run() event loop)
         match rx.await {
             Ok(result) => Ok(result),
             Err(_) => Err(qsh_core::Error::Protocol {
-                message: format!("Global request sender dropped for request_id {}", request_id),
+                message: format!(
+                    "Global request sender dropped for request_id {}",
+                    request_id
+                ),
             }),
         }
     }

@@ -1218,10 +1218,17 @@ pub struct Session {
     resource_manager: Option<crate::control::ResourceManager>,
     /// Resource event receiver for broadcasting to control clients.
     resource_event_rx: Option<tokio::sync::broadcast::Receiver<crate::control::ResourceEvent>>,
+    /// Attachment registry for terminal I/O bindings.
+    attachment_registry: crate::control::AttachmentRegistry,
+    /// Channel for terminal output forwarding tasks to send messages back.
+    control_output_tx: tokio::sync::mpsc::UnboundedSender<(usize, crate::control::proto::Message)>,
+    /// Receiver for messages from terminal output forwarding tasks.
+    control_output_rx: tokio::sync::mpsc::UnboundedReceiver<(usize, crate::control::proto::Message)>,
 }
 
 impl Session {
     pub fn new(connection: std::sync::Arc<ReconnectableConnection>, parts: SessionParts) -> Self {
+        let (control_output_tx, control_output_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             connection,
             parts,
@@ -1231,6 +1238,9 @@ impl Session {
             connected_at: None,
             resource_manager: None,
             resource_event_rx: None,
+            attachment_registry: crate::control::AttachmentRegistry::new(),
+            control_output_tx,
+            control_output_rx,
         }
     }
 
@@ -1268,6 +1278,160 @@ impl Session {
     pub fn with_session_name(mut self, name: String) -> Self {
         self.session_name = Some(name);
         self
+    }
+
+    /// Handle TerminalAttach command.
+    ///
+    /// Returns the Unix socket path for raw terminal I/O.
+    /// Clients connect directly to this socket for low-latency terminal access.
+    async fn handle_terminal_attach(
+        &mut self,
+        _client_id: usize,
+        request_id: u32,
+        resource_id: &str,
+    ) -> crate::control::proto::Message {
+        use crate::control::proto;
+
+        // Check if resource manager exists
+        let rm = match self.resource_manager.as_ref() {
+            Some(rm) => rm,
+            None => {
+                return command_error(request_id, 0, proto::ErrorCode::Internal, "Resource manager not initialized");
+            }
+        };
+
+        let event_seq = rm.next_event_seq().await;
+
+        // Verify it exists and is a terminal
+        let info = match rm.describe(resource_id).await {
+            Some(info) if matches!(info.kind, crate::control::ResourceKind::Terminal) => info,
+            Some(_) => {
+                return command_error(request_id, event_seq, proto::ErrorCode::InvalidArgument, "Resource is not a terminal");
+            }
+            None => {
+                return command_error(request_id, event_seq, proto::ErrorCode::NotFound, "Terminal not found");
+            }
+        };
+
+        // Get the I/O socket path
+        let socket_path = match rm.terminal_io_socket(resource_id).await {
+            Ok(path) => path,
+            Err(e) => {
+                return command_error(request_id, event_seq, proto::ErrorCode::Internal, &e.to_string());
+            }
+        };
+
+        tracing::info!(
+            resource_id = %resource_id,
+            socket_path = %socket_path.display(),
+            "Returning terminal I/O socket path"
+        );
+
+        // Return success with socket path
+        proto::Message {
+            kind: Some(proto::message::Kind::Event(proto::Event {
+                event_seq,
+                evt: Some(proto::event::Evt::CommandResult(proto::CommandResult {
+                    request_id,
+                    result: Some(proto::command_result::Result::Ok(proto::CommandOk {
+                        data: Some(proto::command_ok::Data::TerminalAttach(
+                            proto::TerminalAttachResult {
+                                resource_id: info.id.clone(),
+                                io_socket_path: socket_path.to_string_lossy().to_string(),
+                            },
+                        )),
+                    })),
+                })),
+            })),
+        }
+    }
+
+    /// Handle TerminalDetach command.
+    ///
+    /// With raw I/O sockets, detach is essentially a no-op on the server side.
+    /// Clients just disconnect from the I/O socket directly.
+    async fn handle_terminal_detach(
+        &mut self,
+        _client_id: usize,
+        request_id: u32,
+        resource_id: &str,
+    ) -> crate::control::proto::Message {
+        use crate::control::proto;
+
+        let event_seq = match self.resource_manager.as_ref() {
+            Some(rm) => rm.next_event_seq().await,
+            None => 0,
+        };
+
+        // Verify the resource exists
+        if let Some(ref rm) = self.resource_manager {
+            if rm.describe(resource_id).await.is_none() {
+                return command_error(request_id, event_seq, proto::ErrorCode::NotFound, "Terminal not found");
+            }
+        }
+
+        tracing::info!(
+            resource_id = %resource_id,
+            "Terminal detach acknowledged (client disconnects from I/O socket directly)"
+        );
+
+        // Return success
+        proto::Message {
+            kind: Some(proto::message::Kind::Event(proto::Event {
+                event_seq,
+                evt: Some(proto::event::Evt::CommandResult(proto::CommandResult {
+                    request_id,
+                    result: Some(proto::command_result::Result::Ok(proto::CommandOk {
+                        data: None,
+                    })),
+                })),
+            })),
+        }
+    }
+
+    /// Handle TerminalResize command.
+    async fn handle_terminal_resize(
+        &mut self,
+        request_id: u32,
+        resource_id: &str,
+        cols: u32,
+        rows: u32,
+    ) -> crate::control::proto::Message {
+        use crate::control::proto;
+
+        let event_seq = match self.resource_manager.as_ref() {
+            Some(rm) => rm.next_event_seq().await,
+            None => 0,
+        };
+
+        // Call terminal_resize on the resource manager
+        if let Some(ref rm) = self.resource_manager {
+            if let Err(e) = rm.terminal_resize(resource_id, cols, rows).await {
+                return command_error(request_id, event_seq, proto::ErrorCode::NotFound, &e.to_string());
+            }
+        } else {
+            return command_error(request_id, event_seq, proto::ErrorCode::Internal, "Resource manager not initialized");
+        }
+
+        tracing::debug!(
+            resource_id = %resource_id,
+            cols,
+            rows,
+            "Terminal resized via control socket"
+        );
+
+        // Return success
+        proto::Message {
+            kind: Some(proto::message::Kind::Event(proto::Event {
+                event_seq,
+                evt: Some(proto::event::Evt::CommandResult(proto::CommandResult {
+                    request_id,
+                    result: Some(proto::command_result::Result::Ok(proto::CommandOk {
+                        data: None,
+                    })),
+                })),
+            })),
+        }
     }
 
     /// Construct session from CLI arguments.
@@ -1840,22 +2004,38 @@ impl Session {
                                     tracing::debug!(client_id, "Control client connected");
                                 }
                                 ControlEvent::Command { client_id, request_id, cmd } => {
-                                    // Handle unified protocol commands
-                                    let heartbeat_srtt = heartbeat.tracker.srtt();
-                                    let server_addr = self.connection.server_addr().to_string();
-                                    let connected_at_secs = self.connected_at
-                                        .map(|t| t.elapsed().as_secs())
-                                        .unwrap_or(0);
+                                    // Handle terminal attachment commands specially since they need
+                                    // access to the attachment registry
+                                    let response = match &cmd {
+                                        proto::command::Cmd::TerminalAttach(attach) => {
+                                            self.handle_terminal_attach(client_id, request_id, &attach.resource_id).await
+                                        }
+                                        proto::command::Cmd::TerminalDetach(detach) => {
+                                            self.handle_terminal_detach(client_id, request_id, &detach.resource_id).await
+                                        }
+                                        proto::command::Cmd::TerminalResize(resize) => {
+                                            self.handle_terminal_resize(request_id, &resize.resource_id, resize.cols, resize.rows).await
+                                        }
+                                        _ => {
+                                            // Handle other unified protocol commands
+                                            let heartbeat_srtt = heartbeat.tracker.srtt();
+                                            let server_addr = self.connection.server_addr().to_string();
+                                            let connected_at_secs = self.connected_at
+                                                .map(|t| t.elapsed().as_secs())
+                                                .unwrap_or(0);
 
-                                    let response = handle_unified_command(
-                                        request_id,
-                                        cmd,
-                                        self.resource_manager.as_ref(),
-                                        &conn,
-                                        &server_addr,
-                                        connected_at_secs,
-                                        heartbeat_srtt,
-                                    ).await;
+                                            handle_unified_command(
+                                                request_id,
+                                                cmd,
+                                                self.resource_manager.as_ref(),
+                                                &conn,
+                                                &server_addr,
+                                                connected_at_secs,
+                                                heartbeat_srtt,
+                                                self.session_name.as_deref(),
+                                            ).await
+                                        }
+                                    };
 
                                     if let Some(ctl) = self.control.as_mut() {
                                         if let Err(e) = ctl.send_message(client_id, response).await {
@@ -1866,19 +2046,16 @@ impl Session {
                                 ControlEvent::Stream { client_id, stream } => {
                                     // Handle terminal I/O streams
                                     if stream.stream_kind == proto::StreamKind::TerminalIo as i32 {
-                                        let resource_id = stream.resource_id.clone();
                                         let data = stream.data;
 
-                                        // Forward input to the terminal resource
-                                        // Note: Stream I/O is handled through the terminal's attached channels
-                                        // which are managed by the Terminal resource itself after attach
-                                        tracing::debug!(
-                                            client_id,
-                                            resource_id = %resource_id,
-                                            bytes = data.len(),
-                                            "Received terminal stream from control client"
-                                        );
-                                        // TODO: Forward to terminal input channel through attached client registry
+                                        // Forward input to the terminal via attachment registry
+                                        if let Err(e) = self.attachment_registry.send_input(client_id, data) {
+                                            tracing::warn!(
+                                                client_id,
+                                                error = %e,
+                                                "Failed to forward terminal input"
+                                            );
+                                        }
                                     }
                                 }
                                 ControlEvent::ClientDisconnected { client_id, error } => {
@@ -1887,8 +2064,18 @@ impl Session {
                                     } else {
                                         tracing::debug!(client_id, "Control client disconnected");
                                     }
-                                    // TODO: Detach terminal if this client was attached
+                                    // Note: Terminal I/O uses raw Unix sockets, so clients
+                                    // disconnect directly from the I/O socket. No cleanup needed here.
                                 }
+                            }
+                        }
+                    }
+
+                    // Terminal output forwarding - messages from output_rx tasks
+                    Some((client_id, message)) = self.control_output_rx.recv() => {
+                        if let Some(ref mut ctl) = self.control {
+                            if let Err(e) = ctl.send_message(client_id, message).await {
+                                tracing::warn!(client_id, error = %e, "Failed to send terminal output to control client");
                             }
                         }
                     }
@@ -1951,6 +2138,7 @@ async fn handle_unified_command(
     server_addr: &str,
     connected_at: u64,
     srtt: Option<Duration>,
+    session_name: Option<&str>,
 ) -> crate::control::Message {
     use crate::control::{proto, resource_info_to_proto, Forward, ForwardParams, ForwardType, Message, ResourceKind};
 
@@ -2015,10 +2203,67 @@ async fn handle_unified_command(
 
                     command_error(request_id, event_seq, proto::ErrorCode::Internal, "Forward created but info unavailable")
                 }
-                Some(proto::resource_create::Params::Terminal(_params)) => {
-                    // Terminal creation via control socket - not yet implemented
-                    // Terminals are typically created at session start
-                    command_error(request_id, event_seq, proto::ErrorCode::Unspecified, "Terminal creation via control socket not yet implemented")
+                Some(proto::resource_create::Params::Terminal(params)) => {
+                    use crate::control::resources::Terminal;
+
+                    // Create the terminal resource
+                    let terminal = Terminal::from_params(
+                        String::new(), // ID will be assigned by add_with_factory
+                        if params.cols > 0 { Some(params.cols) } else { None },
+                        if params.rows > 0 { Some(params.rows) } else { None },
+                        if params.term_type.is_empty() { None } else { Some(params.term_type) },
+                        if params.shell.is_empty() { None } else { Some(params.shell) },
+                        if params.command.is_empty() { None } else { Some(params.command) },
+                        params.env.into_iter().map(|e| (e.key, e.value)).collect(),
+                    );
+
+                    // Get session directory for terminal I/O socket
+                    let sess_dir = session_name
+                        .map(|name| crate::control::session_dir(name))
+                        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+
+                    // Register with manager
+                    let id = match rm.add_with_factory(ResourceKind::Terminal, |id| {
+                        let mut t = terminal;
+                        t.set_id(id.to_string());
+                        Box::new(t)
+                    }).await {
+                        Ok(id) => id,
+                        Err(e) => return command_error(request_id, event_seq, proto::ErrorCode::Internal, &format!("Failed to create terminal: {}", e)),
+                    };
+
+                    // Set session directory on the terminal for I/O socket
+                    if let Err(e) = rm.terminal_set_session_dir(&id, sess_dir).await {
+                        tracing::warn!(error = %e, "Failed to set terminal session dir");
+                    }
+
+                    // Start the terminal
+                    if let Err(e) = rm.start(&id, conn.clone()).await {
+                        let _ = rm.close(&id).await;
+                        return command_error(request_id, event_seq, proto::ErrorCode::Internal, &format!("Failed to start terminal: {}", e));
+                    }
+
+                    // Get the resource info to return
+                    if let Some(info) = rm.describe(&id).await {
+                        return Message {
+                            kind: Some(proto::message::Kind::Event(proto::Event {
+                                event_seq,
+                                evt: Some(proto::event::Evt::CommandResult(proto::CommandResult {
+                                    request_id,
+                                    result: Some(proto::command_result::Result::Ok(proto::CommandOk {
+                                        data: Some(proto::command_ok::Data::ResourceCreated(
+                                            proto::ResourceCreateResult {
+                                                resource_id: id,
+                                                info: Some(resource_info_to_proto(&info)),
+                                            },
+                                        )),
+                                    })),
+                                })),
+                            })),
+                        };
+                    }
+
+                    command_error(request_id, event_seq, proto::ErrorCode::Internal, "Terminal created but info unavailable")
                 }
                 Some(proto::resource_create::Params::FileTransfer(_params)) => {
                     // File transfer creation - not yet implemented
@@ -2160,75 +2405,12 @@ async fn handle_unified_command(
             command_error(request_id, event_seq, proto::ErrorCode::NotFound, "Resource not found")
         }
 
-        proto::command::Cmd::TerminalAttach(attach) => {
-            // Terminal attach - for now return the resource info
-            // Full I/O streaming will be implemented in phase 3
-            if let Some(rm) = resource_manager {
-                if let Some(info) = rm.describe(&attach.resource_id).await {
-                    if matches!(info.kind, ResourceKind::Terminal) {
-                        return Message {
-                            kind: Some(proto::message::Kind::Event(proto::Event {
-                                event_seq,
-                                evt: Some(proto::event::Evt::CommandResult(proto::CommandResult {
-                                    request_id,
-                                    result: Some(proto::command_result::Result::Ok(proto::CommandOk {
-                                        data: Some(proto::command_ok::Data::ResourceDescribe(
-                                            proto::ResourceDescribeResult {
-                                                info: Some(resource_info_to_proto(&info)),
-                                            },
-                                        )),
-                                    })),
-                                })),
-                            })),
-                        };
-                    }
-                }
-            }
-
-            command_error(request_id, event_seq, proto::ErrorCode::NotFound, "Terminal not found")
-        }
-
-        proto::command::Cmd::TerminalDetach(detach) => {
-            // Terminal detach - for now just acknowledge
-            if let Some(rm) = resource_manager {
-                if rm.describe(&detach.resource_id).await.is_some() {
-                    return Message {
-                        kind: Some(proto::message::Kind::Event(proto::Event {
-                            event_seq,
-                            evt: Some(proto::event::Evt::CommandResult(proto::CommandResult {
-                                request_id,
-                                result: Some(proto::command_result::Result::Ok(proto::CommandOk {
-                                    data: None,
-                                })),
-                            })),
-                        })),
-                    };
-                }
-            }
-
-            command_error(request_id, event_seq, proto::ErrorCode::NotFound, "Terminal not found")
-        }
-
-        proto::command::Cmd::TerminalResize(resize) => {
-            // Terminal resize - for now just acknowledge if resource exists
-            if let Some(rm) = resource_manager {
-                if rm.describe(&resize.resource_id).await.is_some() {
-                    // TODO: Actually resize the terminal via ResourceManager
-                    return Message {
-                        kind: Some(proto::message::Kind::Event(proto::Event {
-                            event_seq,
-                            evt: Some(proto::event::Evt::CommandResult(proto::CommandResult {
-                                request_id,
-                                result: Some(proto::command_result::Result::Ok(proto::CommandOk {
-                                    data: None,
-                                })),
-                            })),
-                        })),
-                    };
-                }
-            }
-
-            command_error(request_id, event_seq, proto::ErrorCode::NotFound, "Terminal not found")
+        // TerminalAttach, TerminalDetach, TerminalResize are handled directly in Session
+        // since they need access to the attachment registry
+        proto::command::Cmd::TerminalAttach(_)
+        | proto::command::Cmd::TerminalDetach(_)
+        | proto::command::Cmd::TerminalResize(_) => {
+            unreachable!("Terminal attachment commands are handled in Session::handle_terminal_*")
         }
 
         // Commands not yet implemented

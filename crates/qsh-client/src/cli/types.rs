@@ -120,8 +120,10 @@ impl FromStr for TunnelArg {
 
 // Import terminal types from terminal module to avoid duplication
 pub use super::terminal::{
-    TerminalAction, TerminalAddArgs, TerminalAttachArgs, TerminalCloseArgs, TerminalCommand,
-    TerminalDetachArgs, TerminalResizeArgs,
+    NotificationStyle as TerminalNotificationStyle, OverlayPosition as TerminalOverlayPosition,
+    PredictionMode as TerminalPredictionMode, TerminalAction, TerminalAddArgs, TerminalAttachArgs,
+    TerminalCloseArgs, TerminalCommand, TerminalDetachArgs, TerminalDisplayOptions,
+    TerminalResizeArgs,
 };
 
 /// Control subcommands for managing existing qsh sessions.

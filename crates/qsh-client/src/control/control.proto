@@ -233,6 +233,7 @@ message CommandOk {
     ResourceCreateResult resource_created = 4;
     ResourceListResult resource_list = 5;
     ResourceDescribeResult resource_describe = 6;
+    TerminalAttachResult terminal_attach = 7;
     // Drain/Close/ForceClose return empty ok
   }
 }
@@ -294,6 +295,11 @@ message ResourceListResult {
 
 message ResourceDescribeResult {
   ResourceInfo info = 1;
+}
+
+message TerminalAttachResult {
+  string resource_id = 1;
+  string io_socket_path = 2;  // Unix socket path for raw terminal I/O
 }
 
 message ResourceInfo {

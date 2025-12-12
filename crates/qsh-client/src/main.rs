@@ -19,7 +19,6 @@ use qsh_client::{
 };
 use qsh_core::protocol::Message;
 use qsh_core::terminal::TerminalParser;
-use qsh_core::transport::TransportSender;
 
 #[cfg(feature = "standalone")]
 use qsh_client::standalone::authenticate as standalone_authenticate;
@@ -56,14 +55,21 @@ fn resolve_session_name(cli: &Cli) -> qsh_core::Result<String> {
 /// Attach to a terminal in an existing qsh session.
 ///
 /// This creates an interactive session with the specified terminal,
-/// relaying stdin/stdout through the control socket.
-async fn run_terminal_attach(session_name: &str, resource_id: Option<String>) -> qsh_core::Result<i32> {
-    use qsh_client::control::{ControlClient, ResourceDetails};
+/// connecting directly to the terminal's raw I/O socket for low latency.
+async fn run_terminal_attach(
+    session_name: &str,
+    resource_id: Option<String>,
+) -> qsh_core::Result<i32> {
+    use qsh_client::control::ControlClient;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
 
     let mut client = ControlClient::connect(session_name).await?;
 
     // Get terminal list to find the target terminal
-    let resources = client.list_resources(Some(qsh_client::control::ProtoResourceKind::Terminal)).await?;
+    let resources = client
+        .list_resources(Some(qsh_client::control::ProtoResourceKind::Terminal))
+        .await?;
 
     if resources.is_empty() {
         return Err(qsh_core::Error::Transport {
@@ -72,40 +78,156 @@ async fn run_terminal_attach(session_name: &str, resource_id: Option<String>) ->
     }
 
     // Find the target terminal
-    let terminal = if let Some(ref id) = resource_id {
-        resources.iter().find(|r| r.id == *id)
+    let terminal_id = if let Some(ref id) = resource_id {
+        let _ = resources
+            .iter()
+            .find(|r| r.id == *id)
             .ok_or_else(|| qsh_core::Error::Transport {
                 message: format!("terminal {} not found", id),
-            })?
+            })?;
+        id.clone()
     } else {
         // Use the most recent (last) terminal
-        resources.last().unwrap()
+        resources.last().unwrap().id.clone()
     };
 
-    // Get terminal details
-    let (cols, rows, shell) = if let ResourceDetails::Terminal(t) = &terminal.details {
-        (t.cols, t.rows, t.shell.clone())
-    } else {
-        (80, 24, "unknown".to_string())
+    // Get the I/O socket path
+    let io_socket_path = client.attach_terminal(&terminal_id).await?;
+
+    // Get terminal size for display
+    let info = client.describe_resource(&terminal_id).await?;
+    let (cols, rows) = match &info.details {
+        qsh_client::control::ResourceDetails::Terminal(t) => (t.cols, t.rows),
+        _ => (80, 24),
     };
 
-    // Terminal attach requires bidirectional I/O streaming through the control socket.
-    // The protocol supports Stream messages with StreamKind::TerminalIo.
-    //
-    // For now, print the terminal info and suggest using the main session.
-    println!("Terminal {} ({}x{}) - {}", terminal.id, cols, rows, terminal.state);
-    println!("Shell: {}", shell);
-    println!();
-    println!("Terminal attach is not yet fully implemented.");
-    println!("Use 'qsh ctl' then 'attach {}' for basic attach commands.", terminal.id);
-    println!();
-    println!("To interact with this terminal, use the main qsh session.");
+    // Connect directly to the raw I/O socket
+    let io_socket = UnixStream::connect(&io_socket_path).await.map_err(|e| {
+        qsh_core::Error::Transport {
+            message: format!("failed to connect to terminal I/O socket: {}", e),
+        }
+    })?;
 
-    Ok(1)
+    // Enter raw mode
+    let _raw_guard = qsh_client::RawModeGuard::enter()?;
+
+    // Resize terminal to current tty size
+    if let Ok(size) = qsh_client::get_terminal_size() {
+        let (term_cols, term_rows) = (size.cols, size.rows);
+        let _ = client.resize_terminal(&terminal_id, term_cols as u32, term_rows as u32).await;
+    }
+
+    eprintln!("\r\n[Attached to {} ({}x{}). Press Ctrl+] then 'd' to detach]\r\n", terminal_id, cols, rows);
+
+    // Set up SIGWINCH handler for terminal resize
+    let mut sigwinch = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+        .map_err(|e| qsh_core::Error::Transport {
+            message: format!("failed to set up SIGWINCH handler: {}", e),
+        })?;
+
+    // Split the I/O socket
+    let (mut io_reader, mut io_writer) = io_socket.into_split();
+
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    let mut in_buf = [0u8; 4096];
+    let mut out_buf = [0u8; 4096];
+    let mut escape_pending = false;
+
+    loop {
+        tokio::select! {
+            biased;
+
+            // Handle terminal resize (SIGWINCH)
+            _ = sigwinch.recv() => {
+                if let Ok(size) = qsh_client::get_terminal_size() {
+                    let _ = client.resize_terminal(&terminal_id, size.cols as u32, size.rows as u32).await;
+                }
+            }
+
+            // Read from stdin (higher priority)
+            result = stdin.read(&mut in_buf) => {
+                match result {
+                    Ok(0) => {
+                        // EOF on stdin
+                        break;
+                    }
+                    Ok(n) => {
+                        let data = &in_buf[..n];
+
+                        // Check for escape sequence: Ctrl+] (0x1d) followed by 'd'
+                        if escape_pending {
+                            escape_pending = false;
+                            if data.first() == Some(&b'd') {
+                                eprintln!("\r\n[Detached from {}]\r\n", terminal_id);
+                                break;
+                            }
+                            // Not a detach command, send the Ctrl+] we held back
+                            let _ = io_writer.write_all(&[0x1d]).await;
+                        }
+
+                        // Check if this chunk contains Ctrl+]
+                        if let Some(pos) = data.iter().position(|&b| b == 0x1d) {
+                            // Send data before the escape
+                            if pos > 0 {
+                                let _ = io_writer.write_all(&data[..pos]).await;
+                            }
+                            // If there's more after Ctrl+], check for 'd'
+                            if pos + 1 < data.len() {
+                                if data[pos + 1] == b'd' {
+                                    eprintln!("\r\n[Detached from {}]\r\n", terminal_id);
+                                    break;
+                                }
+                                // Not 'd', send everything including Ctrl+]
+                                let _ = io_writer.write_all(&data[pos..]).await;
+                            } else {
+                                // Ctrl+] is the last byte, wait for next read
+                                escape_pending = true;
+                            }
+                        } else {
+                            // No escape sequence, send all data
+                            let _ = io_writer.write_all(data).await;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("\r\n[stdin error: {}]\r\n", e);
+                        break;
+                    }
+                }
+            }
+
+            // Read from terminal I/O socket
+            result = io_reader.read(&mut out_buf) => {
+                match result {
+                    Ok(0) => {
+                        // Terminal closed
+                        eprintln!("\r\n[Terminal closed]\r\n");
+                        break;
+                    }
+                    Ok(n) => {
+                        stdout.write_all(&out_buf[..n]).await?;
+                        stdout.flush().await?;
+                    }
+                    Err(e) => {
+                        eprintln!("\r\n[I/O socket error: {}]\r\n", e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Detach from terminal (mainly for cleanup on server side)
+    let _ = client.detach_terminal(&terminal_id).await;
+
+    Ok(0)
 }
 
 /// Run a control subcommand.
-async fn run_control_command(cli: &Cli, subcommand: &qsh_client::cli::Command) -> qsh_core::Result<i32> {
+async fn run_control_command(
+    cli: &Cli,
+    subcommand: &qsh_client::cli::Command,
+) -> qsh_core::Result<i32> {
     use qsh_client::cli::{Command, ForwardAction, TerminalAction};
     use qsh_client::control::ControlClient;
 
@@ -143,28 +265,50 @@ async fn run_control_command(cli: &Cli, subcommand: &qsh_client::cli::Command) -
                     use qsh_client::control::ProtoForwardType;
 
                     // Determine forward type and parse spec
-                    let (forward_type, bind_addr, bind_port, dest_host, dest_port) = if let Some(spec) = &args.local {
-                        let (bind, host, port) = qsh_client::parse_local_forward(spec)?;
-                        (ProtoForwardType::Local, bind.ip().to_string(), bind.port() as u32, Some(host), Some(port as u32))
-                    } else if let Some(spec) = &args.remote {
-                        let (bind_addr, bind_port, host, port) = qsh_client::parse_remote_forward(spec)?;
-                        (ProtoForwardType::Remote, bind_addr, bind_port as u32, Some(host), Some(port as u32))
-                    } else if let Some(spec) = &args.dynamic {
-                        let bind = qsh_client::parse_dynamic_forward(spec)?;
-                        (ProtoForwardType::Dynamic, bind.ip().to_string(), bind.port() as u32, None, None)
-                    } else {
-                        eprintln!("Must specify -L, -R, or -D");
-                        return Ok(1);
-                    };
+                    let (forward_type, bind_addr, bind_port, dest_host, dest_port) =
+                        if let Some(spec) = &args.local {
+                            let (bind, host, port) = qsh_client::parse_local_forward(spec)?;
+                            (
+                                ProtoForwardType::Local,
+                                bind.ip().to_string(),
+                                bind.port() as u32,
+                                Some(host),
+                                Some(port as u32),
+                            )
+                        } else if let Some(spec) = &args.remote {
+                            let (bind_addr, bind_port, host, port) =
+                                qsh_client::parse_remote_forward(spec)?;
+                            (
+                                ProtoForwardType::Remote,
+                                bind_addr,
+                                bind_port as u32,
+                                Some(host),
+                                Some(port as u32),
+                            )
+                        } else if let Some(spec) = &args.dynamic {
+                            let bind = qsh_client::parse_dynamic_forward(spec)?;
+                            (
+                                ProtoForwardType::Dynamic,
+                                bind.ip().to_string(),
+                                bind.port() as u32,
+                                None,
+                                None,
+                            )
+                        } else {
+                            eprintln!("Must specify -L, -R, or -D");
+                            return Ok(1);
+                        };
 
                     // Create the forward via control socket
-                    let info = client.create_forward(
-                        forward_type,
-                        &bind_addr,
-                        bind_port,
-                        dest_host.as_deref(),
-                        dest_port,
-                    ).await?;
+                    let info = client
+                        .create_forward(
+                            forward_type,
+                            &bind_addr,
+                            bind_port,
+                            dest_host.as_deref(),
+                            dest_port,
+                        )
+                        .await?;
 
                     println!("Created forward: {}", info.id);
                     if let qsh_client::control::ResourceDetails::Forward(f) = &info.details {
@@ -178,14 +322,19 @@ async fn run_control_command(cli: &Cli, subcommand: &qsh_client::cli::Command) -
                 }
                 ForwardAction::List => {
                     // List forward resources
-                    let resources = client.list_resources(Some(qsh_client::control::ProtoResourceKind::Forward)).await?;
+                    let resources = client
+                        .list_resources(Some(qsh_client::control::ProtoResourceKind::Forward))
+                        .await?;
                     if resources.is_empty() {
                         println!("No active forwards");
                     } else {
                         for info in resources {
-                            if let qsh_client::control::ResourceDetails::Forward(f) = &info.details {
+                            if let qsh_client::control::ResourceDetails::Forward(f) = &info.details
+                            {
                                 print!("[{}] {}:{}", info.id, f.bind_addr, f.bind_port);
-                                if let (Some(dest_host), Some(dest_port)) = (&f.dest_host, f.dest_port) {
+                                if let (Some(dest_host), Some(dest_port)) =
+                                    (&f.dest_host, f.dest_port)
+                                {
                                     print!(" -> {}:{}", dest_host, dest_port);
                                 }
                                 println!(" ({:?}, {})", f.forward_type, info.state);
@@ -201,7 +350,9 @@ async fn run_control_command(cli: &Cli, subcommand: &qsh_client::cli::Command) -
                 }
                 ForwardAction::Drain(args) => {
                     let timeout = args.timeout.unwrap_or(30);
-                    client.drain_resource(&args.forward_id, timeout as u64 * 1000).await?;
+                    client
+                        .drain_resource(&args.forward_id, timeout as u64 * 1000)
+                        .await?;
                     println!("Forward drained");
                     Ok(0)
                 }
@@ -254,11 +405,22 @@ async fn run_control_command(cli: &Cli, subcommand: &qsh_client::cli::Command) -
             let mut client = ControlClient::connect(&session_name).await?;
 
             match &term_cmd.action {
-                TerminalAction::Add(_args) => {
-                    // Terminal creation via resource API not yet implemented
-                    // This requires sending a ResourceCreate command with TerminalCreateParams
-                    eprintln!("Terminal add via control socket not yet implemented");
-                    Ok(1)
+                TerminalAction::Add(args) => {
+                    let info = client
+                        .create_terminal(
+                            args.cols,
+                            args.rows,
+                            Some(&args.term_type),
+                            args.shell.as_deref(),
+                            args.command.as_deref(),
+                        )
+                        .await?;
+                    println!("Terminal created: {}", info.id);
+                    if let qsh_client::control::ResourceDetails::Terminal(t) = &info.details {
+                        println!("  Size: {}x{}", t.cols, t.rows);
+                        println!("  Shell: {}", t.shell);
+                    }
+                    Ok(0)
                 }
                 TerminalAction::Close(args) => {
                     // Use resource ID format (e.g., "term-0")
@@ -272,21 +434,20 @@ async fn run_control_command(cli: &Cli, subcommand: &qsh_client::cli::Command) -
                     Ok(0)
                 }
                 TerminalAction::List => {
-                    let resources = client.list_resources(Some(qsh_client::control::ProtoResourceKind::Terminal)).await?;
+                    let resources = client
+                        .list_resources(Some(qsh_client::control::ProtoResourceKind::Terminal))
+                        .await?;
                     if resources.is_empty() {
                         println!("No active terminals");
                     } else {
                         println!("{:<12} {:<12} {:<10} {}", "ID", "SIZE", "STATE", "SHELL");
                         println!("{}", "-".repeat(50));
                         for info in resources {
-                            if let qsh_client::control::ResourceDetails::Terminal(t) = &info.details {
+                            if let qsh_client::control::ResourceDetails::Terminal(t) = &info.details
+                            {
                                 println!(
                                     "{:<12} {}x{:<8} {:<10} {}",
-                                    info.id,
-                                    t.cols,
-                                    t.rows,
-                                    info.state,
-                                    t.shell
+                                    info.id, t.cols, t.rows, info.state, t.shell
                                 );
                             }
                         }
@@ -317,7 +478,9 @@ async fn run_control_command(cli: &Cli, subcommand: &qsh_client::cli::Command) -
                     } else {
                         format!("term-{}", args.resource_id)
                     };
-                    client.resize_terminal(&resource_id, args.cols, args.rows).await?;
+                    client
+                        .resize_terminal(&resource_id, args.cols, args.rows)
+                        .await?;
                     println!("Terminal resized to {}x{}", args.cols, args.rows);
                     Ok(0)
                 }
@@ -445,11 +608,11 @@ fn main() {
 /// 6. Waits for attach client to connect to pipe
 /// 7. Runs the Session with pipe as stdin/stdout
 async fn run_bootstrap_mode(cli: &Cli) -> qsh_core::Result<i32> {
-    use std::net::IpAddr;
-    use qsh_client::attach::{create_pipe, pipe_path, accept_attach};
-    use qsh_core::bootstrap::{BootstrapEndpoint, BootstrapOptions};
+    use qsh_client::attach::{accept_attach, create_pipe, pipe_path};
     use qsh_core::ConnectMode;
+    use qsh_core::bootstrap::{BootstrapEndpoint, BootstrapOptions};
     use qsh_core::transport::{ListenerConfig, QuicAcceptor};
+    use std::net::IpAddr;
 
     info!("Starting bootstrap/responder mode");
 
@@ -459,12 +622,12 @@ async fn run_bootstrap_mode(cli: &Cli) -> qsh_core::Result<i32> {
     info!(pipe = %attach_pipe_path.display(), "Created attach pipe");
 
     // Parse bind IP
-    let bind_ip: IpAddr = cli
-        .bootstrap_bind_ip
-        .parse()
-        .map_err(|e| qsh_core::Error::Transport {
-            message: format!("invalid bind IP '{}': {}", cli.bootstrap_bind_ip, e),
-        })?;
+    let bind_ip: IpAddr =
+        cli.bootstrap_bind_ip
+            .parse()
+            .map_err(|e| qsh_core::Error::Transport {
+                message: format!("invalid bind IP '{}': {}", cli.bootstrap_bind_ip, e),
+            })?;
 
     // Create bootstrap options
     let mut bootstrap_options = BootstrapOptions::default();
@@ -555,7 +718,10 @@ async fn run_bootstrap_mode(cli: &Cli) -> qsh_core::Result<i32> {
     // Wait for attach client to connect.
     // We must process control messages (heartbeats) AND terminal output from the server
     // to keep the connection alive and buffer any shell output.
-    info!("Waiting for attach client on {}", attach_pipe_path.display());
+    info!(
+        "Waiting for attach client on {}",
+        attach_pipe_path.display()
+    );
 
     // Use a channel to signal when attach client connects
     let (attach_tx, attach_rx) = tokio::sync::oneshot::channel();
@@ -645,8 +811,14 @@ async fn run_bootstrap_mode(cli: &Cli) -> qsh_core::Result<i32> {
     use tokio::io::AsyncWriteExt;
     let (mut attach_rx, mut attach_tx) = attach_stream.into_split();
     if !output_buffer.is_empty() {
-        info!(len = output_buffer.len(), "Flushing buffered terminal output to attach client");
-        attach_tx.write_all(&output_buffer).await.map_err(|e| qsh_core::Error::Io(e))?;
+        info!(
+            len = output_buffer.len(),
+            "Flushing buffered terminal output to attach client"
+        );
+        attach_tx
+            .write_all(&output_buffer)
+            .await
+            .map_err(|e| qsh_core::Error::Io(e))?;
     }
 
     // Simple relay loop: attach <-> terminal channel
@@ -746,9 +918,9 @@ async fn run_bootstrap_mode(cli: &Cli) -> qsh_core::Result<i32> {
 /// Connects to an existing bootstrap session via named pipe.
 /// Provides stdin/stdout/stderr access to the remote shell.
 async fn run_attach_mode(pipe_path: Option<&str>) -> qsh_core::Result<i32> {
-    use std::path::Path;
     use qsh_client::attach::{connect_attach, find_latest_pipe};
     use qsh_client::terminal::RawModeGuard;
+    use std::path::Path;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let resolved_path = match pipe_path {
@@ -768,7 +940,7 @@ async fn run_attach_mode(pipe_path: Option<&str>) -> qsh_core::Result<i32> {
     // Get stdin and stdout/stderr
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
-    let mut stderr = tokio::io::stderr();
+    let stderr = tokio::io::stderr();
 
     // Relay I/O between local terminal and pipe
     // Pipe output goes to both stdout and stderr (PTY merges them)
@@ -932,8 +1104,6 @@ async fn run_client_ssh_bootstrap(
     host: &str,
     user: Option<&str>,
 ) -> qsh_core::Result<i32> {
-    info!("Using channel model...");
-
     // Build server args, adding --mode if requested
     let mut server_args = cli.bootstrap_server_args.clone().unwrap_or_default();
 
@@ -1020,7 +1190,7 @@ async fn run_client_ssh_bootstrap(
     info!(
         rtt = ?conn.rtt().await,
         session_id = ?conn.session_id(),
-        "Channel model connection established"
+        "Connection established"
     );
 
     // Drop the bootstrap handle now that QUIC connection is established

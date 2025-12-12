@@ -29,13 +29,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
 use super::resource::{
     FailureReason, Resource, ResourceError, ResourceEvent, ResourceInfo, ResourceKind,
     ResourceState, ResourceStats,
 };
+use super::resources::Terminal;
 use crate::ChannelConnection;
 
 /// Channel capacity for the event broadcast.
@@ -94,7 +95,7 @@ impl ResourceManager {
     }
 
     /// Get the next event sequence number.
-    async fn next_event_seq(&self) -> u64 {
+    pub async fn next_event_seq(&self) -> u64 {
         let mut seq = self.event_seq.write().await;
         let current = *seq;
         *seq += 1;
@@ -505,6 +506,146 @@ impl ResourceManager {
     pub async fn ids(&self) -> Vec<String> {
         let resources = self.resources.read().await;
         resources.keys().cloned().collect()
+    }
+
+    /// Execute a function with mutable access to a resource, with downcasting.
+    ///
+    /// This allows calling resource-specific methods like Terminal::attach().
+    /// Returns None if the resource doesn't exist or can't be downcast to T.
+    pub async fn with_resource_mut<T: 'static, F, R>(&self, id: &str, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut T) -> R,
+    {
+        let mut resources = self.resources.write().await;
+        if let Some(resource) = resources.get_mut(id) {
+            if let Some(typed) = resource.as_any_mut().downcast_mut::<T>() {
+                return Some(f(typed));
+            }
+        }
+        None
+    }
+
+    /// Execute an async function with mutable access to a resource, with downcasting.
+    ///
+    /// This allows calling async resource-specific methods like Terminal::attach().
+    /// Returns None if the resource doesn't exist or can't be downcast to T.
+    ///
+    /// Note: The closure must return a boxed future since we can't use async closures yet.
+    pub async fn with_resource<T: 'static, F, R>(&self, id: &str, f: F) -> Option<R>
+    where
+        F: FnOnce(&T) -> R,
+    {
+        let resources = self.resources.read().await;
+        if let Some(resource) = resources.get(id) {
+            if let Some(typed) = resource.as_any().downcast_ref::<T>() {
+                return Some(f(typed));
+            }
+        }
+        None
+    }
+
+    // =========================================================================
+    // Terminal-specific operations
+    // =========================================================================
+
+    /// Get the I/O socket path for a terminal resource.
+    ///
+    /// Returns the Unix socket path that clients can connect to for raw terminal I/O.
+    /// Any TTY-aware client (socat, nc, custom tools) can connect to this socket.
+    pub async fn terminal_io_socket(&self, id: &str) -> Result<std::path::PathBuf, ResourceError> {
+        let resources = self.resources.read().await;
+        let resource = resources.get(id).ok_or_else(|| {
+            ResourceError::NotFound(id.to_string())
+        })?;
+
+        // Verify it's a terminal
+        if resource.kind() != ResourceKind::Terminal {
+            return Err(ResourceError::Internal(format!(
+                "resource {} is not a terminal",
+                id
+            )));
+        }
+
+        // Downcast and get socket path
+        let terminal = resource.as_any().downcast_ref::<Terminal>().ok_or_else(|| {
+            ResourceError::Internal("failed to downcast to Terminal".to_string())
+        })?;
+
+        terminal.io_socket_path().await.ok_or_else(|| {
+            ResourceError::Internal("terminal I/O socket not ready".to_string())
+        })
+    }
+
+    /// Check if a terminal resource is attached (has a connected client).
+    pub async fn terminal_is_attached(&self, id: &str) -> Result<bool, ResourceError> {
+        let resources = self.resources.read().await;
+        let resource = resources.get(id).ok_or_else(|| {
+            ResourceError::NotFound(id.to_string())
+        })?;
+
+        // Verify it's a terminal
+        if resource.kind() != ResourceKind::Terminal {
+            return Err(ResourceError::Internal(format!(
+                "resource {} is not a terminal",
+                id
+            )));
+        }
+
+        // Downcast and check attached
+        let terminal = resource.as_any().downcast_ref::<Terminal>().ok_or_else(|| {
+            ResourceError::Internal("failed to downcast to Terminal".to_string())
+        })?;
+
+        Ok(terminal.is_attached())
+    }
+
+    /// Resize a terminal resource.
+    pub async fn terminal_resize(&self, id: &str, cols: u32, rows: u32) -> Result<(), ResourceError> {
+        let resources = self.resources.read().await;
+        let resource = resources.get(id).ok_or_else(|| {
+            ResourceError::NotFound(id.to_string())
+        })?;
+
+        // Verify it's a terminal
+        if resource.kind() != ResourceKind::Terminal {
+            return Err(ResourceError::Internal(format!(
+                "resource {} is not a terminal",
+                id
+            )));
+        }
+
+        // Downcast and call resize
+        let terminal = resource.as_any().downcast_ref::<Terminal>().ok_or_else(|| {
+            ResourceError::Internal("failed to downcast to Terminal".to_string())
+        })?;
+
+        terminal.resize(cols, rows).await
+    }
+
+    /// Set the session directory for a terminal resource's I/O socket.
+    ///
+    /// Must be called before start() for the socket to be created in the right location.
+    pub async fn terminal_set_session_dir(&self, id: &str, dir: std::path::PathBuf) -> Result<(), ResourceError> {
+        let resources = self.resources.read().await;
+        let resource = resources.get(id).ok_or_else(|| {
+            ResourceError::NotFound(id.to_string())
+        })?;
+
+        // Verify it's a terminal
+        if resource.kind() != ResourceKind::Terminal {
+            return Err(ResourceError::Internal(format!(
+                "resource {} is not a terminal",
+                id
+            )));
+        }
+
+        // Downcast and set session dir
+        let terminal = resource.as_any().downcast_ref::<Terminal>().ok_or_else(|| {
+            ResourceError::Internal("failed to downcast to Terminal".to_string())
+        })?;
+
+        terminal.set_session_dir(dir).await;
+        Ok(())
     }
 }
 

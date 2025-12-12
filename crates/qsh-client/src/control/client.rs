@@ -422,34 +422,32 @@ impl ControlClient {
     // Terminal operations
     // =========================================================================
 
-    /// Attach to a terminal for I/O streaming.
+    /// Attach to a terminal and get its I/O socket path.
     ///
-    /// After attaching, use `send_terminal_stream()` and `recv_stream()` for I/O.
-    pub async fn attach_terminal(&mut self, resource_id: &str) -> Result<RustResourceInfo> {
+    /// Returns the Unix socket path for direct terminal I/O.
+    /// Connect to this socket for low-latency raw terminal access.
+    pub async fn attach_terminal(&mut self, resource_id: &str) -> Result<std::path::PathBuf> {
         let result = self
             .send_command(command::Cmd::TerminalAttach(proto::TerminalAttachCmd {
                 resource_id: resource_id.to_string(),
             }))
             .await?;
 
-        let describe = Self::extract_result(result, |data| {
-            if let command_ok::Data::ResourceDescribe(d) = data {
-                Some(d)
+        let attach_result = Self::extract_result(result, |data| {
+            if let command_ok::Data::TerminalAttach(a) = data {
+                Some(a)
             } else {
                 None
             }
         })?;
 
-        describe
-            .info
-            .ok_or_else(|| Error::Codec {
-                message: "missing resource info".to_string(),
-            })
-            .and_then(|info| {
-                resource_info_from_proto(info).map_err(|e| Error::Codec {
-                    message: format!("invalid resource info: {}", e),
-                })
-            })
+        if attach_result.io_socket_path.is_empty() {
+            return Err(Error::Codec {
+                message: "missing I/O socket path in attach response".to_string(),
+            });
+        }
+
+        Ok(std::path::PathBuf::from(attach_result.io_socket_path))
     }
 
     /// Detach from a terminal.
