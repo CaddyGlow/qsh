@@ -45,6 +45,9 @@ pub struct SessionState {
     /// Channel for sending terminal commands.
     pub terminal_cmd_tx: Option<mpsc::Sender<TerminalCommand>>,
 
+    /// Channel for sending file transfer commands.
+    pub file_transfer_cmd_tx: Option<mpsc::Sender<FileTransferCommand>>,
+
     /// Current terminals (channel_id -> info).
     pub terminals: Vec<TerminalState>,
 
@@ -159,6 +162,61 @@ pub struct TerminalState {
     pub pid: Option<u64>,
 }
 
+/// Command to control file transfers.
+pub enum FileTransferCommand {
+    /// Start an upload.
+    Upload {
+        local_path: std::path::PathBuf,
+        remote_path: String,
+        options: FileTransferOptions,
+        response_tx: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    /// Start a download.
+    Download {
+        remote_path: String,
+        local_path: std::path::PathBuf,
+        options: FileTransferOptions,
+        response_tx: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    /// Cancel a file transfer.
+    Cancel {
+        resource_id: String,
+        response_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+}
+
+/// File transfer options (matches proto::FileTransferOptions).
+#[derive(Debug, Clone, Default)]
+pub struct FileTransferOptions {
+    pub recursive: bool,
+    pub resume: bool,
+    pub delta: bool,
+    pub compress: bool,
+    pub parallel: u32,
+    pub skip_unchanged: bool,
+}
+
+impl FileTransferOptions {
+    /// Convert to qsh_core::protocol::TransferOptions.
+    pub fn to_transfer_options(&self) -> qsh_core::protocol::TransferOptions {
+        use qsh_core::protocol::DeltaAlgo;
+
+        qsh_core::protocol::TransferOptions {
+            compress: self.compress,
+            delta: self.delta,
+            delta_algo: if self.delta {
+                DeltaAlgo::RollingStreaming
+            } else {
+                DeltaAlgo::None
+            },
+            recursive: self.recursive,
+            preserve_mode: false,
+            parallel: self.parallel.max(1),
+            skip_if_unchanged: self.skip_unchanged,
+        }
+    }
+}
+
 impl Default for SessionState {
     fn default() -> Self {
         Self {
@@ -172,6 +230,7 @@ impl Default for SessionState {
             forward_add_tx: None,
             forward_remove_tx: None,
             terminal_cmd_tx: None,
+            file_transfer_cmd_tx: None,
             terminals: Vec::new(),
             rtt_ms: None,
             bytes_sent: 0,

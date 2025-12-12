@@ -591,6 +591,56 @@ impl CommandBuilder {
             })),
         }
     }
+
+    /// Build a file upload command.
+    pub fn file_upload(
+        self,
+        local_path: String,
+        remote_path: String,
+        options: proto::FileTransferOptions,
+    ) -> proto::Message {
+        proto::Message {
+            kind: Some(proto::message::Kind::Command(proto::Command {
+                request_id: self.request_id,
+                cmd: Some(proto::command::Cmd::FileUpload(proto::FileUploadCmd {
+                    local_path,
+                    remote_path,
+                    options: Some(options),
+                })),
+            })),
+        }
+    }
+
+    /// Build a file download command.
+    pub fn file_download(
+        self,
+        remote_path: String,
+        local_path: String,
+        options: proto::FileTransferOptions,
+    ) -> proto::Message {
+        proto::Message {
+            kind: Some(proto::message::Kind::Command(proto::Command {
+                request_id: self.request_id,
+                cmd: Some(proto::command::Cmd::FileDownload(proto::FileDownloadCmd {
+                    remote_path,
+                    local_path,
+                    options: Some(options),
+                })),
+            })),
+        }
+    }
+
+    /// Build a file cancel command.
+    pub fn file_cancel(self, resource_id: String) -> proto::Message {
+        proto::Message {
+            kind: Some(proto::message::Kind::Command(proto::Command {
+                request_id: self.request_id,
+                cmd: Some(proto::command::Cmd::FileCancel(proto::FileCancelCmd {
+                    resource_id,
+                })),
+            })),
+        }
+    }
 }
 
 /// Builder for creating event/response messages.

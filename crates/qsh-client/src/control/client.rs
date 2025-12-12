@@ -510,6 +510,104 @@ impl ControlClient {
         self.stream.flush().await.map_err(Error::Io)
     }
 
+    // =========================================================================
+    // File transfer operations
+    // =========================================================================
+
+    /// Start a file upload.
+    ///
+    /// Returns the created resource info including the assigned ID.
+    /// The transfer runs in the background; use `describe_resource` to check progress.
+    pub async fn upload_file(
+        &mut self,
+        local_path: &str,
+        remote_path: &str,
+        options: proto::FileTransferOptions,
+    ) -> Result<RustResourceInfo> {
+        let result = self
+            .send_command(command::Cmd::FileUpload(proto::FileUploadCmd {
+                local_path: local_path.to_string(),
+                remote_path: remote_path.to_string(),
+                options: Some(options),
+            }))
+            .await?;
+
+        let created = Self::extract_result(result, |data| {
+            if let command_ok::Data::ResourceCreated(c) = data {
+                Some(c)
+            } else {
+                None
+            }
+        })?;
+
+        created
+            .info
+            .ok_or_else(|| Error::Codec {
+                message: "missing resource info".to_string(),
+            })
+            .and_then(|info| {
+                resource_info_from_proto(info).map_err(|e| Error::Codec {
+                    message: format!("invalid resource info: {}", e),
+                })
+            })
+    }
+
+    /// Start a file download.
+    ///
+    /// Returns the created resource info including the assigned ID.
+    /// The transfer runs in the background; use `describe_resource` to check progress.
+    pub async fn download_file(
+        &mut self,
+        remote_path: &str,
+        local_path: &str,
+        options: proto::FileTransferOptions,
+    ) -> Result<RustResourceInfo> {
+        let result = self
+            .send_command(command::Cmd::FileDownload(proto::FileDownloadCmd {
+                remote_path: remote_path.to_string(),
+                local_path: local_path.to_string(),
+                options: Some(options),
+            }))
+            .await?;
+
+        let created = Self::extract_result(result, |data| {
+            if let command_ok::Data::ResourceCreated(c) = data {
+                Some(c)
+            } else {
+                None
+            }
+        })?;
+
+        created
+            .info
+            .ok_or_else(|| Error::Codec {
+                message: "missing resource info".to_string(),
+            })
+            .and_then(|info| {
+                resource_info_from_proto(info).map_err(|e| Error::Codec {
+                    message: format!("invalid resource info: {}", e),
+                })
+            })
+    }
+
+    /// Cancel a file transfer.
+    pub async fn cancel_file_transfer(&mut self, resource_id: &str) -> Result<()> {
+        let result = self
+            .send_command(command::Cmd::FileCancel(proto::FileCancelCmd {
+                resource_id: resource_id.to_string(),
+            }))
+            .await?;
+        Self::extract_void_result(result)
+    }
+
+    /// List file transfers.
+    ///
+    /// Convenience method that filters resources by FileTransfer kind.
+    pub async fn list_file_transfers(&mut self) -> Result<Vec<RustResourceInfo>> {
+        self.list_resources(Some(proto::ResourceKind::FileTransfer))
+            .await
+    }
+
     /// Try to receive a stream message (non-blocking).
     ///
     /// Returns `Ok(Some(stream))` if a stream message is available,
