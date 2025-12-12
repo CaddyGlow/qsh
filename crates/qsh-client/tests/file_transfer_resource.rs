@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use qsh_client::control::resource::Resource;
 use qsh_client::control::resources::FileTransfer;
 use qsh_core::protocol::{TransferDirection, TransferOptions};
 

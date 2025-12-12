@@ -499,8 +499,8 @@ mod tests {
         );
 
         assert_eq!(terminal.id(), "term-1");
-        assert_eq!(terminal.params.cols, 120);
-        assert_eq!(terminal.params.rows, 40);
+        assert_eq!(terminal.params.term_size.cols, 120);
+        assert_eq!(terminal.params.term_size.rows, 40);
         assert_eq!(terminal.params.shell, Some("/bin/zsh".to_string()));
     }
 }

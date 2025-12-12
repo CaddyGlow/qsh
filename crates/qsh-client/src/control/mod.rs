@@ -54,6 +54,9 @@ pub use resource::{
     ResourceError, ResourceEvent, ResourceInfo, ResourceKind, ResourceState, ResourceStats,
     StubResource, TerminalDetails,
 };
+
+// Re-export concrete resource implementations
+pub use resources::{FileTransfer, Forward, ForwardParams, Terminal};
 pub use protocol::{
     CommandBuilder, EventBuilder, ProtocolError, decode_message, encode_into, encode_message,
     resource_event_to_proto, resource_info_from_proto, resource_info_to_proto, stream_message,

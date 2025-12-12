@@ -1214,6 +1214,8 @@ pub struct Session {
     forward_registry: std::sync::Arc<std::sync::Mutex<crate::forward::ForwardRegistry>>,
     /// Connection start time (for uptime tracking).
     connected_at: Option<std::time::Instant>,
+    /// Resource manager for unified resource tracking (Phase 2).
+    resource_manager: Option<crate::control::ResourceManager>,
 }
 
 impl Session {
@@ -1225,7 +1227,19 @@ impl Session {
             session_name: None,
             forward_registry: std::sync::Arc::new(std::sync::Mutex::new(crate::forward::ForwardRegistry::new())),
             connected_at: None,
+            resource_manager: None,
         }
+    }
+
+    /// Attach a resource manager for unified resource tracking.
+    pub fn with_resource_manager(mut self, manager: crate::control::ResourceManager) -> Self {
+        self.resource_manager = Some(manager);
+        self
+    }
+
+    /// Get a reference to the resource manager, if set.
+    pub fn resource_manager(&self) -> Option<&crate::control::ResourceManager> {
+        self.resource_manager.as_ref()
     }
 
     /// Attach a control socket to this session.
@@ -1278,6 +1292,10 @@ impl Session {
         }
 
         let mut session = Self::new(connection, SessionParts { terminal, forwards });
+
+        // Create resource manager for unified resource tracking
+        let (resource_manager, _event_rx) = crate::control::ResourceManager::new();
+        session.resource_manager = Some(resource_manager);
 
         // Create control socket for session management
         // Session name: use -S flag, or derive from user@host
@@ -1751,6 +1769,15 @@ impl Session {
                                         vec![]
                                     };
 
+                                    // Create Arc reference to resource manager if available
+                                    let resource_manager_arc = self.resource_manager.as_ref().map(|rm| {
+                                        // Note: This requires ResourceManager to be wrapped in Arc
+                                        // For now, we skip this and use None
+                                        // In a full implementation, Session would hold Arc<ResourceManager>
+                                        std::sync::Arc::new(crate::control::ResourceManager::new().0)
+                                    });
+                                    // TODO: Properly share ResourceManager via Arc in Session
+
                                     let state = SessionState {
                                         session_name: self.session_name.clone().unwrap_or_else(|| "unknown".to_string()),
                                         remote_host: None, // TODO: Parse from session_name if available
@@ -1766,6 +1793,7 @@ impl Session {
                                         rtt_ms: heartbeat.tracker.srtt().map(|d| d.as_millis() as u32),
                                         bytes_sent: 0, // TODO: Track bytes
                                         bytes_received: 0, // TODO: Track bytes
+                                        resource_manager: None, // TODO: Wire resource_manager_arc once Session holds Arc<ResourceManager>
                                     };
 
                                     // Spawn a task to handle the command asynchronously.

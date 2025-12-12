@@ -77,6 +77,10 @@ pub struct SessionState {
 
     /// Bytes received.
     pub bytes_received: u64,
+
+    /// Resource manager for unified resource tracking (Phase 2).
+    /// When present, resource queries can use this instead of legacy registries.
+    pub resource_manager: Option<Arc<super::ResourceManager>>,
 }
 
 /// Connection state enum.
@@ -170,6 +174,7 @@ impl Default for SessionState {
             rtt_ms: None,
             bytes_sent: 0,
             bytes_received: 0,
+            resource_manager: None,
         }
     }
 }
@@ -612,6 +617,7 @@ mod tests {
             rtt_ms: Some(25),
             bytes_sent: 1024,
             bytes_received: 2048,
+            resource_manager: None,
         }
     }
 

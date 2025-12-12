@@ -8,18 +8,22 @@
 
 use qsh_client::control::resource::{Resource, ResourceKind, ResourceState};
 use qsh_client::control::resources::Terminal;
-use qsh_core::protocol::TerminalParams;
+use qsh_core::protocol::{TerminalParams, TermSize};
+
+fn make_params(cols: u16, rows: u16, shell: Option<String>) -> TerminalParams {
+    TerminalParams {
+        term_size: TermSize { cols, rows },
+        term_type: "xterm-256color".to_string(),
+        shell,
+        command: None,
+        env: vec![],
+        ..Default::default()
+    }
+}
 
 #[test]
 fn test_terminal_creation() {
-    let params = TerminalParams {
-        cols: 80,
-        rows: 24,
-        term_type: "xterm-256color".to_string(),
-        shell: None,
-        command: None,
-        env: vec![],
-    };
+    let params = make_params(80, 24, None);
 
     let terminal = Terminal::new("term-0".to_string(), params);
     assert_eq!(terminal.id(), "term-0");
@@ -49,14 +53,7 @@ fn test_terminal_from_params() {
 
 #[test]
 fn test_describe() {
-    let params = TerminalParams {
-        cols: 100,
-        rows: 30,
-        term_type: "xterm-256color".to_string(),
-        shell: Some("/bin/bash".to_string()),
-        command: None,
-        env: vec![],
-    };
+    let params = make_params(100, 30, Some("/bin/bash".to_string()));
 
     let terminal = Terminal::new("term-2".to_string(), params);
     let info = terminal.describe();
@@ -83,14 +80,7 @@ fn test_describe() {
 
 #[tokio::test]
 async fn test_attach_detach_without_connection() {
-    let params = TerminalParams {
-        cols: 80,
-        rows: 24,
-        term_type: "xterm-256color".to_string(),
-        shell: None,
-        command: None,
-        env: vec![],
-    };
+    let params = make_params(80, 24, None);
 
     let terminal = Terminal::new("term-3".to_string(), params);
 
@@ -101,14 +91,7 @@ async fn test_attach_detach_without_connection() {
 
 #[tokio::test]
 async fn test_resize_without_connection() {
-    let params = TerminalParams {
-        cols: 80,
-        rows: 24,
-        term_type: "xterm-256color".to_string(),
-        shell: None,
-        command: None,
-        env: vec![],
-    };
+    let params = make_params(80, 24, None);
 
     let terminal = Terminal::new("term-4".to_string(), params);
 
@@ -119,14 +102,7 @@ async fn test_resize_without_connection() {
 
 #[tokio::test]
 async fn test_is_attached() {
-    let params = TerminalParams {
-        cols: 80,
-        rows: 24,
-        term_type: "xterm-256color".to_string(),
-        shell: None,
-        command: None,
-        env: vec![],
-    };
+    let params = make_params(80, 24, None);
 
     let terminal = Terminal::new("term-5".to_string(), params);
     assert!(!terminal.is_attached().await);
