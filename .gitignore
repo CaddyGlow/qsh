@@ -27,4 +27,4 @@ credentials.json
 
 .claude/
 .direnv/
-.envrc/
+.envrc
