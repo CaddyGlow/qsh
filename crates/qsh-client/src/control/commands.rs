@@ -121,6 +121,9 @@ pub enum TerminalCommand {
         term_type: String,
         shell: Option<String>,
         command: Option<String>,
+        env: Vec<(String, String)>,
+        output_mode: qsh_core::protocol::OutputMode,
+        allocate_pty: bool,
         response_tx: tokio::sync::oneshot::Sender<Result<u64, String>>,
     },
     Close {

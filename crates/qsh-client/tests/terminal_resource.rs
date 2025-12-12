@@ -41,6 +41,8 @@ fn test_terminal_from_params() {
         Some("/bin/zsh".to_string()),
         None,
         vec![("FOO".to_string(), "bar".to_string())],
+        qsh_core::protocol::OutputMode::Mosh,
+        true, // allocate_pty
     );
 
     assert_eq!(terminal.id(), "term-1");
@@ -69,6 +71,8 @@ fn test_describe() {
         assert_eq!(details.rows, 30);
         assert_eq!(details.shell, "/bin/bash");
         assert!(!details.attached);
+        assert_eq!(details.term_type, "xterm-256color");
+        assert!(details.socket_path.is_none()); // Not started yet
     } else {
         panic!("Expected Terminal details");
     }

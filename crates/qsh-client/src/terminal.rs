@@ -10,7 +10,6 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tokio::io::AsyncWriteExt;
 use tokio::io::unix::AsyncFd;
 use tracing::{debug, warn};
 

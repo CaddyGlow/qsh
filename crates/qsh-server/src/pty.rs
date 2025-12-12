@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use nix::pty::{Winsize, openpty};
 use nix::sys::signal::{Signal, kill};
-use nix::unistd::{ForkResult, Pid, close, dup2, execvp, fork, setsid};
+use nix::unistd::{ForkResult, Pid, close, execvp, fork, setsid};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};

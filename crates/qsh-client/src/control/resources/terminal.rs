@@ -23,6 +23,7 @@
 use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -31,7 +32,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use qsh_core::protocol::TerminalParams;
 
@@ -211,8 +212,8 @@ pub struct Terminal {
     connection: RwLock<Option<Arc<ChannelConnection>>>,
     /// Current terminal size (uses std lock for sync access in describe).
     term_size: StdRwLock<(u32, u32)>,
-    /// Path to the I/O socket (e.g., /run/user/1000/qsh/session/term-0.io.sock).
-    io_socket_path: Mutex<Option<PathBuf>>,
+    /// Path to the I/O socket (uses std mutex for sync access in describe).
+    io_socket_path: StdMutex<Option<PathBuf>>,
     /// I/O socket listener task handle.
     io_listener_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Currently attached client's I/O task handle.
@@ -240,7 +241,7 @@ impl Terminal {
             channel: RwLock::new(None),
             connection: RwLock::new(None),
             term_size: StdRwLock::new((cols, rows)),
-            io_socket_path: Mutex::new(None),
+            io_socket_path: StdMutex::new(None),
             io_listener_task: Mutex::new(None),
             io_client_task: Mutex::new(None),
             session_dir: Mutex::new(None),
@@ -257,6 +258,8 @@ impl Terminal {
         shell: Option<String>,
         command: Option<String>,
         env: Vec<(String, String)>,
+        output_mode: qsh_core::protocol::OutputMode,
+        allocate_pty: bool,
     ) -> Self {
         use qsh_core::protocol::TermSize;
 
@@ -270,6 +273,8 @@ impl Terminal {
             shell,
             command,
             env,
+            output_mode,
+            allocate_pty,
             ..Default::default()
         };
 
@@ -291,8 +296,8 @@ impl Terminal {
     /// Get the path to the I/O socket.
     ///
     /// Returns None if the terminal hasn't been started yet.
-    pub async fn io_socket_path(&self) -> Option<PathBuf> {
-        self.io_socket_path.lock().await.clone()
+    pub fn io_socket_path(&self) -> Option<PathBuf> {
+        self.io_socket_path.lock().unwrap().clone()
     }
 
     /// Resize the terminal.
@@ -361,7 +366,7 @@ impl Terminal {
         );
 
         // Store the socket path
-        *self.io_socket_path.lock().await = Some(socket_path.clone());
+        *self.io_socket_path.lock().unwrap() = Some(socket_path.clone());
 
         // Get clones of channel and connection for the listener task
         let channel = self.channel.read().await.clone();
@@ -512,7 +517,7 @@ impl Terminal {
         }
 
         // Remove socket file
-        if let Some(path) = self.io_socket_path.lock().await.take() {
+        if let Some(path) = self.io_socket_path.lock().unwrap().take() {
             let _ = std::fs::remove_file(&path);
             debug!(terminal_id = %self.id, path = %path.display(), "Removed I/O socket");
         }
@@ -621,6 +626,11 @@ impl Resource for Terminal {
                 shell: self.params.shell.clone().unwrap_or_else(|| "/bin/bash".to_string()),
                 attached,
                 pid: None, // TODO: Track PID
+                socket_path: self.io_socket_path().map(|p| p.display().to_string()),
+                term_type: self.params.term_type.clone(),
+                command: self.params.command.clone(),
+                output_mode: self.params.output_mode,
+                allocate_pty: self.params.allocate_pty,
             }),
         }
     }
@@ -706,6 +716,8 @@ mod tests {
 
     #[test]
     fn test_from_params() {
+        use qsh_core::protocol::OutputMode;
+
         let terminal = Terminal::from_params(
             "term-1".to_string(),
             Some(120),
@@ -714,12 +726,16 @@ mod tests {
             Some("/bin/zsh".to_string()),
             None,
             vec![],
+            OutputMode::Mosh,
+            true, // allocate_pty
         );
 
         assert_eq!(terminal.id(), "term-1");
         assert_eq!(terminal.params.term_size.cols, 120);
         assert_eq!(terminal.params.term_size.rows, 40);
         assert_eq!(terminal.params.shell, Some("/bin/zsh".to_string()));
+        assert_eq!(terminal.params.output_mode, OutputMode::Mosh);
+        assert!(terminal.params.allocate_pty);
     }
 
     #[test]

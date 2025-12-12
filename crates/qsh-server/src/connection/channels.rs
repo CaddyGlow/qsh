@@ -1,9 +1,7 @@
 //! Channel management for connections.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use qsh_core::error::{Error, Result};
@@ -465,7 +463,8 @@ impl ConnectionHandler {
 
         // Create terminal channel
         let quic = self.quic().await;
-        let output_mode = self.config.output_mode;
+        // Use per-terminal output_mode from client params (not server-wide config)
+        let output_mode = params.output_mode;
         match TerminalChannel::new(channel_id, params, quic, Arc::clone(self), output_mode).await {
             Ok((channel, initial_state)) => {
                 // Register channel

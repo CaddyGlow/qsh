@@ -27,7 +27,7 @@ impl TestKeys {
     pub fn random_session_key() -> [u8; SESSION_KEY_LEN] {
         use rand::Rng;
         let mut key = [0u8; SESSION_KEY_LEN];
-        rand::thread_rng().fill(&mut key);
+        rand::rng().fill(&mut key);
         key
     }
 

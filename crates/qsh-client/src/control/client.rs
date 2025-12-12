@@ -15,8 +15,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 use super::proto::{
-    self, command, command_ok, command_result, event, message, resource_create, Command,
-    CommandResult, Event, Message, StatusResult, Stream, StreamDirection, StreamKind,
+    self, command, command_ok, command_result, event, message, Command, CommandResult, Event,
+    Message, StatusResult, Stream, StreamDirection, StreamKind,
 };
 use super::socket::socket_path;
 use super::{resource_info_from_proto, ResourceInfo as RustResourceInfo};
@@ -381,6 +381,9 @@ impl ControlClient {
         term_type: Option<&str>,
         shell: Option<&str>,
         command: Option<&str>,
+        env: Vec<(String, String)>,
+        output_mode: qsh_core::protocol::OutputMode,
+        allocate_pty: bool,
     ) -> Result<RustResourceInfo> {
         let result = self
             .send_command(command::Cmd::ResourceCreate(proto::ResourceCreate {
@@ -392,7 +395,13 @@ impl ControlClient {
                         term_type: term_type.unwrap_or("xterm-256color").to_string(),
                         shell: shell.unwrap_or_default().to_string(),
                         command: command.unwrap_or_default().to_string(),
-                        env: vec![],
+                        env: env.into_iter().map(|(k, v)| proto::EnvPair { key: k, value: v }).collect(),
+                        output_mode: match output_mode {
+                            qsh_core::protocol::OutputMode::Direct => proto::OutputMode::Direct as i32,
+                            qsh_core::protocol::OutputMode::Mosh => proto::OutputMode::Mosh as i32,
+                            qsh_core::protocol::OutputMode::StateDiff => proto::OutputMode::StateDiff as i32,
+                        },
+                        allocate_pty,
                     },
                 )),
             }))

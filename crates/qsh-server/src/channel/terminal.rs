@@ -33,6 +33,7 @@ struct TerminalChannelInner {
     /// Channel ID.
     channel_id: ChannelId,
     /// QUIC connection for opening streams.
+    #[allow(dead_code)]
     quic: Arc<QuicConnection>,
     /// PTY control handle.
     pty_control: Arc<dyn PtyControl>,

@@ -28,7 +28,6 @@ pub use config::{
 pub use connection::S2nConnection;
 pub use sender::S2nSender;
 pub use server::S2nAcceptor;
-pub use stats::{ConnectionStats, StatsSubscriber};
 pub use stream::{S2nStream, S2nStreamReader, S2nStreamWriter};
 
 // Import shared utilities from common module
@@ -36,13 +35,12 @@ use super::common;
 
 // Re-export common utilities for convenience
 pub use common::{
-    CHANNEL_BIDI_MAGIC, CHANNEL_STREAM_MAGIC, cert_hash, channel_bidi_header,
-    channel_stream_header, classify_io_error, enable_error_queue, generate_self_signed_cert,
+    cert_hash, classify_io_error, enable_error_queue, generate_self_signed_cert,
     load_certs_from_pem, load_key_from_pem,
 };
 
 // Import parent traits
-use super::{ConnectConfig, ConnectResult, Connection, ListenerConfig, StreamPair, StreamType};
+use super::{ConnectConfig, ConnectResult, ListenerConfig, StreamPair};
 
 // =============================================================================
 // Tests

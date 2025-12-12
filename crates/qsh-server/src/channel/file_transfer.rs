@@ -37,6 +37,7 @@ struct FileTransferChannelInner {
     /// Channel ID.
     channel_id: ChannelId,
     /// QUIC connection.
+    #[allow(dead_code)]
     quic: Arc<QuicConnection>,
     /// Transfer parameters.
     params: FileTransferParams,

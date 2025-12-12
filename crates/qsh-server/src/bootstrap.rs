@@ -55,7 +55,7 @@ impl BootstrapServer {
     pub async fn new(bind_ip: IpAddr, port: u16, port_range: (u16, u16)) -> Result<Self> {
         // Generate random session key
         let mut session_key = [0u8; SESSION_KEY_LEN];
-        rand::thread_rng().fill(&mut session_key);
+        rand::rng().fill(&mut session_key);
         debug!("Generated session key");
 
         // Generate self-signed certificate (returns PEM)

@@ -10,15 +10,10 @@ use tracing::{debug, error, info, warn};
 
 use qsh_client::cli::SshBootstrapMode;
 use qsh_client::{
-    BootstrapMode, ChannelConnection, Cli, ConnectionConfig, EscapeCommand, EscapeHandler,
-    EscapeResult, ForwarderHandle, HeartbeatTracker, LocalForwarder, ProxyHandle, RawModeGuard,
-    ReconnectableConnection, RemoteForwarder, RemoteForwarderHandle, Session, SessionContext,
-    Socks5Proxy, SshConfig, StdinReader, StdoutWriter, TerminalSessionState, bootstrap,
-    get_terminal_size, parse_dynamic_forward, parse_escape_key, parse_local_forward,
-    parse_remote_forward, random_local_port, restore_terminal,
+    BootstrapMode, ChannelConnection, Cli, ConnectionConfig, ReconnectableConnection, Session,
+    SessionContext, SshConfig, bootstrap, get_terminal_size, random_local_port,
 };
 use qsh_core::protocol::Message;
-use qsh_core::terminal::TerminalParser;
 
 #[cfg(feature = "standalone")]
 use qsh_client::standalone::authenticate as standalone_authenticate;
@@ -413,12 +408,24 @@ async fn run_control_command(
                             Some(&args.term_type),
                             args.shell.as_deref(),
                             args.command.as_deref(),
+                            args.parse_env(),
+                            args.output_mode,
+                            args.effective_allocate_pty(),
                         )
                         .await?;
                     println!("Terminal created: {}", info.id);
                     if let qsh_client::control::ResourceDetails::Terminal(t) = &info.details {
                         println!("  Size: {}x{}", t.cols, t.rows);
                         println!("  Shell: {}", t.shell);
+                        println!("  Term type: {}", t.term_type);
+                        if let Some(cmd) = &t.command {
+                            println!("  Command: {}", cmd);
+                        }
+                        println!("  Output mode: {:?}", t.output_mode);
+                        println!("  PTY: {}", t.allocate_pty);
+                        if let Some(socket) = &t.socket_path {
+                            println!("  Socket: {}", socket);
+                        }
                     }
                     Ok(0)
                 }
@@ -440,15 +447,17 @@ async fn run_control_command(
                     if resources.is_empty() {
                         println!("No active terminals");
                     } else {
-                        println!("{:<12} {:<12} {:<10} {}", "ID", "SIZE", "STATE", "SHELL");
-                        println!("{}", "-".repeat(50));
                         for info in resources {
                             if let qsh_client::control::ResourceDetails::Terminal(t) = &info.details
                             {
-                                println!(
-                                    "{:<12} {}x{:<8} {:<10} {}",
-                                    info.id, t.cols, t.rows, info.state, t.shell
+                                print!(
+                                    "{:<12} {}x{:<6} {:<10}",
+                                    info.id, t.cols, t.rows, info.state
                                 );
+                                if let Some(socket) = &t.socket_path {
+                                    print!("  {}", socket);
+                                }
+                                println!();
                             }
                         }
                     }

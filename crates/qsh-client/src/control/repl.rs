@@ -110,10 +110,15 @@ async fn execute_command(client: &mut ControlClient, line: &str) -> Result<bool>
             if resources.is_empty() {
                 println!("No resources");
             } else {
-                println!("{:<12} {:<12} {:<10}", "ID", "KIND", "STATE");
-                println!("{}", "-".repeat(36));
                 for info in resources {
-                    println!("{:<12} {:<12} {:<10}", info.id, info.kind, info.state);
+                    print!("{:<12} {:<12} {:<10}", info.id, info.kind, info.state);
+                    // Show socket path for terminals
+                    if let crate::control::ResourceDetails::Terminal(t) = &info.details {
+                        if let Some(socket) = &t.socket_path {
+                            print!("  {}", socket);
+                        }
+                    }
+                    println!();
                 }
             }
         }
@@ -134,9 +139,18 @@ async fn execute_command(client: &mut ControlClient, line: &str) -> Result<bool>
                     println!("Terminal:");
                     println!("  Size: {}x{}", t.cols, t.rows);
                     println!("  Shell: {}", t.shell);
+                    println!("  Term type: {}", t.term_type);
+                    if let Some(cmd) = &t.command {
+                        println!("  Command: {}", cmd);
+                    }
+                    println!("  Output mode: {:?}", t.output_mode);
+                    println!("  PTY: {}", t.allocate_pty);
                     println!("  Attached: {}", t.attached);
                     if let Some(pid) = t.pid {
                         println!("  PID: {}", pid);
+                    }
+                    if let Some(socket) = &t.socket_path {
+                        println!("  Socket: {}", socket);
                     }
                 }
                 crate::control::ResourceDetails::Forward(f) => {
@@ -352,7 +366,6 @@ pub struct SessionInfo {
 pub fn list_sessions() -> Result<Vec<SessionInfo>> {
     use std::fs;
     use std::path::PathBuf;
-    use std::time::SystemTime;
 
     let mut sessions = Vec::new();
 

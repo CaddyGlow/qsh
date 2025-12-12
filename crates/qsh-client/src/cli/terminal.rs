@@ -162,6 +162,14 @@ pub struct TerminalAddArgs {
     #[arg(long = "mode", value_enum, default_value = "mosh")]
     pub output_mode: OutputMode,
 
+    /// Allocate a PTY (default: true for interactive terminals)
+    #[arg(long = "pty", default_value = "true", action = ArgAction::Set)]
+    pub allocate_pty: bool,
+
+    /// Disable PTY allocation (use pipes instead, like ssh -T)
+    #[arg(long = "no-pty", conflicts_with = "allocate_pty")]
+    pub no_pty: bool,
+
     /// Attach to terminal after creation (interactive mode)
     #[arg(short = 'a', long = "attach")]
     pub attach: bool,
@@ -235,6 +243,15 @@ impl TerminalAddArgs {
             })
             .collect()
     }
+
+    /// Get the effective PTY allocation setting, handling --no-pty flag.
+    pub fn effective_allocate_pty(&self) -> bool {
+        if self.no_pty {
+            false
+        } else {
+            self.allocate_pty
+        }
+    }
 }
 
 #[cfg(test)]
@@ -255,6 +272,8 @@ mod tests {
                 "INVALID".to_string(), // Should be ignored
             ],
             output_mode: OutputMode::Mosh,
+            allocate_pty: true,
+            no_pty: false,
             attach: false,
             display: TerminalDisplayOptions::default(),
         };
@@ -263,6 +282,28 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0], ("FOO".to_string(), "bar".to_string()));
         assert_eq!(parsed[1], ("BAZ".to_string(), "qux".to_string()));
+    }
+
+    #[test]
+    fn test_effective_allocate_pty() {
+        let mut args = TerminalAddArgs {
+            cols: 80,
+            rows: 24,
+            term_type: "xterm".to_string(),
+            shell: None,
+            command: None,
+            env: vec![],
+            output_mode: OutputMode::Mosh,
+            allocate_pty: true,
+            no_pty: false,
+            attach: false,
+            display: TerminalDisplayOptions::default(),
+        };
+
+        assert!(args.effective_allocate_pty());
+
+        args.no_pty = true;
+        assert!(!args.effective_allocate_pty());
     }
 
     #[test]

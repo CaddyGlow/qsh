@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
 
 use super::resource::{
@@ -571,7 +571,7 @@ impl ResourceManager {
             ResourceError::Internal("failed to downcast to Terminal".to_string())
         })?;
 
-        terminal.io_socket_path().await.ok_or_else(|| {
+        terminal.io_socket_path().ok_or_else(|| {
             ResourceError::Internal("terminal I/O socket not ready".to_string())
         })
     }

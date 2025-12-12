@@ -293,6 +293,15 @@ pub fn resource_info_to_proto(info: &RustResourceInfo) -> proto::ResourceInfo {
                 shell: t.shell.clone(),
                 attached: t.attached,
                 pid: t.pid.unwrap_or(0),
+                socket_path: t.socket_path.clone().unwrap_or_default(),
+                term_type: t.term_type.clone(),
+                command: t.command.clone().unwrap_or_default(),
+                output_mode: match t.output_mode {
+                    qsh_core::protocol::OutputMode::Direct => proto::OutputMode::Direct.into(),
+                    qsh_core::protocol::OutputMode::Mosh => proto::OutputMode::Mosh.into(),
+                    qsh_core::protocol::OutputMode::StateDiff => proto::OutputMode::StateDiff.into(),
+                },
+                allocate_pty: t.allocate_pty,
             },
         )),
         ResourceDetails::Forward(f) => Some(proto::resource_info::Details::Forward(
@@ -353,12 +362,33 @@ pub fn resource_info_from_proto(info: proto::ResourceInfo) -> Result<RustResourc
 
     let details = match info.details {
         Some(proto::resource_info::Details::Terminal(t)) => {
+            let output_mode = proto::OutputMode::try_from(t.output_mode)
+                .unwrap_or(proto::OutputMode::Direct);
             ResourceDetails::Terminal(TerminalDetails {
                 cols: t.cols,
                 rows: t.rows,
                 shell: t.shell,
                 attached: t.attached,
                 pid: if t.pid > 0 { Some(t.pid) } else { None },
+                socket_path: if t.socket_path.is_empty() {
+                    None
+                } else {
+                    Some(t.socket_path)
+                },
+                term_type: t.term_type,
+                command: if t.command.is_empty() {
+                    None
+                } else {
+                    Some(t.command)
+                },
+                output_mode: match output_mode {
+                    proto::OutputMode::Direct | proto::OutputMode::Unspecified => {
+                        qsh_core::protocol::OutputMode::Direct
+                    }
+                    proto::OutputMode::Mosh => qsh_core::protocol::OutputMode::Mosh,
+                    proto::OutputMode::StateDiff => qsh_core::protocol::OutputMode::StateDiff,
+                },
+                allocate_pty: t.allocate_pty,
             })
         }
         Some(proto::resource_info::Details::Forward(f)) => {

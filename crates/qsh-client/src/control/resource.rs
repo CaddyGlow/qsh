@@ -221,6 +221,13 @@ pub struct TerminalDetails {
     pub shell: String,
     pub attached: bool,
     pub pid: Option<u64>,
+    /// Path to the I/O socket for raw terminal access.
+    pub socket_path: Option<String>,
+    // Creation config
+    pub term_type: String,
+    pub command: Option<String>,
+    pub output_mode: qsh_core::protocol::OutputMode,
+    pub allocate_pty: bool,
 }
 
 /// Forward-specific details.
@@ -569,6 +576,11 @@ impl Resource for StubResource {
                     shell: "/bin/bash".to_string(),
                     attached: false,
                     pid: None,
+                    socket_path: None,
+                    term_type: "xterm-256color".to_string(),
+                    command: None,
+                    output_mode: qsh_core::protocol::OutputMode::Direct,
+                    allocate_pty: true,
                 }),
                 ResourceKind::Forward => ResourceDetails::Forward(ForwardDetails {
                     forward_type: ForwardType::Local,

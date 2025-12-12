@@ -14,12 +14,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
-use tracing::debug;
 
 use qsh_core::error::Result;
 use qsh_core::protocol::SessionId;
 use qsh_core::terminal::TerminalState;
-use qsh_core::transport::{Connection, QuicConnection, QuicSender, QuicStream, StreamPair};
+use qsh_core::transport::{Connection, QuicConnection, QuicSender, QuicStream};
 use qsh_core::ConnectMode;
 
 use crate::channel::ChannelHandle;
@@ -73,9 +72,11 @@ pub struct ConnectionHandler {
     /// Session ID for this connection.
     session_id: SessionId,
     /// Pending global requests awaiting reply (request_id -> reply sender).
+    #[allow(dead_code)]
     pending_global_requests:
         Mutex<HashMap<u32, oneshot::Sender<qsh_core::protocol::GlobalReplyResult>>>,
     /// Next global request ID.
+    #[allow(dead_code)]
     next_global_request_id: std::sync::atomic::AtomicU32,
     /// Pending server-initiated channel opens awaiting accept/reject.
     pending_channel_opens:

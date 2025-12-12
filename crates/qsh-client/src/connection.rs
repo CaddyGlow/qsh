@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rand::Rng;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 // Re-export shared connection types from qsh-core
 pub use qsh_core::connection::HeartbeatTracker;
@@ -198,6 +198,7 @@ pub struct ChannelConnection {
     /// Control sender (allows sending without holding control lock).
     control_sender: QuicSender,
     /// Connection configuration.
+    #[allow(dead_code)]
     config: ConnectionConfig,
     /// Session ID from server.
     session_id: SessionId,
@@ -644,7 +645,7 @@ impl ChannelConnection {
         self.send_control(&Message::ChannelOpen(open)).await?;
 
         // Wait for ChannelAccept
-        let accept_data = match rx.await {
+        let _accept_data = match rx.await {
             Ok(Ok(data)) => data,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
@@ -1028,6 +1029,7 @@ impl ChannelConnection {
 }
 
 /// Convert a channel reject code to an error.
+#[allow(dead_code)]
 fn channel_reject_to_error(code: ChannelRejectCode, message: Option<String>) -> Error {
     let msg = message.unwrap_or_else(|| format!("{:?}", code));
     match code {

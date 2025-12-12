@@ -75,7 +75,7 @@ impl SessionAuthorizer {
     /// Generate and allow a new random session key.
     pub async fn allow_random(&self) -> [u8; SESSION_KEY_LEN] {
         let mut key = [0u8; SESSION_KEY_LEN];
-        rand::thread_rng().fill(&mut key);
+        rand::rng().fill(&mut key);
         self.allow(key).await;
         key
     }

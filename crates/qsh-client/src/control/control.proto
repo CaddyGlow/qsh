@@ -175,6 +175,16 @@ message TerminalCreateParams {
   string shell = 4;
   string command = 5;
   repeated EnvPair env = 6;
+  OutputMode output_mode = 7;
+  bool allocate_pty = 8;  // true = PTY (default), false = pipes (like ssh -T)
+}
+
+// Terminal output mode (maps to qsh_core::protocol::OutputMode)
+enum OutputMode {
+  OUTPUT_MODE_UNSPECIFIED = 0;  // Default: Direct
+  DIRECT = 1;                    // Raw PTY bytes immediately
+  MOSH = 2;                      // ANSI escape sequences from terminal state diffs
+  STATE_DIFF = 3;                // Binary StateDiff structs
 }
 
 message EnvPair {
@@ -327,6 +337,12 @@ message TerminalDetails {
   string shell = 3;
   bool attached = 4;
   uint64 pid = 5;
+  string socket_path = 6;  // Unix socket for raw I/O (e.g., /run/user/1000/qsh/session/term-0.io.sock)
+  // Creation config
+  string term_type = 7;
+  string command = 8;      // Command if not shell
+  OutputMode output_mode = 9;
+  bool allocate_pty = 10;
 }
 
 message ForwardDetails {

@@ -264,6 +264,7 @@ pub struct TerminalComponent {
     // Connection tracking
     is_first_connection: bool,
     reconnect_error: Option<String>,
+    #[allow(dead_code)]
     disconnect_requested: bool,
 
     // CLI flags
@@ -1221,6 +1222,7 @@ pub struct Session {
     /// Attachment registry for terminal I/O bindings.
     attachment_registry: crate::control::AttachmentRegistry,
     /// Channel for terminal output forwarding tasks to send messages back.
+    #[allow(dead_code)]
     control_output_tx: tokio::sync::mpsc::UnboundedSender<(usize, crate::control::proto::Message)>,
     /// Receiver for messages from terminal output forwarding tasks.
     control_output_rx: tokio::sync::mpsc::UnboundedReceiver<(usize, crate::control::proto::Message)>,
@@ -1530,13 +1532,13 @@ impl Session {
             let mut heartbeat = HeartbeatState::new(Duration::from_secs(1));
 
             // Create channel for forward commands from control socket
-            let (forward_cmd_tx, mut forward_cmd_rx) = tokio::sync::mpsc::channel::<crate::control::ForwardAddCommand>(16);
+            let (_forward_cmd_tx, mut forward_cmd_rx) = tokio::sync::mpsc::channel::<crate::control::ForwardAddCommand>(16);
 
             // Create channel for terminal commands from control socket
-            let (terminal_cmd_tx, mut terminal_cmd_rx) = tokio::sync::mpsc::channel::<crate::control::TerminalCommand>(16);
+            let (_terminal_cmd_tx, mut terminal_cmd_rx) = tokio::sync::mpsc::channel::<crate::control::TerminalCommand>(16);
 
             // Create channel for control responses (allows spawned tasks to send responses back)
-            let (control_response_tx, mut control_response_rx) = tokio::sync::mpsc::channel::<(usize, crate::control::Message)>(16);
+            let (_control_response_tx, mut control_response_rx) = tokio::sync::mpsc::channel::<(usize, crate::control::Message)>(16);
 
             // Unified event loop
             let res: Result<i32> = loop {
@@ -1628,7 +1630,7 @@ impl Session {
                         use crate::control::TerminalCommand;
                         use crate::control::resources::Terminal;
                         match cmd {
-                            TerminalCommand::Open { cols, rows, term_type, shell, command, response_tx } => {
+                            TerminalCommand::Open { cols, rows, term_type, shell, command, env, output_mode, allocate_pty, response_tx } => {
                                 // Create a Terminal resource and start it via ResourceManager
                                 info!(cols, rows, term_type = %term_type, shell = ?shell, command = ?command, "Terminal open requested");
 
@@ -1641,7 +1643,9 @@ impl Session {
                                         Some(term_type.clone()),
                                         shell.clone(),
                                         command.clone(),
-                                        vec![],
+                                        env,
+                                        output_mode,
+                                        allocate_pty,
                                     );
 
                                     // Add to resource manager (gets assigned ID like "term-0")
@@ -2205,6 +2209,14 @@ async fn handle_unified_command(
                 }
                 Some(proto::resource_create::Params::Terminal(params)) => {
                     use crate::control::resources::Terminal;
+                    use qsh_core::protocol::OutputMode;
+
+                    // Convert protobuf output mode to core enum
+                    let output_mode = match proto::OutputMode::try_from(params.output_mode) {
+                        Ok(proto::OutputMode::Mosh) => OutputMode::Mosh,
+                        Ok(proto::OutputMode::StateDiff) => OutputMode::StateDiff,
+                        Ok(proto::OutputMode::Direct) | Ok(proto::OutputMode::Unspecified) | Err(_) => OutputMode::Direct,
+                    };
 
                     // Create the terminal resource
                     let terminal = Terminal::from_params(
@@ -2215,6 +2227,8 @@ async fn handle_unified_command(
                         if params.shell.is_empty() { None } else { Some(params.shell) },
                         if params.command.is_empty() { None } else { Some(params.command) },
                         params.env.into_iter().map(|e| (e.key, e.value)).collect(),
+                        output_mode,
+                        params.allocate_pty,
                     );
 
                     // Get session directory for terminal I/O socket
