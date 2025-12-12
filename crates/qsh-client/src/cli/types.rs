@@ -4,7 +4,7 @@ use std::path::PathBuf;
 #[cfg(feature = "tunnel")]
 use std::str::FromStr;
 
-use clap::{ArgAction, Parser, ValueEnum};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use qsh_core::protocol::OutputMode;
 
 /// Log output format for CLI.
@@ -118,6 +118,140 @@ impl FromStr for TunnelArg {
     }
 }
 
+/// Control subcommands for managing existing qsh sessions.
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Manage port forwards
+    Forward(ForwardCommand),
+    /// Manage terminals
+    Terminal(TerminalCommand),
+    /// Query session status
+    Status(StatusArgs),
+    /// Interactive control REPL
+    Ctl(CtlArgs),
+    /// List active sessions
+    Sessions,
+}
+
+/// Terminal subcommands.
+#[derive(Debug, Parser)]
+pub struct TerminalCommand {
+    #[command(subcommand)]
+    pub action: TerminalAction,
+}
+
+/// Terminal actions.
+#[derive(Debug, Subcommand)]
+pub enum TerminalAction {
+    /// Open a new terminal
+    Open(TerminalOpenArgs),
+    /// Close a terminal
+    Close(TerminalCloseArgs),
+    /// Attach to a terminal (interactive I/O)
+    Attach(TerminalAttachArgs),
+    /// List active terminals
+    List,
+}
+
+/// Arguments for opening a terminal.
+#[derive(Debug, Parser)]
+pub struct TerminalOpenArgs {
+    /// Terminal columns
+    #[arg(long, value_name = "COLS")]
+    pub cols: Option<u32>,
+
+    /// Terminal rows
+    #[arg(long, value_name = "ROWS")]
+    pub rows: Option<u32>,
+
+    /// Terminal type (TERM env var)
+    #[arg(long = "term", value_name = "TYPE")]
+    pub term_type: Option<String>,
+
+    /// Shell to run
+    #[arg(long, value_name = "SHELL")]
+    pub shell: Option<String>,
+
+    /// Command to run instead of shell
+    #[arg(value_name = "COMMAND")]
+    pub command: Option<String>,
+}
+
+/// Arguments for closing a terminal.
+#[derive(Debug, Parser)]
+pub struct TerminalCloseArgs {
+    /// Terminal ID to close
+    #[arg(value_name = "ID")]
+    pub terminal_id: u64,
+}
+
+/// Arguments for attaching to a terminal.
+#[derive(Debug, Parser)]
+pub struct TerminalAttachArgs {
+    /// Terminal ID to attach to (default: most recent)
+    #[arg(value_name = "ID")]
+    pub terminal_id: Option<u64>,
+}
+
+/// Port forward subcommands.
+#[derive(Debug, Parser)]
+pub struct ForwardCommand {
+    #[command(subcommand)]
+    pub action: ForwardAction,
+}
+
+/// Forward actions.
+#[derive(Debug, Subcommand)]
+pub enum ForwardAction {
+    /// Add a new port forward
+    Add(ForwardAddArgs),
+    /// List active port forwards
+    List,
+    /// Remove a port forward
+    Remove(ForwardRemoveArgs),
+}
+
+/// Arguments for adding a port forward.
+#[derive(Debug, Parser)]
+pub struct ForwardAddArgs {
+    /// Local forward: [bind_addr:]port:host:hostport
+    /// Binds locally and forwards to remote target through the server.
+    #[arg(short = 'L', long = "local", value_name = "SPEC", group = "forward_type")]
+    pub local: Option<String>,
+
+    /// Remote forward: [bind_addr:]port:host:hostport
+    /// Server binds and forwards to local target.
+    #[arg(short = 'R', long = "remote", value_name = "SPEC", group = "forward_type")]
+    pub remote: Option<String>,
+
+    /// Dynamic SOCKS5 forward: [bind_addr:]port
+    /// Creates a SOCKS5 proxy.
+    #[arg(short = 'D', long = "dynamic", value_name = "SPEC", group = "forward_type")]
+    pub dynamic: Option<String>,
+}
+
+/// Arguments for removing a port forward.
+#[derive(Debug, Parser)]
+pub struct ForwardRemoveArgs {
+    /// Forward ID to remove
+    #[arg(value_name = "ID")]
+    pub forward_id: String,
+}
+
+/// Arguments for status query.
+#[derive(Debug, Parser)]
+pub struct StatusArgs {
+    /// Show detailed information
+    #[arg(short = 'd', long)]
+    pub detailed: bool,
+}
+
+/// Arguments for interactive REPL.
+#[derive(Debug, Parser)]
+pub struct CtlArgs {
+    // No arguments for now
+}
+
 /// Modern roaming-capable remote terminal.
 #[derive(Debug, Parser)]
 #[command(
@@ -126,13 +260,20 @@ impl FromStr for TunnelArg {
     about = "Modern roaming-capable remote terminal"
 )]
 pub struct Cli {
+    /// Control subcommand (forward, status, ctl, sessions)
+    #[command(subcommand)]
+    pub subcommand: Option<Command>,
+
     /// Remote host (user@host or host)
-    #[arg(required_unless_present_any = ["bootstrap", "attach"])]
     pub destination: Option<String>,
 
     /// Command to execute on remote host (optional)
     #[arg(trailing_var_arg = true)]
     pub command: Vec<String>,
+
+    /// Session name for control socket (default: auto-discover latest)
+    #[arg(short = 'S', long = "session", global = true, value_name = "NAME")]
+    pub session: Option<String>,
 
     /// SSH port to connect to
     #[arg(short = 'p', long, default_value_t = 22)]

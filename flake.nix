@@ -105,6 +105,9 @@
           clang
           cmake
           mold
+
+          # For protobuf codegen (prost-build)
+          protobuf
         ];
 
         # Linux-specific cross-compilation toolchains

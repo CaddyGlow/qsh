@@ -120,9 +120,14 @@ impl StreamDirectionMapper {
                 // Should WE initiate? Only if we ARE the logical server
                 self.logical_role == EndpointRole::Server
             }
-            StreamType::ChannelBidi(_) => {
-                // Bidirectional channels opened by logical client
-                self.logical_role == EndpointRole::Client
+            StreamType::ChannelBidi(channel_id) => {
+                // Bidirectional channels are opened by the channel initiator encoded in
+                // the ChannelId (client side => logical client, server side => logical server).
+                if channel_id.is_client() {
+                    self.logical_role == EndpointRole::Client
+                } else {
+                    self.logical_role == EndpointRole::Server
+                }
             }
         }
     }
@@ -156,8 +161,14 @@ impl StreamDirectionMapper {
 
         match magic {
             CHANNEL_BIDI_MAGIC if !is_uni => {
-                // Bidirectional channel stream
-                Some(StreamType::ChannelBidi(channel_id))
+                // Bidirectional channel stream. ChannelId side says who initiated.
+                // Validate stream initiator matches ChannelId side; otherwise reject.
+                let expected_client_initiated = channel_id.is_client();
+                if is_client_initiated == expected_client_initiated {
+                    Some(StreamType::ChannelBidi(channel_id))
+                } else {
+                    None
+                }
             }
             CHANNEL_STREAM_MAGIC if is_uni => {
                 // Unidirectional channel stream - determine In vs Out based on roles
@@ -220,9 +231,16 @@ impl StreamDirectionMapper {
                 let client_initiated = self.is_inverted();
                 (client_initiated, true) // Unidirectional
             }
-            StreamType::ChannelBidi(_) => {
-                // Bidi channels initiated by logical client
-                let client_initiated = !self.is_inverted();
+            StreamType::ChannelBidi(channel_id) => {
+                // Bidi channels initiated by the side encoded in ChannelId.
+                // Map logical initiator -> QUIC initiator using inversion flag.
+                let client_initiated = if channel_id.is_client() {
+                    // Logical client initiates
+                    !self.is_inverted()
+                } else {
+                    // Logical server initiates
+                    self.is_inverted()
+                };
                 (client_initiated, false) // Bidirectional
             }
         }

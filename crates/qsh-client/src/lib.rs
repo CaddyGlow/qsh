@@ -13,11 +13,13 @@
 //! - Channel-based multiplexing (SSH-style)
 //! - Direct connection mode with SSH key authentication (feature-gated)
 //! - Attach pipe for bootstrap sessions (reverse mode)
+//! - Control socket for managing existing connections
 
 pub mod attach;
 pub mod channel;
 pub mod cli;
 pub mod connection;
+pub mod control;
 pub mod escape;
 pub mod file;
 pub mod forward;

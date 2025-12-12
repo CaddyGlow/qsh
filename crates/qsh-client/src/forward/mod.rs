@@ -6,10 +6,12 @@
 //! - `RemoteForwarder`: Remote port forward (-R) - server listens, client connects to local target
 
 mod local;
+mod registry;
 mod remote;
 mod socks;
 
 pub use local::{ForwarderHandle, LocalForwarder};
+pub use registry::{DynamicForwardEntry, ForwardEntryType, ForwardRegistry, LocalForwardEntry, RemoteForwardEntry};
 pub use remote::{RemoteForwarder, RemoteForwarderHandle};
 pub use socks::{ProxyHandle, Socks5Proxy};
 

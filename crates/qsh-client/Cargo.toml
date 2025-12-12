@@ -47,14 +47,21 @@ libc = { workspace = true }
 rand = { workspace = true }
 indicatif = "0.18"
 futures = "0.3"
+prost = "0.13"
+prost-types = "0.13"
+rustyline = "14.0"
 
 # Standalone mode (optional)
 ssh-key = { workspace = true, optional = true }
 rpassword = { workspace = true, optional = true }
+
+[build-dependencies]
+prost-build = "0.13"
 
 [dev-dependencies]
 tokio-test = { workspace = true }
 proptest = { workspace = true }
 test-case = { workspace = true }
 assert_matches = { workspace = true }
+tempfile = { workspace = true }
 qsh-test-utils = { path = "../qsh-test-utils", default-features = false }

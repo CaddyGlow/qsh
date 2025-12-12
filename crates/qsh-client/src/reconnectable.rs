@@ -119,6 +119,11 @@ impl ReconnectableConnection {
         read_lock(&self.context).session_id()
     }
 
+    /// Get the server address.
+    pub fn server_addr(&self) -> std::net::SocketAddr {
+        read_lock(&self.context).server_addr
+    }
+
     /// Get a reference to the underlying connection.
     ///
     /// Returns None if currently reconnecting. Callers should use

@@ -50,9 +50,11 @@ fn test_destination_with_respond_mode_fails() {
 
 #[test]
 fn test_no_destination_and_no_bootstrap_fails() {
-    // This should fail at clap parsing level due to required_unless_present_any
-    let result = Cli::try_parse_from(["qsh"]);
+    // This should succeed at clap parsing level but fail at validation
+    let cli = Cli::try_parse_from(["qsh"]).unwrap();
+    let result = cli.validate_and_infer_connect_mode();
     assert!(result.is_err());
+    assert!(result.unwrap_err().contains("destination host must be specified"));
 }
 
 #[test]

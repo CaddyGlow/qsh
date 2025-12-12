@@ -28,9 +28,276 @@ use qsh_client::{DirectAuthenticator, DirectConfig, establish_quic_connection};
 
 use qsh_core::protocol::TermSize;
 
+/// Format a duration in human-readable form.
+fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else if secs < 86400 {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!("{}d {}h", secs / 86400, (secs % 86400) / 3600)
+    }
+}
+
+/// Resolve session name: use explicit -S flag or auto-discover latest.
+fn resolve_session_name(cli: &Cli) -> qsh_core::Result<String> {
+    use qsh_client::control::discover_latest_session;
+
+    if let Some(ref name) = cli.session {
+        Ok(name.clone())
+    } else {
+        discover_latest_session()
+    }
+}
+
+/// Attach to a terminal in an existing qsh session.
+///
+/// This creates an interactive session with the specified terminal,
+/// relaying stdin/stdout through the control socket.
+async fn run_terminal_attach(session_name: &str, terminal_id: Option<u64>) -> qsh_core::Result<i32> {
+    use qsh_client::control::ControlClient;
+
+    let mut client = ControlClient::connect(session_name).await?;
+
+    // Get terminal list to find the target terminal
+    let list = client.list_terminals().await?;
+
+    if list.terminals.is_empty() {
+        return Err(qsh_core::Error::Transport {
+            message: "no terminals available in session".to_string(),
+        });
+    }
+
+    // Find the target terminal
+    let terminal = if let Some(id) = terminal_id {
+        list.terminals.iter().find(|t| t.terminal_id == id)
+            .ok_or_else(|| qsh_core::Error::Transport {
+                message: format!("terminal {} not found", id),
+            })?
+    } else {
+        // Use the most recent (last) terminal
+        list.terminals.last().unwrap()
+    };
+
+    // Terminal attach requires bidirectional I/O streaming through the control socket.
+    // This is not yet implemented - the control protocol needs TerminalInput/TerminalOutput
+    // messages to support interactive terminal I/O.
+    //
+    // For now, print the terminal info and suggest using the main session.
+    println!("Terminal {} ({}x{}) - {}", terminal.terminal_id, terminal.cols, terminal.rows, terminal.status);
+    if let Some(ref shell) = terminal.shell {
+        println!("Shell: {}", shell);
+    }
+    println!();
+    println!("Terminal attach is not yet implemented.");
+    println!("Interactive I/O requires TerminalInput/TerminalOutput protocol messages.");
+    println!();
+    println!("To interact with this terminal, use the main qsh session.");
+
+    Ok(1)
+}
+
+/// Run a control subcommand.
+async fn run_control_command(cli: &Cli, subcommand: &qsh_client::cli::Command) -> qsh_core::Result<i32> {
+    use qsh_client::cli::{Command, ForwardAction, TerminalAction};
+    use qsh_client::control::ControlClient;
+
+    match subcommand {
+        Command::Ctl(_) => {
+            // Run interactive REPL
+            qsh_client::control::run_repl(cli.session.as_deref()).await
+        }
+        Command::Status(args) => {
+            // Get and display status
+            let session_name = resolve_session_name(cli)?;
+
+            let mut client = ControlClient::connect(&session_name).await?;
+            let status = client.get_status().await?;
+
+            println!("State: {}", status.state);
+            if let Some(addr) = status.server_addr {
+                println!("Server: {}", addr);
+            }
+            if let Some(uptime) = status.uptime_secs {
+                println!("Uptime: {}s", uptime);
+            }
+            if let Some(rtt) = status.rtt_ms {
+                println!("RTT: {}ms", rtt);
+            }
+
+            if args.detailed {
+                if let Some(sent) = status.bytes_sent {
+                    println!("Bytes sent: {}", sent);
+                }
+                if let Some(recv) = status.bytes_received {
+                    println!("Bytes received: {}", recv);
+                }
+            }
+
+            Ok(0)
+        }
+        Command::Forward(fwd_cmd) => {
+            let session_name = resolve_session_name(cli)?;
+
+            let mut client = ControlClient::connect(&session_name).await?;
+
+            match &fwd_cmd.action {
+                ForwardAction::Add(args) => {
+                    let response = if let Some(ref spec) = args.local {
+                        client.add_forward_local(spec).await?
+                    } else if let Some(ref spec) = args.remote {
+                        client.add_forward_remote(spec).await?
+                    } else if let Some(ref spec) = args.dynamic {
+                        client.add_forward_dynamic(spec).await?
+                    } else {
+                        return Err(qsh_core::Error::Transport {
+                            message: "specify forward type: -L (local), -R (remote), or -D (dynamic)".to_string(),
+                        });
+                    };
+                    println!("Forward added: {}", response.forward_id);
+                    Ok(0)
+                }
+                ForwardAction::List => {
+                    let list = client.list_forwards().await?;
+                    if list.forwards.is_empty() {
+                        println!("No active forwards");
+                    } else {
+                        for fwd in list.forwards {
+                            print!("[{}] {}:{}", fwd.id, fwd.bind_addr, fwd.bind_port);
+                            if let Some(ref dest_host) = fwd.dest_host {
+                                print!(" -> {}", dest_host);
+                                if let Some(dest_port) = fwd.dest_port {
+                                    print!(":{}", dest_port);
+                                }
+                            }
+                            println!(" ({}, {})", fwd.r#type, fwd.status);
+                        }
+                    }
+                    Ok(0)
+                }
+                ForwardAction::Remove(args) => {
+                    let response = client.remove_forward(&args.forward_id).await?;
+                    if response.removed {
+                        println!("Forward removed");
+                    } else {
+                        println!("Failed to remove forward");
+                    }
+                    Ok(0)
+                }
+            }
+        }
+        Command::Sessions => {
+            // List active sessions
+            use qsh_client::control::list_sessions;
+            use std::time::SystemTime;
+
+            let sessions = list_sessions()?;
+
+            if sessions.is_empty() {
+                println!("No active qsh sessions found.");
+                return Ok(0);
+            }
+
+            println!("Active qsh sessions:");
+            println!("{:<20} {:<40} {}", "NAME", "SOCKET", "AGE");
+            println!("{}", "-".repeat(70));
+
+            for session in sessions {
+                let age = SystemTime::now()
+                    .duration_since(session.modified)
+                    .map(|d| format_duration(d))
+                    .unwrap_or_else(|_| "?".to_string());
+
+                println!(
+                    "{:<20} {:<40} {}",
+                    session.name,
+                    session.socket_path.display(),
+                    age
+                );
+            }
+
+            Ok(0)
+        }
+        Command::Terminal(term_cmd) => {
+            let session_name = resolve_session_name(cli)?;
+            let mut client = ControlClient::connect(&session_name).await?;
+
+            match &term_cmd.action {
+                TerminalAction::Open(args) => {
+                    let response = client.open_terminal(
+                        args.cols,
+                        args.rows,
+                        args.term_type.clone(),
+                        args.shell.clone(),
+                        args.command.clone(),
+                    ).await?;
+                    println!("Terminal opened: {} ({}x{})", response.terminal_id, response.cols, response.rows);
+                    Ok(0)
+                }
+                TerminalAction::Close(args) => {
+                    let response = client.close_terminal(args.terminal_id).await?;
+                    if response.closed {
+                        if let Some(exit_code) = response.exit_code {
+                            println!("Terminal closed (exit code: {})", exit_code);
+                        } else {
+                            println!("Terminal closed");
+                        }
+                    } else {
+                        println!("Failed to close terminal");
+                    }
+                    Ok(0)
+                }
+                TerminalAction::List => {
+                    let list = client.list_terminals().await?;
+                    if list.terminals.is_empty() {
+                        println!("No active terminals");
+                    } else {
+                        println!("{:<10} {:<12} {:<10} {}", "ID", "SIZE", "STATUS", "SHELL");
+                        println!("{}", "-".repeat(50));
+                        for term in list.terminals {
+                            let shell = term.shell.as_deref().unwrap_or("-");
+                            println!(
+                                "{:<10} {}x{:<8} {:<10} {}",
+                                term.terminal_id,
+                                term.cols,
+                                term.rows,
+                                term.status,
+                                shell
+                            );
+                        }
+                    }
+                    Ok(0)
+                }
+                TerminalAction::Attach(args) => {
+                    // Attach requires raw terminal and interactive I/O
+                    run_terminal_attach(&session_name, args.terminal_id).await
+                }
+            }
+        }
+    }
+}
+
 fn main() {
     // Parse CLI arguments
     let cli = Cli::parse();
+
+    // Check for control subcommands first (before validation)
+    if let Some(ref subcommand) = cli.subcommand {
+        // Control subcommands have their own flow
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        let result = rt.block_on(async { run_control_command(&cli, subcommand).await });
+
+        match result {
+            Ok(exit_code) => std::process::exit(exit_code),
+            Err(e) => {
+                eprintln!("qsh: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
 
     // Validate CLI arguments and infer connect mode before doing anything else
     let _effective_connect_mode = match cli.validate_and_infer_connect_mode() {

@@ -912,6 +912,13 @@ impl TerminalComponent {
         self.channel.as_ref().map(|ch| ch.channel_id())
     }
 
+    /// Get current terminal size.
+    ///
+    /// Returns the current terminal size, falling back to 80x24 if unavailable.
+    pub fn terminal_size(&self) -> TermSize {
+        crate::get_terminal_size().unwrap_or(TermSize { cols: 80, rows: 24 })
+    }
+
     /// Write data to stdout
     pub async fn stdout_write(&mut self, data: &[u8]) -> Result<()> {
         self.stdout.write(data).await.map_err(|e| e.into())
@@ -1201,11 +1208,42 @@ impl ForwardComponent {
 pub struct Session {
     connection: std::sync::Arc<ReconnectableConnection>,
     parts: SessionParts,
+    control: Option<crate::control::ControlSocket>,
+    session_name: Option<String>,
+    /// Forward registry for tracking runtime-added forwards.
+    forward_registry: std::sync::Arc<std::sync::Mutex<crate::forward::ForwardRegistry>>,
+    /// Connection start time (for uptime tracking).
+    connected_at: Option<std::time::Instant>,
 }
 
 impl Session {
     pub fn new(connection: std::sync::Arc<ReconnectableConnection>, parts: SessionParts) -> Self {
-        Self { connection, parts }
+        Self {
+            connection,
+            parts,
+            control: None,
+            session_name: None,
+            forward_registry: std::sync::Arc::new(std::sync::Mutex::new(crate::forward::ForwardRegistry::new())),
+            connected_at: None,
+        }
+    }
+
+    /// Attach a control socket to this session.
+    ///
+    /// The control socket allows separate terminal sessions to manage this
+    /// connection (query status, add/remove port forwards, etc.).
+    pub fn with_control_socket(mut self, socket: crate::control::ControlSocket) -> Self {
+        self.control = Some(socket);
+        self
+    }
+
+    /// Set the session name for this connection.
+    ///
+    /// The session name is used for identifying the control socket and
+    /// for display purposes.
+    pub fn with_session_name(mut self, name: String) -> Self {
+        self.session_name = Some(name);
+        self
     }
 
     /// Construct session from CLI arguments.
@@ -1221,7 +1259,7 @@ impl Session {
         let is_forward_only = cli.is_forward_only();
 
         let terminal = if !is_forward_only {
-            Some(TerminalComponent::new(cli, user_host)?)
+            Some(TerminalComponent::new(cli, user_host.clone())?)
         } else {
             None
         };
@@ -1239,7 +1277,26 @@ impl Session {
             });
         }
 
-        Ok(Self::new(connection, SessionParts { terminal, forwards }))
+        let mut session = Self::new(connection, SessionParts { terminal, forwards });
+
+        // Create control socket for session management
+        // Session name: use -S flag, or derive from user@host
+        let session_name = cli.session.clone().or(user_host).unwrap_or_else(|| "qsh".to_string());
+        let socket_path = crate::control::socket_path(&session_name);
+
+        match crate::control::ControlSocket::new(&socket_path) {
+            Ok(control_socket) => {
+                tracing::info!(path = %socket_path.display(), name = %session_name, "Control socket created");
+                session.control = Some(control_socket);
+                session.session_name = Some(session_name);
+            }
+            Err(e) => {
+                // Non-fatal: log warning but continue without control socket
+                tracing::warn!(error = %e, path = %socket_path.display(), "Failed to create control socket");
+            }
+        }
+
+        Ok(session)
     }
 
     /// Construct session for bootstrap/responder mode.
@@ -1270,6 +1327,9 @@ impl Session {
         loop {
             let conn = self.connection.wait_connected().await?;
 
+            // Track connection start time
+            self.connected_at = Some(std::time::Instant::now());
+
             // Initialize components
             if let Some(ref mut term) = self.parts.terminal {
                 term.on_connect(&conn).await?;
@@ -1280,6 +1340,15 @@ impl Session {
 
             let mut heartbeat = HeartbeatState::new(Duration::from_secs(1));
 
+            // Create channel for forward commands from control socket
+            let (forward_cmd_tx, mut forward_cmd_rx) = tokio::sync::mpsc::channel::<crate::control::ForwardAddCommand>(16);
+
+            // Create channel for terminal commands from control socket
+            let (terminal_cmd_tx, mut terminal_cmd_rx) = tokio::sync::mpsc::channel::<crate::control::TerminalCommand>(16);
+
+            // Create channel for control responses (allows spawned tasks to send responses back)
+            let (control_response_tx, mut control_response_rx) = tokio::sync::mpsc::channel::<(usize, crate::control::ControlResponse)>(16);
+
             // Unified event loop
             let res: Result<i32> = loop {
                 tokio::select! {
@@ -1289,6 +1358,146 @@ impl Session {
                     _ = tokio::signal::ctrl_c() => {
                         info!("Shutting down...");
                         break Ok(0);
+                    }
+
+                    // Forward command from control socket
+                    Some(cmd) = forward_cmd_rx.recv() => {
+                        use crate::control::ForwardAddCommand;
+                        match cmd {
+                            ForwardAddCommand::Local { bind_addr, bind_port, dest_host, dest_port, response_tx } => {
+                                let bind_addr_str = bind_addr.as_deref().unwrap_or("0.0.0.0");
+                                let bind_socket: std::net::SocketAddr = format!("{}:{}", bind_addr_str, bind_port)
+                                    .parse()
+                                    .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], bind_port as u16)));
+
+                                let forwarder = crate::LocalForwarder::new(
+                                    bind_socket,
+                                    dest_host.clone(),
+                                    dest_port as u16,
+                                    std::sync::Arc::clone(&conn),
+                                );
+
+                                match forwarder.start().await {
+                                    Ok(handle) => {
+                                        let local_addr = handle.local_addr();
+                                        let target = format!("{}:{}", dest_host, dest_port);
+                                        let spec = format!("{}:{}", local_addr, target);
+                                        info!(bind = %local_addr, target = %target, "Local forward started");
+
+                                        // Register in registry (passing handle to keep forwarder alive)
+                                        let id = {
+                                            let mut registry = self.forward_registry.lock().unwrap();
+                                            registry.add_local(&spec, local_addr, target, Some(handle))
+                                        };
+
+                                        let _ = response_tx.send(Ok(id));
+                                    }
+                                    Err(e) => {
+                                        error!(error = %e, "Failed to start local forward");
+                                        let _ = response_tx.send(Err(e.to_string()));
+                                    }
+                                }
+                            }
+                            ForwardAddCommand::Dynamic { bind_addr, bind_port, response_tx } => {
+                                let bind_addr_str = bind_addr.as_deref().unwrap_or("0.0.0.0");
+                                let bind_socket: std::net::SocketAddr = format!("{}:{}", bind_addr_str, bind_port)
+                                    .parse()
+                                    .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], bind_port as u16)));
+
+                                let proxy = crate::Socks5Proxy::new(bind_socket, std::sync::Arc::clone(&conn));
+
+                                match proxy.start().await {
+                                    Ok(handle) => {
+                                        let local_addr = handle.local_addr();
+                                        let spec = local_addr.to_string();
+                                        info!(bind = %local_addr, "SOCKS5 proxy started");
+
+                                        // Register in registry (passing handle to keep proxy alive)
+                                        let id = {
+                                            let mut registry = self.forward_registry.lock().unwrap();
+                                            registry.add_dynamic(&spec, local_addr, Some(handle))
+                                        };
+
+                                        let _ = response_tx.send(Ok(id));
+                                    }
+                                    Err(e) => {
+                                        error!(error = %e, "Failed to start SOCKS5 proxy");
+                                        let _ = response_tx.send(Err(e.to_string()));
+                                    }
+                                }
+                            }
+                            ForwardAddCommand::Remote { bind_addr: _, bind_port: _, dest_host: _, dest_port: _, response_tx } => {
+                                // Remote forwards require server-side support
+                                // For now, return not implemented
+                                let _ = response_tx.send(Err("remote forwards not yet implemented".to_string()));
+                            }
+                        }
+                    }
+
+                    // Terminal command from control socket
+                    Some(cmd) = terminal_cmd_rx.recv() => {
+                        use crate::control::TerminalCommand;
+                        match cmd {
+                            TerminalCommand::Open { cols, rows, term_type, shell, command, response_tx } => {
+                                // Opening new terminals requires creating new PTY channels
+                                // For now, return a placeholder terminal ID
+                                // TODO: Implement actual terminal multiplexing
+                                info!(cols, rows, term_type = %term_type, shell = ?shell, command = ?command, "Terminal open requested");
+
+                                // If we have a main terminal, return its "ID" (0)
+                                // Otherwise return an error
+                                if self.parts.terminal.is_some() {
+                                    // Return terminal ID 0 for the main terminal
+                                    let _ = response_tx.send(Ok(0));
+                                } else {
+                                    let _ = response_tx.send(Err("no terminal available (session started with -N)".to_string()));
+                                }
+                            }
+                            TerminalCommand::Close { terminal_id, response_tx } => {
+                                info!(terminal_id, "Terminal close requested");
+                                // For now, we only support the main terminal (ID 0)
+                                if terminal_id == 0 {
+                                    // Can't close the main terminal via control socket
+                                    let _ = response_tx.send(Err("cannot close main terminal via control socket".to_string()));
+                                } else {
+                                    let _ = response_tx.send(Err(format!("terminal {} not found", terminal_id)));
+                                }
+                            }
+                            TerminalCommand::Resize { terminal_id, cols, rows, response_tx } => {
+                                info!(terminal_id, cols, rows, "Terminal resize requested");
+                                // Resize the main terminal if ID is 0
+                                if terminal_id == 0 {
+                                    if let Some(ref term) = self.parts.terminal {
+                                        if let Some(channel_id) = term.channel_id() {
+                                            // Send resize to the server
+                                            match conn.send_resize(channel_id, cols as u16, rows as u16).await {
+                                                Ok(_) => {
+                                                    let _ = response_tx.send(Ok(()));
+                                                }
+                                                Err(e) => {
+                                                    let _ = response_tx.send(Err(format!("failed to resize: {}", e)));
+                                                }
+                                            }
+                                        } else {
+                                            let _ = response_tx.send(Err("terminal channel not open".to_string()));
+                                        }
+                                    } else {
+                                        let _ = response_tx.send(Err("no terminal available".to_string()));
+                                    }
+                                } else {
+                                    let _ = response_tx.send(Err(format!("terminal {} not found", terminal_id)));
+                                }
+                            }
+                        }
+                    }
+
+                    // Control response from spawned task
+                    Some((client_id, response)) = control_response_rx.recv() => {
+                        if let Some(ctl) = self.control.as_mut() {
+                            if let Err(e) = ctl.send_response(client_id, response).await {
+                                tracing::warn!(error = %e, "Failed to send control response");
+                            }
+                        }
                     }
 
                     // Heartbeat timer
@@ -1499,6 +1708,87 @@ impl Session {
                         }
                     } => {
                         // Forwards typically don't emit events
+                    }
+
+                    // Control socket events (guarded)
+                    ev = async {
+                        match self.control.as_mut() {
+                            Some(ctl) => ctl.next_event().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if let Ok(Some(event)) = ev {
+                            use crate::control::{ControlEvent, handle_command, SessionState, ConnectionState as CtlConnState, TerminalState};
+
+                            match event {
+                                ControlEvent::ClientConnected { client_id } => {
+                                    tracing::debug!(client_id, "Control client connected");
+                                }
+                                ControlEvent::Request { client_id, request } => {
+                                    // Build SessionState from actual session data
+                                    let connection_state = match self.connection.state() {
+                                        ConnectionState::Connected => CtlConnState::Connected,
+                                        ConnectionState::Reconnecting | ConnectionState::Connecting => CtlConnState::Reconnecting,
+                                        _ => CtlConnState::Disconnected,
+                                    };
+
+                                    // Build terminal list from terminal component
+                                    let terminals: Vec<TerminalState> = if let Some(ref term) = self.parts.terminal {
+                                        if let Some(channel_id) = term.channel_id() {
+                                            let size = term.terminal_size();
+                                            vec![TerminalState {
+                                                terminal_id: channel_id.id,
+                                                cols: size.cols as u32,
+                                                rows: size.rows as u32,
+                                                status: "open".to_string(),
+                                                shell: None, // Not tracked
+                                                pid: None,   // Not tracked
+                                            }]
+                                        } else {
+                                            vec![]
+                                        }
+                                    } else {
+                                        vec![]
+                                    };
+
+                                    let state = SessionState {
+                                        session_name: self.session_name.clone().unwrap_or_else(|| "unknown".to_string()),
+                                        remote_host: None, // TODO: Parse from session_name if available
+                                        remote_user: None, // TODO: Parse from session_name if available
+                                        connection_state,
+                                        server_addr: Some(self.connection.server_addr().to_string()),
+                                        connected_at: self.connected_at,
+                                        forward_registry: self.forward_registry.clone(),
+                                        forward_add_tx: Some(forward_cmd_tx.clone()),
+                                        forward_remove_tx: None, // TODO: Wire up forward remove channel
+                                        terminal_cmd_tx: Some(terminal_cmd_tx.clone()),
+                                        terminals,
+                                        rtt_ms: heartbeat.tracker.srtt().map(|d| d.as_millis() as u32),
+                                        bytes_sent: 0, // TODO: Track bytes
+                                        bytes_received: 0, // TODO: Track bytes
+                                    };
+
+                                    // Spawn a task to handle the command asynchronously.
+                                    // This is necessary because commands like forward_add need to
+                                    // send via the forward_cmd channel and wait for a response,
+                                    // which would deadlock if done synchronously in the select! loop.
+                                    let response_tx = control_response_tx.clone();
+                                    tokio::spawn(async move {
+                                        let response = handle_command(request, &state).await;
+                                        if let Err(e) = response_tx.send((client_id, response)).await {
+                                            tracing::warn!(error = %e, "Failed to queue control response");
+                                        }
+                                    });
+                                }
+                                ControlEvent::ClientDisconnected { client_id, error } => {
+                                    if let Some(e) = error {
+                                        tracing::debug!(client_id, error = %e, "Control client disconnected");
+                                    } else {
+                                        tracing::debug!(client_id, "Control client disconnected");
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             };

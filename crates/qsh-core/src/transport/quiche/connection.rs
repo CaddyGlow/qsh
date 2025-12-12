@@ -384,8 +384,9 @@ impl QuicheConnectionInner {
             }
         }
 
-        // Control stream is always bidi stream 0 (client) or 1 (server)
-        if stream_id == 0 || stream_id == 1 {
+        // Control stream is only the client-initiated bidi stream (ID 0).
+        // ID 1 must carry a header and be classified as a normal bidi stream.
+        if stream_id == 0 {
             let mut known = self.known_streams.write().await;
             known.insert(stream_id);
             return Some(StreamType::Control);

@@ -1,0 +1,577 @@
+syntax = "proto3";
+package qsh.control;
+
+// ============================================================================
+// Unified Resource Control Protocol
+// ============================================================================
+//
+// New envelope format for resource-based control. Carries commands, events,
+// and streams over a single control socket with namespaced endpoints.
+// Wire format: u32 LE length prefix + protobuf Message.
+
+// Top-level envelope for all control messages
+message Message {
+  oneof kind {
+    Command command = 1;
+    Event event = 2;
+    Stream stream = 3;
+  }
+}
+
+// Commands from client to supervisor
+message Command {
+  uint32 request_id = 1;
+  oneof cmd {
+    // Session commands
+    StatusCmd status = 10;
+    PingCmd ping = 11;
+    SessionsCmd sessions = 12;
+    ExitCmd exit = 13;
+
+    // Generic resource commands
+    ResourceCreate resource_create = 20;
+    ResourceList resource_list = 21;
+    ResourceDescribe resource_describe = 22;
+    ResourceDrain resource_drain = 23;
+    ResourceClose resource_close = 24;
+    ResourceForceClose resource_force_close = 25;
+
+    // Terminal-specific commands
+    TerminalAttachCmd terminal_attach = 30;
+    TerminalDetachCmd terminal_detach = 31;
+    TerminalResizeCmd terminal_resize = 32;
+
+    // File transfer commands
+    FileUploadCmd file_upload = 40;
+    FileDownloadCmd file_download = 41;
+    FileCancelCmd file_cancel = 42;
+  }
+}
+
+// Events from supervisor to clients
+message Event {
+  uint64 event_seq = 1;  // Monotonic per session for reconciliation
+  oneof evt {
+    CommandResult command_result = 10;
+    ResourceEvent resource_event = 20;
+  }
+}
+
+// Streaming data (bidirectional)
+message Stream {
+  string resource_id = 1;
+  StreamKind stream_kind = 2;
+  StreamDirection direction = 3;
+  bytes data = 4;
+}
+
+enum StreamKind {
+  STREAM_KIND_UNSPECIFIED = 0;
+  TERMINAL_IO = 1;
+  CONTROL = 2;
+  CUSTOM = 3;
+}
+
+enum StreamDirection {
+  STREAM_DIRECTION_UNSPECIFIED = 0;
+  IN = 1;   // To server (from client's perspective)
+  OUT = 2;  // From server (from client's perspective)
+}
+
+// ============================================================================
+// Command Messages
+// ============================================================================
+
+message StatusCmd {}
+message PingCmd { uint64 timestamp = 1; }
+message SessionsCmd {}
+message ExitCmd { bool force = 1; }
+
+message ResourceCreate {
+  ResourceKind kind = 1;
+  oneof params {
+    TerminalCreateParams terminal = 10;
+    ForwardCreateParams forward = 11;
+    FileTransferCreateParams file_transfer = 12;
+  }
+}
+
+message ResourceList {
+  ResourceKind kind = 1;  // UNSPECIFIED = all kinds
+}
+
+message ResourceDescribe {
+  string resource_id = 1;
+}
+
+message ResourceDrain {
+  string resource_id = 1;
+  uint64 deadline_ms = 2;  // 0 = default timeout
+}
+
+message ResourceClose {
+  string resource_id = 1;
+}
+
+message ResourceForceClose {
+  string resource_id = 1;
+}
+
+message TerminalAttachCmd {
+  string resource_id = 1;
+}
+
+message TerminalDetachCmd {
+  string resource_id = 1;
+}
+
+message TerminalResizeCmd {
+  string resource_id = 1;
+  uint32 cols = 2;
+  uint32 rows = 3;
+}
+
+message FileUploadCmd {
+  string local_path = 1;
+  string remote_path = 2;
+  FileTransferOptions options = 3;
+}
+
+message FileDownloadCmd {
+  string remote_path = 1;
+  string local_path = 2;
+  FileTransferOptions options = 3;
+}
+
+message FileCancelCmd {
+  string resource_id = 1;
+}
+
+// ============================================================================
+// Resource Types and Parameters
+// ============================================================================
+
+enum ResourceKind {
+  RESOURCE_KIND_UNSPECIFIED = 0;
+  TERMINAL = 1;
+  FORWARD = 2;
+  FILE_TRANSFER = 3;
+}
+
+enum ResourceState {
+  RESOURCE_STATE_UNSPECIFIED = 0;
+  PENDING = 1;
+  STARTING = 2;
+  RUNNING = 3;
+  DRAINING = 4;
+  CLOSED = 5;
+  FAILED = 6;
+}
+
+message TerminalCreateParams {
+  uint32 cols = 1;
+  uint32 rows = 2;
+  string term_type = 3;
+  string shell = 4;
+  string command = 5;
+  repeated EnvPair env = 6;
+}
+
+message EnvPair {
+  string key = 1;
+  string value = 2;
+}
+
+message ForwardCreateParams {
+  ForwardType forward_type = 1;
+  string bind_addr = 2;
+  uint32 bind_port = 3;
+  string dest_host = 4;
+  uint32 dest_port = 5;
+}
+
+enum ForwardType {
+  FORWARD_TYPE_UNSPECIFIED = 0;
+  LOCAL = 1;
+  REMOTE = 2;
+  DYNAMIC = 3;
+}
+
+message FileTransferCreateParams {
+  string local_path = 1;
+  string remote_path = 2;
+  bool upload = 3;  // true = upload, false = download
+  FileTransferOptions options = 4;
+}
+
+message FileTransferOptions {
+  bool recursive = 1;
+  bool resume = 2;
+  bool delta = 3;
+  bool compress = 4;
+  uint32 parallel = 5;
+  bool skip_unchanged = 6;
+}
+
+// ============================================================================
+// Event Messages
+// ============================================================================
+
+message CommandResult {
+  uint32 request_id = 1;
+  oneof result {
+    CommandOk ok = 2;
+    CommandError error = 3;
+  }
+}
+
+message CommandOk {
+  oneof data {
+    StatusResult status = 1;
+    PongResult pong = 2;
+    SessionsResult sessions = 3;
+    ResourceCreateResult resource_created = 4;
+    ResourceListResult resource_list = 5;
+    ResourceDescribeResult resource_describe = 6;
+    // Drain/Close/ForceClose return empty ok
+  }
+}
+
+message CommandError {
+  ErrorCode code = 1;
+  string message = 2;
+  string details = 3;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  NOT_FOUND = 1;
+  INVALID_ARGUMENT = 2;
+  ALREADY_EXISTS = 3;
+  PERMISSION_DENIED = 4;
+  RESOURCE_EXHAUSTED = 5;
+  INTERNAL = 6;
+  UNAVAILABLE = 7;
+  BIND_FAILED = 8;
+  CONNECT_FAILED = 9;
+}
+
+message StatusResult {
+  string state = 1;
+  string server_addr = 2;
+  uint64 uptime_secs = 3;
+  uint64 bytes_sent = 4;
+  uint64 bytes_received = 5;
+  uint32 rtt_ms = 6;
+  uint32 resource_count = 7;
+}
+
+message PongResult {
+  uint64 timestamp = 1;
+  uint64 server_time = 2;
+}
+
+message SessionsResult {
+  repeated SessionSummary sessions = 1;
+}
+
+message SessionSummary {
+  string session_id = 1;
+  string socket_path = 2;
+  string server_addr = 3;
+  uint64 connected_at = 4;
+  uint32 resource_count = 5;
+}
+
+message ResourceCreateResult {
+  string resource_id = 1;
+  ResourceInfo info = 2;
+}
+
+message ResourceListResult {
+  repeated ResourceInfo resources = 1;
+}
+
+message ResourceDescribeResult {
+  ResourceInfo info = 1;
+}
+
+message ResourceInfo {
+  string id = 1;
+  ResourceKind kind = 2;
+  ResourceState state = 3;
+  string reason = 4;  // Populated when state = FAILED
+  ResourceStats stats = 5;
+  oneof details {
+    TerminalDetails terminal = 10;
+    ForwardDetails forward = 11;
+    FileTransferDetails file_transfer = 12;
+  }
+}
+
+message ResourceStats {
+  uint64 created_at = 1;
+  uint64 bytes_in = 2;
+  uint64 bytes_out = 3;
+}
+
+message TerminalDetails {
+  uint32 cols = 1;
+  uint32 rows = 2;
+  string shell = 3;
+  bool attached = 4;
+  uint64 pid = 5;
+}
+
+message ForwardDetails {
+  ForwardType forward_type = 1;
+  string bind_addr = 2;
+  uint32 bind_port = 3;
+  string dest_host = 4;
+  uint32 dest_port = 5;
+  uint64 active_connections = 6;
+}
+
+message FileTransferDetails {
+  string local_path = 1;
+  string remote_path = 2;
+  bool upload = 3;
+  uint64 total_bytes = 4;
+  uint64 transferred_bytes = 5;
+  uint32 files_total = 6;
+  uint32 files_done = 7;
+  uint32 files_failed = 8;
+}
+
+// Resource lifecycle events broadcast to all control clients
+message ResourceEvent {
+  string id = 1;
+  ResourceKind kind = 2;
+  ResourceState state = 3;
+  string reason = 4;
+  ResourceStats stats = 5;
+}
+
+// ============================================================================
+// Legacy Protocol (maintained for compatibility during transition)
+// ============================================================================
+
+// Top-level request message
+message ControlRequest {
+  uint32 id = 1;
+  oneof command {
+    GetStatusRequest get_status = 10;
+    ForwardAddRequest forward_add = 11;
+    ForwardListRequest forward_list = 12;
+    ForwardRemoveRequest forward_remove = 13;
+    SessionInfoRequest session_info = 14;
+    PingRequest ping = 15;
+    // Terminal commands
+    TerminalOpenRequest terminal_open = 20;
+    TerminalCloseRequest terminal_close = 21;
+    TerminalResizeRequest terminal_resize = 22;
+    TerminalListRequest terminal_list = 23;
+  }
+}
+
+// Top-level response message
+message ControlResponse {
+  uint32 id = 1;
+  oneof result {
+    StatusResponse status = 10;
+    ForwardAddResponse forward_added = 11;
+    ForwardListResponse forward_list = 12;
+    ForwardRemoveResponse forward_removed = 13;
+    SessionInfoResponse session_info = 14;
+    PongResponse pong = 15;
+    // Terminal responses
+    TerminalOpenResponse terminal_opened = 20;
+    TerminalCloseResponse terminal_closed = 21;
+    TerminalResizeResponse terminal_resized = 22;
+    TerminalListResponse terminal_list = 23;
+    ErrorResponse error = 100;
+  }
+}
+
+// Request: Get connection status
+message GetStatusRequest {}
+
+// Response: Connection status
+message StatusResponse {
+  string state = 1;              // "connected", "reconnecting", "disconnected"
+  optional string server_addr = 2;
+  optional uint64 uptime_secs = 3;
+  optional uint64 bytes_sent = 4;
+  optional uint64 bytes_received = 5;
+  optional uint32 rtt_ms = 6;
+}
+
+// Request: Add a port forward
+message ForwardAddRequest {
+  oneof spec {
+    LocalForwardSpec local = 1;
+    RemoteForwardSpec remote = 2;
+    DynamicForwardSpec dynamic = 3;
+  }
+}
+
+// Local forward: -L [bind_addr:]bind_port:dest_host:dest_port
+message LocalForwardSpec {
+  optional string bind_addr = 1;  // Default: localhost
+  uint32 bind_port = 2;
+  string dest_host = 3;
+  uint32 dest_port = 4;
+}
+
+// Remote forward: -R [bind_addr:]bind_port:dest_host:dest_port
+message RemoteForwardSpec {
+  optional string bind_addr = 1;  // Default: localhost
+  uint32 bind_port = 2;
+  string dest_host = 3;
+  uint32 dest_port = 4;
+}
+
+// Dynamic forward (SOCKS): -D [bind_addr:]bind_port
+message DynamicForwardSpec {
+  optional string bind_addr = 1;  // Default: localhost
+  uint32 bind_port = 2;
+}
+
+// Response: Forward added
+message ForwardAddResponse {
+  string forward_id = 1;
+  ForwardInfo info = 2;
+}
+
+// Request: List all port forwards
+message ForwardListRequest {}
+
+// Response: List of forwards
+message ForwardListResponse {
+  repeated ForwardInfo forwards = 1;
+}
+
+// Information about a port forward
+message ForwardInfo {
+  string id = 1;
+  string type = 2;               // "local", "remote", "dynamic"
+  string bind_addr = 3;
+  uint32 bind_port = 4;
+  optional string dest_host = 5;
+  optional uint32 dest_port = 6;
+  string status = 7;             // "active", "failed", "closed"
+  optional uint64 connections = 8;
+  optional uint64 bytes_sent = 9;
+  optional uint64 bytes_received = 10;
+}
+
+// Request: Remove a port forward
+message ForwardRemoveRequest {
+  string forward_id = 1;
+}
+
+// Response: Forward removed
+message ForwardRemoveResponse {
+  bool removed = 1;
+  optional string message = 2;
+}
+
+// Request: Get session information
+message SessionInfoRequest {}
+
+// Response: Session information
+message SessionInfoResponse {
+  string session_id = 1;
+  optional string user = 2;
+  optional string host = 3;
+  uint64 connected_at = 4;       // Unix timestamp
+  repeated ChannelInfo channels = 5;
+}
+
+// Information about a channel
+message ChannelInfo {
+  uint64 channel_id = 1;
+  string type = 2;               // "terminal", "forward", "tunnel"
+  string status = 3;             // "open", "closing", "closed"
+  optional uint64 bytes_sent = 4;
+  optional uint64 bytes_received = 5;
+}
+
+// Request: Ping
+message PingRequest {
+  uint64 timestamp = 1;          // Client timestamp
+}
+
+// Response: Pong
+message PongResponse {
+  uint64 timestamp = 1;          // Echo of client timestamp
+  uint64 server_time = 2;        // Server timestamp
+}
+
+// Error response
+message ErrorResponse {
+  uint32 code = 1;
+  string message = 2;
+  optional string details = 3;
+}
+
+// ============================================================================
+// Terminal Commands
+// ============================================================================
+
+// Request: Open a new terminal
+message TerminalOpenRequest {
+  optional uint32 cols = 1;      // Terminal columns (default: 80)
+  optional uint32 rows = 2;      // Terminal rows (default: 24)
+  optional string term_type = 3; // TERM env var (default: xterm-256color)
+  optional string shell = 4;     // Shell to run (default: user's shell)
+  optional string command = 5;   // Command to run instead of shell
+}
+
+// Response: Terminal opened
+message TerminalOpenResponse {
+  uint64 terminal_id = 1;
+  uint32 cols = 2;
+  uint32 rows = 3;
+}
+
+// Request: Close a terminal
+message TerminalCloseRequest {
+  uint64 terminal_id = 1;
+}
+
+// Response: Terminal closed
+message TerminalCloseResponse {
+  bool closed = 1;
+  optional sint32 exit_code = 2;  // Exit code if available
+}
+
+// Request: Resize a terminal
+message TerminalResizeRequest {
+  uint64 terminal_id = 1;
+  uint32 cols = 2;
+  uint32 rows = 3;
+}
+
+// Response: Terminal resized
+message TerminalResizeResponse {
+  bool resized = 1;
+}
+
+// Request: List terminals
+message TerminalListRequest {}
+
+// Response: List of terminals
+message TerminalListResponse {
+  repeated TerminalInfo terminals = 1;
+}
+
+// Information about a terminal
+message TerminalInfo {
+  uint64 terminal_id = 1;
+  uint32 cols = 2;
+  uint32 rows = 3;
+  string status = 4;             // "open", "closing", "closed"
+  optional string shell = 5;
+  optional uint64 pid = 6;       // Remote PID if known
+}

@@ -359,6 +359,57 @@ async fn reverse_mode_bidirectional_data_exchange() {
 }
 
 // =============================================================================
+// Bidirectional initiator tests
+// =============================================================================
+
+/// Verify that server-initiated bidirectional channels work (e.g., forwarded-tcpip)
+/// and are routed as ChannelBidi when the ChannelId is server-side.
+#[tokio::test]
+async fn server_initiates_bidi_channel() {
+    let (quic_client_conn, quic_server_conn) = TestConnection::pair();
+
+    // Logical server is QUIC client in reverse mode
+    let logical_server_mapper = StreamDirectionMapper::new(EndpointRole::Server, EndpointRole::Client);
+
+    // Use a server-side channel id to mirror server-initiated forwards
+    let channel_id = ChannelId::server(7);
+
+    // Logical server (QUIC client) opens ChannelBidi
+    let opener_task = quic_client_conn.open_stream(StreamType::ChannelBidi(channel_id));
+
+    // Logical client (QUIC server) accepts it
+    let acceptor_task = quic_server_conn.accept_stream();
+
+    let timeout_duration = Duration::from_secs(1);
+
+    let (opener_result, acceptor_result) = tokio::join!(
+        timeout(timeout_duration, opener_task),
+        timeout(timeout_duration, acceptor_task)
+    );
+
+    let mut opener_stream = opener_result
+        .map_err(|_| Error::Timeout)?
+        .map_err(|e| Error::Protocol { message: format!("Opener failed: {:?}", e) })?;
+
+    let (stream_type, mut acceptor_stream) = acceptor_result
+        .map_err(|_| Error::Timeout)?
+        .map_err(|e| Error::Protocol { message: format!("Acceptor failed: {:?}", e) })?;
+
+    assert_eq!(stream_type, StreamType::ChannelBidi(channel_id), "Acceptor should see ChannelBidi");
+
+    // Round-trip a message to prove directionality works
+    let test_msg = Message::Resize(ResizePayload {
+        channel_id: Some(channel_id),
+        cols: 200,
+        rows: 60,
+    });
+
+    opener_stream.send(&test_msg).await?;
+    let received_msg = acceptor_stream.recv().await?;
+    assert_eq!(received_msg, test_msg, "Message should roundtrip on server-initiated bidi");
+}
+
+// =============================================================================
 // Control Stream Tests
 // =============================================================================
 
