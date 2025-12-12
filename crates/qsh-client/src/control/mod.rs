@@ -35,6 +35,7 @@ pub mod manager;
 pub mod protocol;
 pub mod repl;
 pub mod resource;
+pub mod resources;
 pub mod socket;
 
 // Re-export main types from legacy interface

@@ -118,6 +118,12 @@ impl FromStr for TunnelArg {
     }
 }
 
+// Import terminal types from terminal module to avoid duplication
+pub use super::terminal::{
+    TerminalAction, TerminalAddArgs, TerminalAttachArgs, TerminalCloseArgs, TerminalCommand,
+    TerminalDetachArgs, TerminalResizeArgs,
+};
+
 /// Control subcommands for managing existing qsh sessions.
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -131,66 +137,6 @@ pub enum Command {
     Ctl(CtlArgs),
     /// List active sessions
     Sessions,
-}
-
-/// Terminal subcommands.
-#[derive(Debug, Parser)]
-pub struct TerminalCommand {
-    #[command(subcommand)]
-    pub action: TerminalAction,
-}
-
-/// Terminal actions.
-#[derive(Debug, Subcommand)]
-pub enum TerminalAction {
-    /// Open a new terminal
-    Open(TerminalOpenArgs),
-    /// Close a terminal
-    Close(TerminalCloseArgs),
-    /// Attach to a terminal (interactive I/O)
-    Attach(TerminalAttachArgs),
-    /// List active terminals
-    List,
-}
-
-/// Arguments for opening a terminal.
-#[derive(Debug, Parser)]
-pub struct TerminalOpenArgs {
-    /// Terminal columns
-    #[arg(long, value_name = "COLS")]
-    pub cols: Option<u32>,
-
-    /// Terminal rows
-    #[arg(long, value_name = "ROWS")]
-    pub rows: Option<u32>,
-
-    /// Terminal type (TERM env var)
-    #[arg(long = "term", value_name = "TYPE")]
-    pub term_type: Option<String>,
-
-    /// Shell to run
-    #[arg(long, value_name = "SHELL")]
-    pub shell: Option<String>,
-
-    /// Command to run instead of shell
-    #[arg(value_name = "COMMAND")]
-    pub command: Option<String>,
-}
-
-/// Arguments for closing a terminal.
-#[derive(Debug, Parser)]
-pub struct TerminalCloseArgs {
-    /// Terminal ID to close
-    #[arg(value_name = "ID")]
-    pub terminal_id: u64,
-}
-
-/// Arguments for attaching to a terminal.
-#[derive(Debug, Parser)]
-pub struct TerminalAttachArgs {
-    /// Terminal ID to attach to (default: most recent)
-    #[arg(value_name = "ID")]
-    pub terminal_id: Option<u64>,
 }
 
 /// Port forward subcommands.

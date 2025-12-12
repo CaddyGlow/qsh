@@ -77,7 +77,7 @@ impl Terminal {
     /// The terminal is created in Pending state and must be started
     /// via the Resource::start() method.
     pub fn new(id: String, params: TerminalParams) -> Self {
-        let (cols, rows) = (params.cols as u32, params.rows as u32);
+        let (cols, rows) = (params.term_size.cols as u32, params.term_size.rows as u32);
 
         Self {
             id,
@@ -101,17 +101,19 @@ impl Terminal {
         command: Option<String>,
         env: Vec<(String, String)>,
     ) -> Self {
+        use qsh_core::protocol::TermSize;
+
         let cols = cols.unwrap_or(80) as u16;
         let rows = rows.unwrap_or(24) as u16;
         let term_type = term_type.unwrap_or_else(|| "xterm-256color".to_string());
 
         let params = TerminalParams {
-            cols,
-            rows,
+            term_size: TermSize { cols, rows },
             term_type,
             shell,
             command,
             env,
+            ..Default::default()
         };
 
         Self::new(id, params)
@@ -136,14 +138,12 @@ impl Terminal {
         ),
         ResourceError,
     > {
-        let state = self.state.read().unwrap();
-        if !state.is_running() {
+        if !self.state.is_running() {
             return Err(ResourceError::InvalidState {
-                current: state.clone(),
+                current: self.state.clone(),
                 expected: "running",
             });
         }
-        drop(state);
 
         let mut attachment = self.attachment.lock().await;
         if matches!(*attachment, AttachmentState::Attached) {
@@ -323,8 +323,8 @@ impl Resource for Terminal {
 
         info!(
             terminal_id = %self.id,
-            cols = self.params.cols,
-            rows = self.params.rows,
+            cols = self.params.term_size.cols,
+            rows = self.params.term_size.rows,
             "Starting terminal resource"
         );
 
@@ -440,6 +440,10 @@ impl Resource for Terminal {
         if let Some(handle) = io_task {
             handle.abort();
         }
+
+        // Force detach since the client's channels are broken
+        // Client will need to re-attach after reconnect
+        *self.attachment.blocking_lock() = AttachmentState::Detached;
     }
 
     async fn on_reconnect(&mut self, conn: Arc<ChannelConnection>) -> Result<(), ResourceError> {
@@ -455,12 +459,8 @@ impl Resource for Terminal {
 
         *self.channel.write().await = Some(channel);
 
-        // If there was an attached client, restart I/O forwarding
-        if matches!(*self.attachment.lock().await, AttachmentState::Attached { .. }) {
-            self.spawn_io_task().await;
-        }
-
-        info!(terminal_id = %self.id, "Terminal resumed successfully");
+        // Note: Client was auto-detached on disconnect, they need to re-attach
+        info!(terminal_id = %self.id, "Terminal resumed successfully (client must re-attach)");
         Ok(())
     }
 }
@@ -468,16 +468,17 @@ impl Resource for Terminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qsh_core::protocol::TermSize;
 
     #[test]
     fn test_terminal_creation() {
         let params = TerminalParams {
-            cols: 80,
-            rows: 24,
+            term_size: TermSize { cols: 80, rows: 24 },
             term_type: "xterm-256color".to_string(),
             shell: None,
             command: None,
             env: vec![],
+            ..Default::default()
         };
 
         let terminal = Terminal::new("term-0".to_string(), params);

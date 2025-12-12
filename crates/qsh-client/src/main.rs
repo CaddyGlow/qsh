@@ -187,6 +187,29 @@ async fn run_control_command(cli: &Cli, subcommand: &qsh_client::cli::Command) -
                     }
                     Ok(0)
                 }
+                ForwardAction::Drain(args) => {
+                    // TODO: Implement drain in ControlClient
+                    let timeout = args.timeout.unwrap_or(30);
+                    println!("Draining forward {} (timeout: {}s)", args.forward_id, timeout);
+                    println!("Forward drain not yet implemented via control socket");
+                    Ok(0)
+                }
+                ForwardAction::Close(args) => {
+                    // Close is similar to remove but more aggressive
+                    let response = client.remove_forward(&args.forward_id).await?;
+                    if response.removed {
+                        println!("Forward closed");
+                    } else {
+                        println!("Failed to close forward");
+                    }
+                    Ok(0)
+                }
+                ForwardAction::ForceClose(args) => {
+                    // Force close ignores errors
+                    let _ = client.remove_forward(&args.forward_id).await;
+                    println!("Forward force closed");
+                    Ok(0)
+                }
             }
         }
         Command::Sessions => {
@@ -226,11 +249,11 @@ async fn run_control_command(cli: &Cli, subcommand: &qsh_client::cli::Command) -
             let mut client = ControlClient::connect(&session_name).await?;
 
             match &term_cmd.action {
-                TerminalAction::Open(args) => {
+                TerminalAction::Add(args) => {
                     let response = client.open_terminal(
-                        args.cols,
-                        args.rows,
-                        args.term_type.clone(),
+                        Some(args.cols),
+                        Some(args.rows),
+                        Some(args.term_type.clone()),
                         args.shell.clone(),
                         args.command.clone(),
                     ).await?;
@@ -238,7 +261,13 @@ async fn run_control_command(cli: &Cli, subcommand: &qsh_client::cli::Command) -
                     Ok(0)
                 }
                 TerminalAction::Close(args) => {
-                    let response = client.close_terminal(args.terminal_id).await?;
+                    // Parse resource_id as u64 for backward compat with control client
+                    let terminal_id: u64 = args.resource_id.parse().map_err(|_| {
+                        qsh_core::Error::Transport {
+                            message: format!("invalid terminal ID: {}", args.resource_id),
+                        }
+                    })?;
+                    let response = client.close_terminal(terminal_id).await?;
                     if response.closed {
                         if let Some(exit_code) = response.exit_code {
                             println!("Terminal closed (exit code: {})", exit_code);
@@ -272,8 +301,35 @@ async fn run_control_command(cli: &Cli, subcommand: &qsh_client::cli::Command) -
                     Ok(0)
                 }
                 TerminalAction::Attach(args) => {
+                    // Parse resource_id as u64 if provided
+                    let terminal_id: Option<u64> = if args.resource_id.is_empty() {
+                        None
+                    } else {
+                        Some(args.resource_id.parse().map_err(|_| {
+                            qsh_core::Error::Transport {
+                                message: format!("invalid terminal ID: {}", args.resource_id),
+                            }
+                        })?)
+                    };
                     // Attach requires raw terminal and interactive I/O
-                    run_terminal_attach(&session_name, args.terminal_id).await
+                    run_terminal_attach(&session_name, terminal_id).await
+                }
+                TerminalAction::Detach(_args) => {
+                    // Detach is handled via escape sequence during attach, not as standalone command
+                    println!("Use Ctrl+^ then d to detach from an attached terminal");
+                    Ok(0)
+                }
+                TerminalAction::Resize(args) => {
+                    // Parse resource_id as u64
+                    let terminal_id: u64 = args.resource_id.parse().map_err(|_| {
+                        qsh_core::Error::Transport {
+                            message: format!("invalid terminal ID: {}", args.resource_id),
+                        }
+                    })?;
+                    // TODO: Add resize method to ControlClient
+                    println!("Resize terminal {} to {}x{}", terminal_id, args.cols, args.rows);
+                    println!("Terminal resize not yet implemented via control socket");
+                    Ok(0)
                 }
             }
         }

@@ -30,6 +30,7 @@ pub mod render;
 pub mod session;
 pub mod ssh;
 pub mod terminal;
+pub mod transfer;
 
 #[cfg(feature = "standalone")]
 pub mod standalone;

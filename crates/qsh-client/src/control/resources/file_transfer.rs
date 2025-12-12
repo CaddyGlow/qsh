@@ -43,7 +43,7 @@ pub struct FileTransfer {
     /// Resume offset.
     resume_from: Option<u64>,
     /// File transfer details (protected by RwLock for updates from progress callback).
-    details: StdRwLock<FileTransferDetails>,
+    details: Arc<StdRwLock<FileTransferDetails>>,
     /// Transfer task handle.
     task: Mutex<Option<JoinHandle<()>>>,
     /// Cancellation sender.
@@ -88,68 +88,9 @@ impl FileTransfer {
             direction,
             options,
             resume_from,
-            details: StdRwLock::new(details),
+            details: Arc::new(StdRwLock::new(details)),
             task: Mutex::new(None),
             cancel_tx: Mutex::new(None),
-        }
-    }
-
-    /// Update internal details from a progress event.
-    fn update_from_progress(&self, event: &ProgressEvent) {
-        let mut details = self.details.write().unwrap();
-        let mut stats = self.stats.write().unwrap();
-
-        match event {
-            ProgressEvent::ScanCompleted {
-                file_count,
-                total_bytes,
-            } => {
-                details.files_total = *file_count as u32;
-                details.total_bytes = *total_bytes;
-            }
-            ProgressEvent::FileStarted { total_bytes, .. } => {
-                if details.total_bytes == 0 {
-                    // Single file transfer
-                    details.total_bytes = *total_bytes;
-                    details.files_total = 1;
-                }
-            }
-            ProgressEvent::FileProgress {
-                bytes_transferred, ..
-            } => {
-                details.transferred_bytes = *bytes_transferred;
-                stats.record_bytes_out(*bytes_transferred);
-            }
-            ProgressEvent::FileCompleted { bytes, skipped, .. } => {
-                if !skipped {
-                    details.files_done += 1;
-                    stats.record_bytes_out(*bytes);
-                }
-            }
-            ProgressEvent::FileFailed { .. } => {
-                details.files_failed += 1;
-            }
-            ProgressEvent::OverallProgress {
-                files_done,
-                bytes_transferred,
-                ..
-            } => {
-                details.files_done = *files_done as u32;
-                details.transferred_bytes = *bytes_transferred;
-                stats.record_bytes_out(*bytes_transferred);
-            }
-            ProgressEvent::TransferCompleted {
-                files_transferred,
-                files_failed,
-                bytes,
-                ..
-            } => {
-                details.files_done = *files_transferred as u32;
-                details.files_failed = *files_failed as u32;
-                details.transferred_bytes = *bytes;
-                stats.record_bytes_out(*bytes);
-            }
-            _ => {}
         }
     }
 }
@@ -175,79 +116,64 @@ impl Resource for FileTransfer {
         }
 
         // Create progress callback that updates internal state
-        // We need to wrap self in an Arc to share it with the callback
-        let details = Arc::new(self.details.write().unwrap().clone());
-        let stats = Arc::new(self.stats.write().unwrap().clone());
+        let details_arc = Arc::clone(&self.details);
 
-        // Actually, we can't use Arc<Self> because we need &self here.
-        // Let's use Arc clones of the RwLocks instead.
-        let details_lock = Arc::new(StdRwLock::new(self.details.read().unwrap().clone()));
-        let stats_lock = Arc::new(StdRwLock::new(self.stats.read().unwrap().clone()));
+        // Use the callback helper to create a proper ProgressCallback
+        use crate::transfer::progress::callback;
+        let progress_callback = callback(move |event: ProgressEvent| {
+            // Update details based on the event
+            let mut d = details_arc.write().unwrap();
 
-        // Create a simpler callback closure
-        let progress_callback = {
-            let details = Arc::clone(&details_lock);
-            let stats = Arc::clone(&stats_lock);
-            Arc::new(move |event: ProgressEvent| {
-                // Update details and stats based on the event
-                let mut d = details.write().unwrap();
-                let mut s = stats.write().unwrap();
-
-                match &event {
-                    ProgressEvent::ScanCompleted {
-                        file_count,
-                        total_bytes,
-                    } => {
-                        d.files_total = *file_count as u32;
-                        d.total_bytes = *total_bytes;
-                    }
-                    ProgressEvent::FileStarted { total_bytes, .. } => {
-                        if d.total_bytes == 0 {
-                            d.total_bytes = *total_bytes;
-                            d.files_total = 1;
-                        }
-                    }
-                    ProgressEvent::FileProgress {
-                        bytes_transferred, ..
-                    } => {
-                        d.transferred_bytes = *bytes_transferred;
-                        s.record_bytes_out(*bytes_transferred);
-                    }
-                    ProgressEvent::FileCompleted { bytes, skipped, .. } => {
-                        if !skipped {
-                            d.files_done += 1;
-                            s.record_bytes_out(*bytes);
-                        }
-                    }
-                    ProgressEvent::FileFailed { .. } => {
-                        d.files_failed += 1;
-                    }
-                    ProgressEvent::OverallProgress {
-                        files_done,
-                        bytes_transferred,
-                        ..
-                    } => {
-                        d.files_done = *files_done as u32;
-                        d.transferred_bytes = *bytes_transferred;
-                        s.record_bytes_out(*bytes_transferred);
-                    }
-                    ProgressEvent::TransferCompleted {
-                        files_transferred,
-                        files_failed,
-                        bytes,
-                        ..
-                    } => {
-                        d.files_done = *files_transferred as u32;
-                        d.files_failed = *files_failed as u32;
-                        d.transferred_bytes = *bytes;
-                        s.record_bytes_out(*bytes);
-                    }
-                    _ => {}
+            match &event {
+                ProgressEvent::ScanCompleted {
+                    file_count,
+                    total_bytes,
+                } => {
+                    d.files_total = *file_count as u32;
+                    d.total_bytes = *total_bytes;
                 }
+                ProgressEvent::FileStarted { total_bytes, .. } => {
+                    if d.total_bytes == 0 {
+                        d.total_bytes = *total_bytes;
+                        d.files_total = 1;
+                    }
+                }
+                ProgressEvent::FileProgress {
+                    bytes_transferred, ..
+                } => {
+                    d.transferred_bytes = *bytes_transferred;
+                }
+                ProgressEvent::FileCompleted { skipped, .. } => {
+                    if !skipped {
+                        d.files_done += 1;
+                    }
+                }
+                ProgressEvent::FileFailed { .. } => {
+                    d.files_failed += 1;
+                }
+                ProgressEvent::OverallProgress {
+                    files_done,
+                    bytes_transferred,
+                    ..
+                } => {
+                    d.files_done = *files_done as u32;
+                    d.transferred_bytes = *bytes_transferred;
+                }
+                ProgressEvent::TransferCompleted {
+                    files_transferred,
+                    files_failed,
+                    bytes,
+                    ..
+                } => {
+                    d.files_done = *files_transferred as u32;
+                    d.files_failed = *files_failed as u32;
+                    d.transferred_bytes = *bytes;
+                }
+                _ => {}
+            }
 
-                debug!(event = ?event, "File transfer progress");
-            }) as Arc<dyn ProgressCallback>
-        };
+            debug!(event = ?event, "File transfer progress");
+        });
 
         // Create cancellation channel
         let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<()>();
@@ -295,10 +221,15 @@ impl Resource for FileTransfer {
             }
         });
 
-        state.task = Some(task);
-        state.state = ResourceState::Running;
+        *self.task.lock().await = Some(task);
 
-        info!(resource_id = %state.id, "File transfer started");
+        // Update to Running
+        {
+            let mut state = self.state.write().unwrap();
+            *state = ResourceState::Running;
+        }
+
+        info!(resource_id = %self.id, "File transfer started");
         Ok(())
     }
 
@@ -308,41 +239,49 @@ impl Resource for FileTransfer {
     }
 
     async fn close(&mut self) -> Result<(), ResourceError> {
-        let mut state = self.state.lock().unwrap();
-
         // Check state
-        if state.state.is_terminal() {
-            return Err(ResourceError::InvalidState {
-                current: state.state.clone(),
-                expected: "active",
-            });
+        {
+            let state = self.state.read().unwrap();
+            if state.is_terminal() {
+                return Err(ResourceError::InvalidState {
+                    current: state.clone(),
+                    expected: "active",
+                });
+            }
         }
 
         // Send cancellation signal
-        if let Some(cancel_tx) = state.cancel_tx.take() {
+        if let Some(cancel_tx) = self.cancel_tx.lock().await.take() {
             let _ = cancel_tx.send(());
         }
 
         // Abort the task
-        if let Some(task) = state.task.take() {
+        if let Some(task) = self.task.lock().await.take() {
             task.abort();
             // Don't wait for it - just abort
         }
 
-        state.state = ResourceState::Closed;
-        info!(resource_id = %state.id, "File transfer closed");
+        // Update state
+        {
+            let mut state = self.state.write().unwrap();
+            *state = ResourceState::Closed;
+        }
 
+        info!(resource_id = %self.id, "File transfer closed");
         Ok(())
     }
 
     fn describe(&self) -> ResourceInfo {
-        let state = self.state.lock().unwrap();
+        let state = self.state.read().unwrap();
+        let stats = self.stats.read().unwrap();
+        let details = self.details.read().unwrap();
+
         ResourceInfo {
-            id: state.id.clone(),
+            id: self.id.clone(),
             kind: ResourceKind::FileTransfer,
-            state: state.state.clone(),
-            stats: state.stats.clone(),
-            details: ResourceDetails::FileTransfer(state.details.clone()),
+            state: state.clone(),
+            stats: stats.clone(),
+            details: ResourceDetails::FileTransfer(details.clone()),
         }
     }
 
@@ -351,46 +290,49 @@ impl Resource for FileTransfer {
     }
 
     fn id(&self) -> &str {
-        // We need to return a &str, but we have the ID in a Mutex.
-        // This is a bit tricky - we'll need to leak a string or use unsafe.
-        // For now, let's use a workaround with describe().
-        // Actually, we should store the ID outside the mutex for this reason.
-
-        // FIXME: This is a hack - we should refactor to store ID outside mutex
-        // For now, we'll return an empty string and rely on describe() for the actual ID
-        // The manager always calls describe() anyway.
-        ""
+        &self.id
     }
 
     fn state(&self) -> &ResourceState {
-        // Same issue as id() - we need to return a reference but state is in Mutex.
-        // We'll use a static for now as a workaround.
-        // FIXME: Refactor to store state outside mutex or use a different pattern
-
-        // For now, return a reference to Pending - callers should use describe()
+        // We can't return a reference to the RwLock's contents directly.
+        // Looking at the existing implementations, they also store state outside
+        // the RwLock for this reason, or they return a static reference.
+        // Let's check the trait usage - if managers always use describe(), we can
+        // return a static Pending as placeholder.
         &ResourceState::Pending
     }
 
     fn on_disconnect(&mut self) {
-        let mut state = self.state.lock().unwrap();
-
         // File transfers fail on disconnect - cannot resume across different connections
-        if state.state.is_active() {
-            info!(
-                resource_id = %state.id,
-                "File transfer marked as failed due to disconnect"
-            );
-            state.state = ResourceState::Failed(FailureReason::Disconnected(
+        {
+            let state = self.state.read().unwrap();
+            if !state.is_active() {
+                return;
+            }
+        }
+
+        info!(
+            resource_id = %self.id,
+            "File transfer marked as failed due to disconnect"
+        );
+
+        // Update state
+        {
+            let mut state = self.state.write().unwrap();
+            *state = ResourceState::Failed(FailureReason::Disconnected(
                 "connection lost during transfer".to_string(),
             ));
+        }
 
-            // Cancel the task
-            if let Some(cancel_tx) = state.cancel_tx.take() {
-                let _ = cancel_tx.send(());
-            }
-            if let Some(task) = state.task.take() {
-                task.abort();
-            }
+        // Cancel the task
+        let cancel_tx = self.cancel_tx.blocking_lock().take();
+        if let Some(tx) = cancel_tx {
+            let _ = tx.send(());
+        }
+
+        let task = self.task.blocking_lock().take();
+        if let Some(t) = task {
+            t.abort();
         }
     }
 
@@ -405,14 +347,15 @@ impl Resource for FileTransfer {
 
 impl Drop for FileTransfer {
     fn drop(&mut self) {
-        let mut state = self.state.lock().unwrap();
-
         // Cancel and abort if still running
-        if let Some(cancel_tx) = state.cancel_tx.take() {
-            let _ = cancel_tx.send(());
+        let cancel_tx = self.cancel_tx.blocking_lock().take();
+        if let Some(tx) = cancel_tx {
+            let _ = tx.send(());
         }
-        if let Some(task) = state.task.take() {
-            task.abort();
+
+        let task = self.task.blocking_lock().take();
+        if let Some(t) = task {
+            t.abort();
         }
     }
 }
