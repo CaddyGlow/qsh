@@ -209,6 +209,12 @@ pub enum ForwardAction {
     List,
     /// Remove a port forward
     Remove(ForwardRemoveArgs),
+    /// Gracefully drain a forward (stop accepting new connections, wait for in-flight to complete)
+    Drain(ForwardDrainArgs),
+    /// Close a forward immediately
+    Close(ForwardCloseArgs),
+    /// Force close a forward (ignore errors)
+    ForceClose(ForwardForceCloseArgs),
 }
 
 /// Arguments for adding a port forward.
@@ -234,6 +240,34 @@ pub struct ForwardAddArgs {
 #[derive(Debug, Parser)]
 pub struct ForwardRemoveArgs {
     /// Forward ID to remove
+    #[arg(value_name = "ID")]
+    pub forward_id: String,
+}
+
+/// Arguments for draining a port forward.
+#[derive(Debug, Parser)]
+pub struct ForwardDrainArgs {
+    /// Forward ID to drain
+    #[arg(value_name = "ID")]
+    pub forward_id: String,
+
+    /// Drain timeout in seconds (default: 30)
+    #[arg(short = 't', long = "timeout", value_name = "SECS")]
+    pub timeout: Option<u64>,
+}
+
+/// Arguments for closing a port forward.
+#[derive(Debug, Parser)]
+pub struct ForwardCloseArgs {
+    /// Forward ID to close
+    #[arg(value_name = "ID")]
+    pub forward_id: String,
+}
+
+/// Arguments for force-closing a port forward.
+#[derive(Debug, Parser)]
+pub struct ForwardForceCloseArgs {
+    /// Forward ID to force close
     #[arg(value_name = "ID")]
     pub forward_id: String,
 }

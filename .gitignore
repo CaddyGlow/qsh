@@ -24,3 +24,7 @@ lcov.info
 *.pem
 *.key
 credentials.json
+
+.claude/
+.direnv/
+.envrc/
