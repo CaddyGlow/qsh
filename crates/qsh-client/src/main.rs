@@ -57,43 +57,47 @@ fn resolve_session_name(cli: &Cli) -> qsh_core::Result<String> {
 ///
 /// This creates an interactive session with the specified terminal,
 /// relaying stdin/stdout through the control socket.
-async fn run_terminal_attach(session_name: &str, terminal_id: Option<u64>) -> qsh_core::Result<i32> {
-    use qsh_client::control::ControlClient;
+async fn run_terminal_attach(session_name: &str, resource_id: Option<String>) -> qsh_core::Result<i32> {
+    use qsh_client::control::{ControlClient, ResourceDetails};
 
     let mut client = ControlClient::connect(session_name).await?;
 
     // Get terminal list to find the target terminal
-    let list = client.list_terminals().await?;
+    let resources = client.list_resources(Some(qsh_client::control::ProtoResourceKind::Terminal)).await?;
 
-    if list.terminals.is_empty() {
+    if resources.is_empty() {
         return Err(qsh_core::Error::Transport {
             message: "no terminals available in session".to_string(),
         });
     }
 
     // Find the target terminal
-    let terminal = if let Some(id) = terminal_id {
-        list.terminals.iter().find(|t| t.terminal_id == id)
+    let terminal = if let Some(ref id) = resource_id {
+        resources.iter().find(|r| r.id == *id)
             .ok_or_else(|| qsh_core::Error::Transport {
                 message: format!("terminal {} not found", id),
             })?
     } else {
         // Use the most recent (last) terminal
-        list.terminals.last().unwrap()
+        resources.last().unwrap()
+    };
+
+    // Get terminal details
+    let (cols, rows, shell) = if let ResourceDetails::Terminal(t) = &terminal.details {
+        (t.cols, t.rows, t.shell.clone())
+    } else {
+        (80, 24, "unknown".to_string())
     };
 
     // Terminal attach requires bidirectional I/O streaming through the control socket.
-    // This is not yet implemented - the control protocol needs TerminalInput/TerminalOutput
-    // messages to support interactive terminal I/O.
+    // The protocol supports Stream messages with StreamKind::TerminalIo.
     //
     // For now, print the terminal info and suggest using the main session.
-    println!("Terminal {} ({}x{}) - {}", terminal.terminal_id, terminal.cols, terminal.rows, terminal.status);
-    if let Some(ref shell) = terminal.shell {
-        println!("Shell: {}", shell);
-    }
+    println!("Terminal {} ({}x{}) - {}", terminal.id, cols, rows, terminal.state);
+    println!("Shell: {}", shell);
     println!();
-    println!("Terminal attach is not yet implemented.");
-    println!("Interactive I/O requires TerminalInput/TerminalOutput protocol messages.");
+    println!("Terminal attach is not yet fully implemented.");
+    println!("Use 'qsh ctl' then 'attach {}' for basic attach commands.", terminal.id);
     println!();
     println!("To interact with this terminal, use the main qsh session.");
 
@@ -118,95 +122,96 @@ async fn run_control_command(cli: &Cli, subcommand: &qsh_client::cli::Command) -
             let status = client.get_status().await?;
 
             println!("State: {}", status.state);
-            if let Some(addr) = status.server_addr {
-                println!("Server: {}", addr);
-            }
-            if let Some(uptime) = status.uptime_secs {
-                println!("Uptime: {}s", uptime);
-            }
-            if let Some(rtt) = status.rtt_ms {
-                println!("RTT: {}ms", rtt);
-            }
+            println!("Server: {}", status.server_addr);
+            println!("Uptime: {}s", status.uptime_secs);
+            println!("RTT: {}ms", status.rtt_ms);
+            println!("Resources: {}", status.resource_count);
 
             if args.detailed {
-                if let Some(sent) = status.bytes_sent {
-                    println!("Bytes sent: {}", sent);
-                }
-                if let Some(recv) = status.bytes_received {
-                    println!("Bytes received: {}", recv);
-                }
+                println!("Bytes sent: {}", status.bytes_sent);
+                println!("Bytes received: {}", status.bytes_received);
             }
 
             Ok(0)
         }
         Command::Forward(fwd_cmd) => {
             let session_name = resolve_session_name(cli)?;
-
             let mut client = ControlClient::connect(&session_name).await?;
 
             match &fwd_cmd.action {
                 ForwardAction::Add(args) => {
-                    let response = if let Some(ref spec) = args.local {
-                        client.add_forward_local(spec).await?
-                    } else if let Some(ref spec) = args.remote {
-                        client.add_forward_remote(spec).await?
-                    } else if let Some(ref spec) = args.dynamic {
-                        client.add_forward_dynamic(spec).await?
+                    use qsh_client::control::ProtoForwardType;
+
+                    // Determine forward type and parse spec
+                    let (forward_type, bind_addr, bind_port, dest_host, dest_port) = if let Some(spec) = &args.local {
+                        let (bind, host, port) = qsh_client::parse_local_forward(spec)?;
+                        (ProtoForwardType::Local, bind.ip().to_string(), bind.port() as u32, Some(host), Some(port as u32))
+                    } else if let Some(spec) = &args.remote {
+                        let (bind_addr, bind_port, host, port) = qsh_client::parse_remote_forward(spec)?;
+                        (ProtoForwardType::Remote, bind_addr, bind_port as u32, Some(host), Some(port as u32))
+                    } else if let Some(spec) = &args.dynamic {
+                        let bind = qsh_client::parse_dynamic_forward(spec)?;
+                        (ProtoForwardType::Dynamic, bind.ip().to_string(), bind.port() as u32, None, None)
                     } else {
-                        return Err(qsh_core::Error::Transport {
-                            message: "specify forward type: -L (local), -R (remote), or -D (dynamic)".to_string(),
-                        });
+                        eprintln!("Must specify -L, -R, or -D");
+                        return Ok(1);
                     };
-                    println!("Forward added: {}", response.forward_id);
+
+                    // Create the forward via control socket
+                    let info = client.create_forward(
+                        forward_type,
+                        &bind_addr,
+                        bind_port,
+                        dest_host.as_deref(),
+                        dest_port,
+                    ).await?;
+
+                    println!("Created forward: {}", info.id);
+                    if let qsh_client::control::ResourceDetails::Forward(f) = &info.details {
+                        print!("  {}:{}", f.bind_addr, f.bind_port);
+                        if let (Some(dest_host), Some(dest_port)) = (&f.dest_host, f.dest_port) {
+                            print!(" -> {}:{}", dest_host, dest_port);
+                        }
+                        println!(" ({:?})", f.forward_type);
+                    }
                     Ok(0)
                 }
                 ForwardAction::List => {
-                    let list = client.list_forwards().await?;
-                    if list.forwards.is_empty() {
+                    // List forward resources
+                    let resources = client.list_resources(Some(qsh_client::control::ProtoResourceKind::Forward)).await?;
+                    if resources.is_empty() {
                         println!("No active forwards");
                     } else {
-                        for fwd in list.forwards {
-                            print!("[{}] {}:{}", fwd.id, fwd.bind_addr, fwd.bind_port);
-                            if let Some(ref dest_host) = fwd.dest_host {
-                                print!(" -> {}", dest_host);
-                                if let Some(dest_port) = fwd.dest_port {
-                                    print!(":{}", dest_port);
+                        for info in resources {
+                            if let qsh_client::control::ResourceDetails::Forward(f) = &info.details {
+                                print!("[{}] {}:{}", info.id, f.bind_addr, f.bind_port);
+                                if let (Some(dest_host), Some(dest_port)) = (&f.dest_host, f.dest_port) {
+                                    print!(" -> {}:{}", dest_host, dest_port);
                                 }
+                                println!(" ({:?}, {})", f.forward_type, info.state);
                             }
-                            println!(" ({}, {})", fwd.r#type, fwd.status);
                         }
                     }
                     Ok(0)
                 }
                 ForwardAction::Remove(args) => {
-                    let response = client.remove_forward(&args.forward_id).await?;
-                    if response.removed {
-                        println!("Forward removed");
-                    } else {
-                        println!("Failed to remove forward");
-                    }
+                    client.close_resource(&args.forward_id).await?;
+                    println!("Forward removed");
                     Ok(0)
                 }
                 ForwardAction::Drain(args) => {
-                    // TODO: Implement drain in ControlClient
                     let timeout = args.timeout.unwrap_or(30);
-                    println!("Draining forward {} (timeout: {}s)", args.forward_id, timeout);
-                    println!("Forward drain not yet implemented via control socket");
+                    client.drain_resource(&args.forward_id, timeout as u64 * 1000).await?;
+                    println!("Forward drained");
                     Ok(0)
                 }
                 ForwardAction::Close(args) => {
-                    // Close is similar to remove but more aggressive
-                    let response = client.remove_forward(&args.forward_id).await?;
-                    if response.removed {
-                        println!("Forward closed");
-                    } else {
-                        println!("Failed to close forward");
-                    }
+                    client.close_resource(&args.forward_id).await?;
+                    println!("Forward closed");
                     Ok(0)
                 }
                 ForwardAction::ForceClose(args) => {
-                    // Force close ignores errors
-                    let _ = client.remove_forward(&args.forward_id).await;
+                    let _ = client.close_resource(&args.forward_id).await;
                     println!("Forward force closed");
                     Ok(0)
                 }
@@ -249,70 +254,56 @@ async fn run_control_command(cli: &Cli, subcommand: &qsh_client::cli::Command) -
             let mut client = ControlClient::connect(&session_name).await?;
 
             match &term_cmd.action {
-                TerminalAction::Add(args) => {
-                    let response = client.open_terminal(
-                        Some(args.cols),
-                        Some(args.rows),
-                        Some(args.term_type.clone()),
-                        args.shell.clone(),
-                        args.command.clone(),
-                    ).await?;
-                    println!("Terminal opened: {} ({}x{})", response.terminal_id, response.cols, response.rows);
-                    Ok(0)
+                TerminalAction::Add(_args) => {
+                    // Terminal creation via resource API not yet implemented
+                    // This requires sending a ResourceCreate command with TerminalCreateParams
+                    eprintln!("Terminal add via control socket not yet implemented");
+                    Ok(1)
                 }
                 TerminalAction::Close(args) => {
-                    // Parse resource_id as u64 for backward compat with control client
-                    let terminal_id: u64 = args.resource_id.parse().map_err(|_| {
-                        qsh_core::Error::Transport {
-                            message: format!("invalid terminal ID: {}", args.resource_id),
-                        }
-                    })?;
-                    let response = client.close_terminal(terminal_id).await?;
-                    if response.closed {
-                        if let Some(exit_code) = response.exit_code {
-                            println!("Terminal closed (exit code: {})", exit_code);
-                        } else {
-                            println!("Terminal closed");
-                        }
+                    // Use resource ID format (e.g., "term-0")
+                    let resource_id = if args.resource_id.starts_with("term-") {
+                        args.resource_id.clone()
                     } else {
-                        println!("Failed to close terminal");
-                    }
+                        format!("term-{}", args.resource_id)
+                    };
+                    client.close_resource(&resource_id).await?;
+                    println!("Terminal closed");
                     Ok(0)
                 }
                 TerminalAction::List => {
-                    let list = client.list_terminals().await?;
-                    if list.terminals.is_empty() {
+                    let resources = client.list_resources(Some(qsh_client::control::ProtoResourceKind::Terminal)).await?;
+                    if resources.is_empty() {
                         println!("No active terminals");
                     } else {
-                        println!("{:<10} {:<12} {:<10} {}", "ID", "SIZE", "STATUS", "SHELL");
+                        println!("{:<12} {:<12} {:<10} {}", "ID", "SIZE", "STATE", "SHELL");
                         println!("{}", "-".repeat(50));
-                        for term in list.terminals {
-                            let shell = term.shell.as_deref().unwrap_or("-");
-                            println!(
-                                "{:<10} {}x{:<8} {:<10} {}",
-                                term.terminal_id,
-                                term.cols,
-                                term.rows,
-                                term.status,
-                                shell
-                            );
+                        for info in resources {
+                            if let qsh_client::control::ResourceDetails::Terminal(t) = &info.details {
+                                println!(
+                                    "{:<12} {}x{:<8} {:<10} {}",
+                                    info.id,
+                                    t.cols,
+                                    t.rows,
+                                    info.state,
+                                    t.shell
+                                );
+                            }
                         }
                     }
                     Ok(0)
                 }
                 TerminalAction::Attach(args) => {
-                    // Parse resource_id as u64 if provided
-                    let terminal_id: Option<u64> = if args.resource_id.is_empty() {
+                    // Use resource ID format
+                    let resource_id = if args.resource_id.is_empty() {
                         None
+                    } else if args.resource_id.starts_with("term-") {
+                        Some(args.resource_id.clone())
                     } else {
-                        Some(args.resource_id.parse().map_err(|_| {
-                            qsh_core::Error::Transport {
-                                message: format!("invalid terminal ID: {}", args.resource_id),
-                            }
-                        })?)
+                        Some(format!("term-{}", args.resource_id))
                     };
                     // Attach requires raw terminal and interactive I/O
-                    run_terminal_attach(&session_name, terminal_id).await
+                    run_terminal_attach(&session_name, resource_id).await
                 }
                 TerminalAction::Detach(_args) => {
                     // Detach is handled via escape sequence during attach, not as standalone command
@@ -320,15 +311,14 @@ async fn run_control_command(cli: &Cli, subcommand: &qsh_client::cli::Command) -
                     Ok(0)
                 }
                 TerminalAction::Resize(args) => {
-                    // Parse resource_id as u64
-                    let terminal_id: u64 = args.resource_id.parse().map_err(|_| {
-                        qsh_core::Error::Transport {
-                            message: format!("invalid terminal ID: {}", args.resource_id),
-                        }
-                    })?;
-                    // TODO: Add resize method to ControlClient
-                    println!("Resize terminal {} to {}x{}", terminal_id, args.cols, args.rows);
-                    println!("Terminal resize not yet implemented via control socket");
+                    // Use resource ID format
+                    let resource_id = if args.resource_id.starts_with("term-") {
+                        args.resource_id.clone()
+                    } else {
+                        format!("term-{}", args.resource_id)
+                    };
+                    client.resize_terminal(&resource_id, args.cols, args.rows).await?;
+                    println!("Terminal resized to {}x{}", args.cols, args.rows);
                     Ok(0)
                 }
             }

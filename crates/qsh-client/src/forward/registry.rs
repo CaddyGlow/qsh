@@ -11,7 +11,30 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::control::ForwardInfo;
+/// Information about a forward for listing purposes.
+#[derive(Debug, Clone)]
+pub struct ForwardInfo {
+    /// Unique forward ID.
+    pub id: String,
+    /// Forward type: "local", "remote", or "dynamic".
+    pub forward_type: String,
+    /// Bind address (IP or hostname).
+    pub bind_addr: String,
+    /// Bind port.
+    pub bind_port: u32,
+    /// Destination host (for local/remote forwards).
+    pub dest_host: Option<String>,
+    /// Destination port (for local/remote forwards).
+    pub dest_port: Option<u32>,
+    /// Forward status: "active", "failed", etc.
+    pub status: String,
+    /// Number of active connections.
+    pub connections: u64,
+    /// Bytes sent through this forward.
+    pub bytes_sent: u64,
+    /// Bytes received through this forward.
+    pub bytes_received: u64,
+}
 
 /// Registry for tracking runtime-added forwards.
 ///
@@ -172,15 +195,15 @@ impl ForwardRegistry {
         for (id, entry) in &self.local {
             forwards.push(ForwardInfo {
                 id: id.clone(),
-                r#type: "local".to_string(),
+                forward_type: "local".to_string(),
                 bind_addr: entry.bind_addr.ip().to_string(),
                 bind_port: entry.bind_addr.port() as u32,
                 dest_host: Some(entry.target.clone()),
                 dest_port: None, // Target is already in "host:port" format
                 status: "active".to_string(),
-                connections: Some(0), // TODO: Track actual connection count
-                bytes_sent: Some(0),  // TODO: Track actual bytes
-                bytes_received: Some(0), // TODO: Track actual bytes
+                connections: 0, // TODO: Track actual connection count
+                bytes_sent: 0,  // TODO: Track actual bytes
+                bytes_received: 0, // TODO: Track actual bytes
             });
         }
 
@@ -188,15 +211,15 @@ impl ForwardRegistry {
         for (id, entry) in &self.remote {
             forwards.push(ForwardInfo {
                 id: id.clone(),
-                r#type: "remote".to_string(),
+                forward_type: "remote".to_string(),
                 bind_addr: entry.bind_addr.clone(),
                 bind_port: 0, // TODO: Parse from bind_addr
                 dest_host: Some(entry.target.clone()),
                 dest_port: None,
                 status: "active".to_string(),
-                connections: Some(0),
-                bytes_sent: Some(0),
-                bytes_received: Some(0),
+                connections: 0,
+                bytes_sent: 0,
+                bytes_received: 0,
             });
         }
 
@@ -204,15 +227,15 @@ impl ForwardRegistry {
         for (id, entry) in &self.dynamic {
             forwards.push(ForwardInfo {
                 id: id.clone(),
-                r#type: "dynamic".to_string(),
+                forward_type: "dynamic".to_string(),
                 bind_addr: entry.bind_addr.ip().to_string(),
                 bind_port: entry.bind_addr.port() as u32,
                 dest_host: None,
                 dest_port: None,
                 status: "active".to_string(),
-                connections: Some(0),
-                bytes_sent: Some(0),
-                bytes_received: Some(0),
+                connections: 0,
+                bytes_sent: 0,
+                bytes_received: 0,
             });
         }
 
@@ -313,10 +336,10 @@ mod tests {
         let forwards = registry.list();
         assert_eq!(forwards.len(), 2);
 
-        let local_fwd = forwards.iter().find(|f| f.r#type == "local").unwrap();
+        let local_fwd = forwards.iter().find(|f| f.forward_type == "local").unwrap();
         assert_eq!(local_fwd.bind_port, 8080);
 
-        let dynamic_fwd = forwards.iter().find(|f| f.r#type == "dynamic").unwrap();
+        let dynamic_fwd = forwards.iter().find(|f| f.forward_type == "dynamic").unwrap();
         assert_eq!(dynamic_fwd.bind_port, 1080);
     }
 

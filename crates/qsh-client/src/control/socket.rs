@@ -10,7 +10,7 @@
 //! Messages use length-prefixed protobuf encoding (4-byte LE length + payload).
 
 use bytes::{Buf, BufMut, BytesMut};
-use prost::Message;
+use prost::Message as ProstMessage;
 use qsh_core::error::{Error, Result};
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
-use super::proto::{ControlRequest, ControlResponse};
+use super::proto::{self, Message};
 
 /// Length of the frame header (4 bytes, little-endian u32).
 const FRAME_HEADER_LEN: usize = 4;
@@ -127,8 +127,29 @@ impl ControlSocket {
                 // Read from existing clients
                 Some((client_id, result)) = Self::poll_clients(&mut self.clients) => {
                     match result {
-                        Ok(request) => {
-                            return Ok(Some(ControlEvent::Request { client_id, request }));
+                        Ok(msg) => {
+                            // Dispatch based on message kind
+                            match msg.kind {
+                                Some(proto::message::Kind::Command(cmd)) => {
+                                    if let Some(c) = cmd.cmd {
+                                        return Ok(Some(ControlEvent::Command {
+                                            client_id,
+                                            request_id: cmd.request_id,
+                                            cmd: c,
+                                        }));
+                                    }
+                                }
+                                Some(proto::message::Kind::Stream(stream)) => {
+                                    return Ok(Some(ControlEvent::Stream { client_id, stream }));
+                                }
+                                Some(proto::message::Kind::Event(_)) => {
+                                    // Events are server-to-client only, ignore from clients
+                                    tracing::debug!(client_id, "Ignoring Event message from client");
+                                }
+                                None => {
+                                    tracing::debug!(client_id, "Empty message from client");
+                                }
+                            }
                         }
                         Err(e) => {
                             // Client disconnected or error
@@ -146,21 +167,74 @@ impl ControlSocket {
         }
     }
 
-    /// Send a response to a specific client.
-    pub async fn send_response(&mut self, client_id: usize, response: ControlResponse) -> Result<()> {
+    /// Send a message to a specific client.
+    pub async fn send_message(&mut self, client_id: usize, message: Message) -> Result<()> {
         if let Some(client) = self.clients.get_mut(&client_id) {
-            client.send_response(response).await?;
+            client.send_message(message).await?;
         }
         Ok(())
     }
 
-    /// Poll all clients for incoming requests.
+    /// Send a command result (success) to a client.
+    pub async fn send_command_ok(
+        &mut self,
+        client_id: usize,
+        request_id: u32,
+        event_seq: u64,
+        data: Option<proto::command_ok::Data>,
+    ) -> Result<()> {
+        let message = Message {
+            kind: Some(proto::message::Kind::Event(proto::Event {
+                event_seq,
+                evt: Some(proto::event::Evt::CommandResult(proto::CommandResult {
+                    request_id,
+                    result: Some(proto::command_result::Result::Ok(proto::CommandOk { data })),
+                })),
+            })),
+        };
+        self.send_message(client_id, message).await
+    }
+
+    /// Send a command error to a client.
+    pub async fn send_command_error(
+        &mut self,
+        client_id: usize,
+        request_id: u32,
+        event_seq: u64,
+        code: proto::ErrorCode,
+        message: String,
+    ) -> Result<()> {
+        let msg = Message {
+            kind: Some(proto::message::Kind::Event(proto::Event {
+                event_seq,
+                evt: Some(proto::event::Evt::CommandResult(proto::CommandResult {
+                    request_id,
+                    result: Some(proto::command_result::Result::Error(proto::CommandError {
+                        code: code.into(),
+                        message,
+                        details: String::new(),
+                    })),
+                })),
+            })),
+        };
+        self.send_message(client_id, msg).await
+    }
+
+    /// Send a stream message to a specific client.
+    pub async fn send_stream(&mut self, client_id: usize, stream: proto::Stream) -> Result<()> {
+        let message = Message {
+            kind: Some(proto::message::Kind::Stream(stream)),
+        };
+        self.send_message(client_id, message).await
+    }
+
+    /// Poll all clients for incoming messages.
     ///
     /// This is a simplified implementation that polls clients sequentially.
     /// A production version would use futures::select_all for better concurrency.
     async fn poll_clients(
         clients: &mut HashMap<usize, ClientConnection>,
-    ) -> Option<(usize, Result<ControlRequest>)> {
+    ) -> Option<(usize, Result<Message>)> {
         if clients.is_empty() {
             return None;
         }
@@ -170,7 +244,7 @@ impl ControlSocket {
             // Non-blocking check if client has data ready
             match tokio::time::timeout(
                 std::time::Duration::from_millis(1),
-                client.read_request(),
+                client.read_message(),
             )
             .await
             {
@@ -181,6 +255,33 @@ impl ControlSocket {
 
         None
     }
+
+    /// Broadcast raw bytes to all connected clients.
+    ///
+    /// This is used for pushing events (like resource state changes) to all
+    /// control clients. Failed sends are logged but don't fail the broadcast.
+    pub async fn broadcast(&mut self, data: &[u8]) -> Result<()> {
+        let mut failed_clients = Vec::new();
+
+        for (client_id, client) in self.clients.iter_mut() {
+            if let Err(e) = client.send_bytes(data).await {
+                tracing::debug!(client_id, error = %e, "Failed to send to client during broadcast");
+                failed_clients.push(*client_id);
+            }
+        }
+
+        // Remove failed clients
+        for client_id in failed_clients {
+            self.clients.remove(&client_id);
+        }
+
+        Ok(())
+    }
+
+    /// Get the number of connected clients.
+    pub fn client_count(&self) -> usize {
+        self.clients.len()
+    }
 }
 
 /// Events emitted by the control socket.
@@ -188,10 +289,16 @@ impl ControlSocket {
 pub enum ControlEvent {
     /// A new client connected.
     ClientConnected { client_id: usize },
-    /// A client sent a request.
-    Request {
+    /// A client sent a command.
+    Command {
         client_id: usize,
-        request: ControlRequest,
+        request_id: u32,
+        cmd: proto::command::Cmd,
+    },
+    /// A client sent a stream message (terminal I/O, etc.).
+    Stream {
+        client_id: usize,
+        stream: proto::Stream,
     },
     /// A client disconnected.
     ClientDisconnected {
@@ -214,12 +321,12 @@ impl ClientConnection {
         }
     }
 
-    /// Read a request from the client.
-    async fn read_request(&mut self) -> Result<ControlRequest> {
+    /// Read a message from the client.
+    async fn read_message(&mut self) -> Result<Message> {
         loop {
             // Try to decode a message from the buffer
-            if let Some(request) = Self::try_decode_request(&mut self.read_buffer)? {
-                return Ok(request);
+            if let Some(msg) = Self::try_decode_message(&mut self.read_buffer)? {
+                return Ok(msg);
             }
 
             // Need more data
@@ -238,8 +345,8 @@ impl ClientConnection {
         }
     }
 
-    /// Try to decode a request from the buffer.
-    fn try_decode_request(buf: &mut BytesMut) -> Result<Option<ControlRequest>> {
+    /// Try to decode a message from the buffer.
+    fn try_decode_message(buf: &mut BytesMut) -> Result<Option<Message>> {
         // Need at least 4 bytes for length
         if buf.len() < FRAME_HEADER_LEN {
             return Ok(None);
@@ -268,21 +375,21 @@ impl ClientConnection {
 
         // Consume and decode the payload
         let payload = buf.split_to(len);
-        let request = ControlRequest::decode(&payload[..]).map_err(|e| Error::Codec {
+        let msg = Message::decode(&payload[..]).map_err(|e| Error::Codec {
             message: format!("protobuf decode failed: {}", e),
         })?;
 
-        Ok(Some(request))
+        Ok(Some(msg))
     }
 
-    /// Send a response to the client.
-    async fn send_response(&mut self, response: ControlResponse) -> Result<()> {
-        let payload = response.encode_to_vec();
+    /// Send a message to the client.
+    async fn send_message(&mut self, message: Message) -> Result<()> {
+        let payload = message.encode_to_vec();
 
         if payload.len() > MAX_MESSAGE_SIZE {
             return Err(Error::Codec {
                 message: format!(
-                    "response too large: {} bytes (max {})",
+                    "message too large: {} bytes (max {})",
                     payload.len(),
                     MAX_MESSAGE_SIZE
                 ),
@@ -297,6 +404,15 @@ impl ClientConnection {
         self.stream.write_all(&buf).await.map_err(Error::Io)?;
         self.stream.flush().await.map_err(Error::Io)?;
 
+        Ok(())
+    }
+
+    /// Send raw bytes to the client (for pre-encoded messages).
+    ///
+    /// The bytes should already be framed (length prefix + payload).
+    async fn send_bytes(&mut self, data: &[u8]) -> Result<()> {
+        self.stream.write_all(data).await.map_err(Error::Io)?;
+        self.stream.flush().await.map_err(Error::Io)?;
         Ok(())
     }
 }

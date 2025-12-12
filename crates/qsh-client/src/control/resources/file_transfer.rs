@@ -18,7 +18,7 @@ use crate::control::resource::{
     FailureReason, Resource, ResourceDetails, ResourceError, ResourceInfo, ResourceKind,
     ResourceState, ResourceStats, FileTransferDetails,
 };
-use crate::transfer::{ProgressCallback, ProgressEvent, TransferEngine};
+use crate::transfer::{ProgressEvent, TransferEngine};
 use crate::ChannelConnection;
 
 /// FileTransfer resource.

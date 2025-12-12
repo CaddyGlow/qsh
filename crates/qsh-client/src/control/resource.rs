@@ -365,6 +365,8 @@ pub trait Resource: Send + Sync + 'static {
 /// Errors that can occur during resource operations.
 #[derive(Debug, Clone)]
 pub enum ResourceError {
+    /// Resource not found.
+    NotFound(String),
     /// Resource is in wrong state for the operation.
     InvalidState { current: ResourceState, expected: &'static str },
     /// Bind operation failed.
@@ -384,6 +386,7 @@ pub enum ResourceError {
 impl std::fmt::Display for ResourceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ResourceError::NotFound(id) => write!(f, "resource not found: {}", id),
             ResourceError::InvalidState { current, expected } => {
                 write!(f, "invalid state: {} (expected {})", current, expected)
             }
@@ -408,6 +411,7 @@ impl From<std::io::Error> for ResourceError {
 impl From<ResourceError> for FailureReason {
     fn from(e: ResourceError) -> Self {
         match e {
+            ResourceError::NotFound(id) => FailureReason::Internal(format!("not found: {}", id)),
             ResourceError::InvalidState { current, .. } => {
                 FailureReason::Internal(format!("invalid state: {}", current))
             }

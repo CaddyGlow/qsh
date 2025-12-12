@@ -141,6 +141,29 @@ impl ResourceManager {
         id
     }
 
+    /// Add a resource using a factory function.
+    ///
+    /// The factory receives the generated resource ID and should return the resource.
+    /// This allows resources that need their ID at construction time.
+    pub async fn add_with_factory<F>(&self, kind: ResourceKind, factory: F) -> Result<String, ResourceError>
+    where
+        F: FnOnce(String) -> Box<dyn Resource>,
+    {
+        let id = self.generate_id(kind).await;
+        let resource = factory(id.clone());
+
+        // Store the resource
+        {
+            let mut resources = self.resources.write().await;
+            resources.insert(id.clone(), resource);
+        }
+
+        info!(resource_id = %id, kind = %kind, "adding resource via factory");
+        self.emit_event(&id, kind, ResourceState::Pending, ResourceStats::new()).await;
+
+        Ok(id)
+    }
+
     /// Add a resource with a specific ID.
     ///
     /// Useful for restoring resources after reconnection. Returns an error if
@@ -301,44 +324,46 @@ impl ResourceManager {
 
     /// Close a specific resource.
     ///
-    /// Immediately terminates the resource.
+    /// Immediately terminates the resource. If the resource is already in a terminal
+    /// state (Closed or Failed), it will be removed from the registry.
     pub async fn close(&self, id: &str) -> Result<(), ResourceError> {
-        let (kind, stats) = {
-            let mut resources = self.resources.write().await;
-            let resource = resources.get_mut(id).ok_or_else(|| {
-                ResourceError::Internal(format!("resource {} not found", id))
-            })?;
+        let mut resources = self.resources.write().await;
+        let resource = resources.get_mut(id).ok_or_else(|| {
+            ResourceError::NotFound(id.to_string())
+        })?;
 
-            let kind = resource.kind();
+        let kind = resource.kind();
+        let info = resource.describe();
+        let current_state = info.state.clone();
 
-            // Check state
-            if resource.state().is_terminal() {
-                return Err(ResourceError::InvalidState {
-                    current: resource.state().clone(),
-                    expected: "active",
-                });
+        // If already terminal, just remove from registry
+        if current_state.is_terminal() {
+            resources.remove(id);
+            info!(resource_id = %id, "removed terminal resource from registry");
+            return Ok(());
+        }
+
+        // Close the resource
+        match resource.close().await {
+            Ok(()) => {
+                let final_stats = resource.describe().stats;
+                // Remove from registry after successful close
+                resources.remove(id);
+                drop(resources); // Release lock before emitting event
+                self.emit_event(id, kind, ResourceState::Closed, final_stats).await;
+                info!(resource_id = %id, "resource closed");
+                Ok(())
             }
-
-            // Close the resource
-            match resource.close().await {
-                Ok(()) => (kind, resource.describe().stats),
-                Err(e) => {
-                    self.emit_event(
-                        id,
-                        kind,
-                        ResourceState::Failed(e.clone().into()),
-                        resource.describe().stats,
-                    ).await;
-                    return Err(e);
-                }
+            Err(e) => {
+                self.emit_event(
+                    id,
+                    kind,
+                    ResourceState::Failed(e.clone().into()),
+                    info.stats,
+                ).await;
+                Err(e)
             }
-        };
-
-        // Emit closed event
-        self.emit_event(id, kind, ResourceState::Closed, stats).await;
-        info!(resource_id = %id, "resource closed");
-
-        Ok(())
+        }
     }
 
     /// Force close a resource, ignoring errors.

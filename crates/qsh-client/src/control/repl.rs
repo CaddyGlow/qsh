@@ -98,41 +98,73 @@ async fn execute_command(client: &mut ControlClient, line: &str) -> Result<bool>
         "status" => {
             let status = client.get_status().await?;
             println!("State: {}", status.state);
-            if let Some(addr) = status.server_addr {
-                println!("Server: {}", addr);
-            }
-            if let Some(uptime) = status.uptime_secs {
-                println!("Uptime: {}s", uptime);
-            }
-            if let Some(rtt) = status.rtt_ms {
-                println!("RTT: {}ms", rtt);
-            }
-            if let Some(sent) = status.bytes_sent {
-                println!("Sent: {} bytes", sent);
-            }
-            if let Some(recv) = status.bytes_received {
-                println!("Received: {} bytes", recv);
-            }
+            println!("Server: {}", status.server_addr);
+            println!("Uptime: {}s", status.uptime_secs);
+            println!("RTT: {}ms", status.rtt_ms);
+            println!("Sent: {} bytes", status.bytes_sent);
+            println!("Received: {} bytes", status.bytes_received);
+            println!("Resources: {}", status.resource_count);
         }
-        "session" => {
-            let info = client.get_session_info().await?;
-            println!("Session ID: {}", info.session_id);
-            if let Some(user) = info.user {
-                print!("User: {}", user);
-                if let Some(host) = info.host {
-                    println!("@{}", host);
-                } else {
-                    println!();
+        "resources" | "ls" => {
+            let resources = client.list_resources(None).await?;
+            if resources.is_empty() {
+                println!("No resources");
+            } else {
+                println!("{:<12} {:<12} {:<10}", "ID", "KIND", "STATE");
+                println!("{}", "-".repeat(36));
+                for info in resources {
+                    println!("{:<12} {:<12} {:<10}", info.id, info.kind, info.state);
                 }
             }
-            println!("Connected at: {}", info.connected_at);
-            println!("Channels:");
-            for ch in info.channels {
-                println!(
-                    "  {} (type={}, status={})",
-                    ch.channel_id, ch.r#type, ch.status
-                );
+        }
+        "describe" => {
+            if parts.len() < 2 {
+                eprintln!("Usage: describe <resource_id>");
+                return Ok(false);
             }
+            let info = client.describe_resource(parts[1]).await?;
+            println!("ID: {}", info.id);
+            println!("Kind: {}", info.kind);
+            println!("State: {}", info.state);
+            println!("Created: {} (epoch)", info.stats.created_at);
+            println!("Bytes in: {}", info.stats.bytes_in);
+            println!("Bytes out: {}", info.stats.bytes_out);
+            match &info.details {
+                crate::control::ResourceDetails::Terminal(t) => {
+                    println!("Terminal:");
+                    println!("  Size: {}x{}", t.cols, t.rows);
+                    println!("  Shell: {}", t.shell);
+                    println!("  Attached: {}", t.attached);
+                    if let Some(pid) = t.pid {
+                        println!("  PID: {}", pid);
+                    }
+                }
+                crate::control::ResourceDetails::Forward(f) => {
+                    println!("Forward:");
+                    println!("  Type: {:?}", f.forward_type);
+                    println!("  Bind: {}:{}", f.bind_addr, f.bind_port);
+                    if let (Some(host), Some(port)) = (&f.dest_host, f.dest_port) {
+                        println!("  Dest: {}:{}", host, port);
+                    }
+                    println!("  Connections: {}", f.active_connections);
+                }
+                crate::control::ResourceDetails::FileTransfer(ft) => {
+                    println!("File Transfer:");
+                    println!("  Local: {}", ft.local_path);
+                    println!("  Remote: {}", ft.remote_path);
+                    println!("  Upload: {}", ft.upload);
+                    println!("  Progress: {}/{} bytes", ft.transferred_bytes, ft.total_bytes);
+                    println!("  Files: {}/{} done, {} failed", ft.files_done, ft.files_total, ft.files_failed);
+                }
+            }
+        }
+        "close" => {
+            if parts.len() < 2 {
+                eprintln!("Usage: close <resource_id>");
+                return Ok(false);
+            }
+            client.close_resource(parts[1]).await?;
+            println!("Closed resource: {}", parts[1]);
         }
         "ping" => {
             let now = std::time::SystemTime::now()
@@ -142,87 +174,38 @@ async fn execute_command(client: &mut ControlClient, line: &str) -> Result<bool>
             let pong = client.ping(now).await?;
             println!("Pong! timestamp={}, server_time={}", pong.timestamp, pong.server_time);
         }
-        "forward" => {
+        "attach" => {
             if parts.len() < 2 {
-                eprintln!("Usage: forward <add|list|remove> [args]");
+                eprintln!("Usage: attach <resource_id>");
                 return Ok(false);
             }
-
-            match parts[1] {
-                "add" => {
-                    if parts.len() < 4 {
-                        eprintln!("Usage: forward add <local|remote|dynamic> <spec>");
-                        eprintln!("  local:   [bind_addr:]port:host:hostport");
-                        eprintln!("  remote:  [bind_addr:]port:host:hostport");
-                        eprintln!("  dynamic: [bind_addr:]port");
-                        return Ok(false);
-                    }
-
-                    let forward_type = parts[2];
-                    let spec = parts[3];
-
-                    let response = match forward_type {
-                        "local" | "l" => client.add_forward_local(spec).await?,
-                        "remote" | "r" => client.add_forward_remote(spec).await?,
-                        "dynamic" | "d" => client.add_forward_dynamic(spec).await?,
-                        _ => {
-                            eprintln!("Invalid forward type: {}", forward_type);
-                            eprintln!("Must be one of: local, remote, dynamic");
-                            return Ok(false);
-                        }
-                    };
-
-                    println!("Forward added: {}", response.forward_id);
-                    if let Some(info) = response.info {
-                        println!("  Type: {}", info.r#type);
-                        println!(
-                            "  Bind: {}:{}",
-                            info.bind_addr, info.bind_port
-                        );
-                        if let Some(dest_host) = info.dest_host {
-                            if let Some(dest_port) = info.dest_port {
-                                println!("  Dest: {}:{}", dest_host, dest_port);
-                            }
-                        }
-                        println!("  Status: {}", info.status);
-                    }
-                }
-                "list" | "ls" => {
-                    let list = client.list_forwards().await?;
-                    if list.forwards.is_empty() {
-                        println!("No active forwards");
-                    } else {
-                        println!("Active forwards:");
-                        for fwd in list.forwards {
-                            print!("  {} - {}:{}", fwd.id, fwd.bind_addr, fwd.bind_port);
-                            if let Some(dest_host) = fwd.dest_host {
-                                if let Some(dest_port) = fwd.dest_port {
-                                    print!(" -> {}:{}", dest_host, dest_port);
-                                }
-                            }
-                            println!(" ({})", fwd.status);
-                        }
-                    }
-                }
-                "remove" | "rm" => {
-                    if parts.len() < 3 {
-                        eprintln!("Usage: forward remove <forward_id>");
-                        return Ok(false);
-                    }
-
-                    let forward_id = parts[2];
-                    let response = client.remove_forward(forward_id).await?;
-                    if response.removed {
-                        println!("Forward removed: {}", forward_id);
-                    } else {
-                        println!("Failed to remove forward: {}", forward_id);
-                    }
-                }
-                _ => {
-                    eprintln!("Unknown forward subcommand: {}", parts[1]);
-                    eprintln!("Available: add, list, remove");
-                }
+            let info = client.attach_terminal(parts[1]).await?;
+            println!("Attached to: {}", info.id);
+            if let crate::control::ResourceDetails::Terminal(t) = &info.details {
+                println!("Terminal size: {}x{}", t.cols, t.rows);
             }
+        }
+        "detach" => {
+            if parts.len() < 2 {
+                eprintln!("Usage: detach <resource_id>");
+                return Ok(false);
+            }
+            client.detach_terminal(parts[1]).await?;
+            println!("Detached from: {}", parts[1]);
+        }
+        "resize" => {
+            if parts.len() < 4 {
+                eprintln!("Usage: resize <resource_id> <cols> <rows>");
+                return Ok(false);
+            }
+            let cols: u32 = parts[2].parse().map_err(|_| Error::Transport {
+                message: "invalid cols value".to_string(),
+            })?;
+            let rows: u32 = parts[3].parse().map_err(|_| Error::Transport {
+                message: "invalid rows value".to_string(),
+            })?;
+            client.resize_terminal(parts[1], cols, rows).await?;
+            println!("Resized {} to {}x{}", parts[1], cols, rows);
         }
         "exit" | "quit" => {
             return Ok(true);
@@ -239,17 +222,16 @@ async fn execute_command(client: &mut ControlClient, line: &str) -> Result<bool>
 /// Print help text.
 fn print_help() {
     println!("Available commands:");
-    println!("  status               - Show connection status");
-    println!("  session              - Show session information");
-    println!("  ping                 - Send a ping to the session");
-    println!("  forward add <type> <spec>  - Add a port forward");
-    println!("    Types: local, remote, dynamic");
-    println!("    Spec: [bind_addr:]port:host:hostport (local/remote)");
-    println!("          [bind_addr:]port (dynamic)");
-    println!("  forward list         - List active forwards");
-    println!("  forward remove <id>  - Remove a forward by ID");
-    println!("  help, ?              - Show this help");
-    println!("  exit, quit           - Exit the REPL");
+    println!("  status                      - Show connection status");
+    println!("  resources, ls               - List all resources");
+    println!("  describe <id>               - Show resource details");
+    println!("  close <id>                  - Close a resource");
+    println!("  ping                        - Send a ping to the session");
+    println!("  attach <id>                 - Attach to a terminal");
+    println!("  detach <id>                 - Detach from a terminal");
+    println!("  resize <id> <cols> <rows>   - Resize a terminal");
+    println!("  help, ?                     - Show this help");
+    println!("  exit, quit                  - Exit the REPL");
 }
 
 /// Discover the latest session by scanning socket directory.

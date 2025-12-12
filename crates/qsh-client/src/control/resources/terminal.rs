@@ -20,6 +20,7 @@
 //! - Lifecycle tracking (start, running, draining, closed)
 
 use std::sync::Arc;
+use std::sync::RwLock as StdRwLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -32,7 +33,7 @@ use crate::channel::TerminalChannel;
 use crate::ChannelConnection;
 
 use super::super::resource::{
-    FailureReason, Resource, ResourceDetails, ResourceError, ResourceInfo, ResourceKind,
+    Resource, ResourceDetails, ResourceError, ResourceInfo, ResourceKind,
     ResourceState, ResourceStats, TerminalDetails as TerminalDetailsInfo,
 };
 
@@ -54,10 +55,10 @@ pub struct Terminal {
     params: TerminalParams,
     /// The underlying terminal channel (set after start()).
     channel: RwLock<Option<TerminalChannel>>,
-    /// Current terminal size.
-    term_size: RwLock<(u32, u32)>,
-    /// Attachment state.
-    attachment: Mutex<AttachmentState>,
+    /// Current terminal size (uses std lock for sync access in describe).
+    term_size: StdRwLock<(u32, u32)>,
+    /// Attachment state (uses std lock for sync access in describe).
+    attachment: StdRwLock<AttachmentState>,
     /// I/O task handle (spawned when attached).
     io_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -85,8 +86,8 @@ impl Terminal {
             stats: ResourceStats::new(),
             params,
             channel: RwLock::new(None),
-            term_size: RwLock::new((cols, rows)),
-            attachment: Mutex::new(AttachmentState::Detached),
+            term_size: StdRwLock::new((cols, rows)),
+            attachment: StdRwLock::new(AttachmentState::Detached),
             io_task: Mutex::new(None),
         }
     }
@@ -145,16 +146,17 @@ impl Terminal {
             });
         }
 
-        let mut attachment = self.attachment.lock().await;
-        if matches!(*attachment, AttachmentState::Attached) {
-            return Err(ResourceError::Internal(
-                "terminal already attached".to_string(),
-            ));
-        }
+        {
+            let mut attachment = self.attachment.write().unwrap();
+            if matches!(*attachment, AttachmentState::Attached) {
+                return Err(ResourceError::Internal(
+                    "terminal already attached".to_string(),
+                ));
+            }
 
-        // Mark as attached
-        *attachment = AttachmentState::Attached;
-        drop(attachment);
+            // Mark as attached
+            *attachment = AttachmentState::Attached;
+        }
 
         // Create channels for I/O forwarding
         let (output_tx, output_rx) = mpsc::unbounded_channel();
@@ -172,15 +174,16 @@ impl Terminal {
     ///
     /// This stops the I/O forwarding task and marks the terminal as detached.
     pub async fn detach(&self) -> Result<(), ResourceError> {
-        let mut attachment = self.attachment.lock().await;
-        if matches!(*attachment, AttachmentState::Detached) {
-            return Err(ResourceError::Internal(
-                "terminal not attached".to_string(),
-            ));
-        }
+        {
+            let mut attachment = self.attachment.write().unwrap();
+            if matches!(*attachment, AttachmentState::Detached) {
+                return Err(ResourceError::Internal(
+                    "terminal not attached".to_string(),
+                ));
+            }
 
-        *attachment = AttachmentState::Detached;
-        drop(attachment);
+            *attachment = AttachmentState::Detached;
+        }
 
         // Stop the I/O task
         self.stop_io_task().await;
@@ -199,7 +202,7 @@ impl Terminal {
         }
 
         // Update size tracking
-        *self.term_size.write().await = (cols, rows);
+        *self.term_size.write().unwrap() = (cols, rows);
 
         // Send resize to remote PTY
         let channel = self.channel.read().await;
@@ -214,7 +217,7 @@ impl Terminal {
 
     /// Check if a client is currently attached.
     pub async fn is_attached(&self) -> bool {
-        matches!(&*self.attachment.lock().await, AttachmentState::Attached)
+        matches!(&*self.attachment.read().unwrap(), AttachmentState::Attached)
     }
 
     /// Get the terminal's PID (if available).
@@ -356,11 +359,12 @@ impl Resource for Terminal {
         info!(terminal_id = %self.id, "Draining terminal resource");
 
         // Detach any attached client
-        let mut attachment = self.attachment.lock().await;
-        if matches!(*attachment, AttachmentState::Attached) {
-            *attachment = AttachmentState::Detached;
+        {
+            let mut attachment = self.attachment.write().unwrap();
+            if matches!(*attachment, AttachmentState::Attached) {
+                *attachment = AttachmentState::Detached;
+            }
         }
-        drop(attachment);
 
         // Stop I/O task
         self.stop_io_task().await;
@@ -401,8 +405,8 @@ impl Resource for Terminal {
     fn describe(&self) -> ResourceInfo {
         let state = self.state.clone();
         let stats = self.stats.clone();
-        let (cols, rows) = *self.term_size.blocking_read();
-        let attached = matches!(&*self.attachment.blocking_lock(), AttachmentState::Attached);
+        let (cols, rows) = *self.term_size.read().unwrap();
+        let attached = matches!(&*self.attachment.read().unwrap(), AttachmentState::Attached);
 
         ResourceInfo {
             id: self.id.clone(),
@@ -443,7 +447,7 @@ impl Resource for Terminal {
 
         // Force detach since the client's channels are broken
         // Client will need to re-attach after reconnect
-        *self.attachment.blocking_lock() = AttachmentState::Detached;
+        *self.attachment.write().unwrap() = AttachmentState::Detached;
     }
 
     async fn on_reconnect(&mut self, conn: Arc<ChannelConnection>) -> Result<(), ResourceError> {

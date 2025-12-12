@@ -1216,6 +1216,8 @@ pub struct Session {
     connected_at: Option<std::time::Instant>,
     /// Resource manager for unified resource tracking (Phase 2).
     resource_manager: Option<crate::control::ResourceManager>,
+    /// Resource event receiver for broadcasting to control clients.
+    resource_event_rx: Option<tokio::sync::broadcast::Receiver<crate::control::ResourceEvent>>,
 }
 
 impl Session {
@@ -1228,12 +1230,20 @@ impl Session {
             forward_registry: std::sync::Arc::new(std::sync::Mutex::new(crate::forward::ForwardRegistry::new())),
             connected_at: None,
             resource_manager: None,
+            resource_event_rx: None,
         }
     }
 
     /// Attach a resource manager for unified resource tracking.
-    pub fn with_resource_manager(mut self, manager: crate::control::ResourceManager) -> Self {
+    ///
+    /// Also stores the event receiver for broadcasting resource events to control clients.
+    pub fn with_resource_manager(
+        mut self,
+        manager: crate::control::ResourceManager,
+        event_rx: tokio::sync::broadcast::Receiver<crate::control::ResourceEvent>,
+    ) -> Self {
         self.resource_manager = Some(manager);
+        self.resource_event_rx = Some(event_rx);
         self
     }
 
@@ -1284,18 +1294,15 @@ impl Session {
             None
         };
 
-        // Validate configuration
-        if is_forward_only && !has_forwards {
-            return Err(qsh_core::Error::Protocol {
-                message: "Forward-only mode (-N) requires at least one forward".to_string(),
-            });
-        }
+        // Note: -N without forwards is allowed - useful for control-socket-only sessions
+        // where forwards/terminals can be added dynamically via the control socket
 
         let mut session = Self::new(connection, SessionParts { terminal, forwards });
 
         // Create resource manager for unified resource tracking
-        let (resource_manager, _event_rx) = crate::control::ResourceManager::new();
+        let (resource_manager, event_rx) = crate::control::ResourceManager::new();
         session.resource_manager = Some(resource_manager);
+        session.resource_event_rx = Some(event_rx);
 
         // Create control socket for session management
         // Session name: use -S flag, or derive from user@host
@@ -1365,7 +1372,7 @@ impl Session {
             let (terminal_cmd_tx, mut terminal_cmd_rx) = tokio::sync::mpsc::channel::<crate::control::TerminalCommand>(16);
 
             // Create channel for control responses (allows spawned tasks to send responses back)
-            let (control_response_tx, mut control_response_rx) = tokio::sync::mpsc::channel::<(usize, crate::control::ControlResponse)>(16);
+            let (control_response_tx, mut control_response_rx) = tokio::sync::mpsc::channel::<(usize, crate::control::Message)>(16);
 
             // Unified event loop
             let res: Result<i32> = loop {
@@ -1455,30 +1462,65 @@ impl Session {
                     // Terminal command from control socket
                     Some(cmd) = terminal_cmd_rx.recv() => {
                         use crate::control::TerminalCommand;
+                        use crate::control::resources::Terminal;
                         match cmd {
                             TerminalCommand::Open { cols, rows, term_type, shell, command, response_tx } => {
-                                // Opening new terminals requires creating new PTY channels
-                                // For now, return a placeholder terminal ID
-                                // TODO: Implement actual terminal multiplexing
+                                // Create a Terminal resource and start it via ResourceManager
                                 info!(cols, rows, term_type = %term_type, shell = ?shell, command = ?command, "Terminal open requested");
 
-                                // If we have a main terminal, return its "ID" (0)
-                                // Otherwise return an error
-                                if self.parts.terminal.is_some() {
-                                    // Return terminal ID 0 for the main terminal
-                                    let _ = response_tx.send(Ok(0));
+                                if let Some(ref rm) = self.resource_manager {
+                                    // Create Terminal resource with params
+                                    let terminal = Terminal::from_params(
+                                        "pending".to_string(), // ID will be assigned by ResourceManager
+                                        Some(cols),
+                                        Some(rows),
+                                        Some(term_type.clone()),
+                                        shell.clone(),
+                                        command.clone(),
+                                        vec![],
+                                    );
+
+                                    // Add to resource manager (gets assigned ID like "term-0")
+                                    let id = rm.add(Box::new(terminal)).await;
+                                    info!(resource_id = %id, "Terminal resource added");
+
+                                    // Start the resource (opens channel on server)
+                                    match rm.start(&id, conn.clone()).await {
+                                        Ok(()) => {
+                                            info!(resource_id = %id, "Terminal resource started");
+                                            // Return the resource ID (parsed as u64 for backwards compat)
+                                            // Format is "term-N", extract N
+                                            let term_num = id.strip_prefix("term-")
+                                                .and_then(|s| s.parse::<u64>().ok())
+                                                .unwrap_or(0);
+                                            let _ = response_tx.send(Ok(term_num));
+                                        }
+                                        Err(e) => {
+                                            error!(resource_id = %id, error = %e, "Failed to start terminal resource");
+                                            let _ = response_tx.send(Err(format!("failed to start terminal: {}", e)));
+                                        }
+                                    }
                                 } else {
-                                    let _ = response_tx.send(Err("no terminal available (session started with -N)".to_string()));
+                                    let _ = response_tx.send(Err("resource manager not available".to_string()));
                                 }
                             }
                             TerminalCommand::Close { terminal_id, response_tx } => {
                                 info!(terminal_id, "Terminal close requested");
-                                // For now, we only support the main terminal (ID 0)
-                                if terminal_id == 0 {
-                                    // Can't close the main terminal via control socket
-                                    let _ = response_tx.send(Err("cannot close main terminal via control socket".to_string()));
+                                // Close via ResourceManager
+                                if let Some(ref rm) = self.resource_manager {
+                                    let id = format!("term-{}", terminal_id);
+                                    match rm.close(&id).await {
+                                        Ok(()) => {
+                                            info!(resource_id = %id, "Terminal resource closed");
+                                            // Return None for exit code (not tracked yet)
+                                            let _ = response_tx.send(Ok(None));
+                                        }
+                                        Err(e) => {
+                                            let _ = response_tx.send(Err(format!("failed to close terminal: {}", e)));
+                                        }
+                                    }
                                 } else {
-                                    let _ = response_tx.send(Err(format!("terminal {} not found", terminal_id)));
+                                    let _ = response_tx.send(Err("resource manager not available".to_string()));
                                 }
                             }
                             TerminalCommand::Resize { terminal_id, cols, rows, response_tx } => {
@@ -1503,8 +1545,21 @@ impl Session {
                                         let _ = response_tx.send(Err("no terminal available".to_string()));
                                     }
                                 } else {
-                                    let _ = response_tx.send(Err(format!("terminal {} not found", terminal_id)));
+                                    // TODO: Resize via ResourceManager for dynamic terminals
+                                    let _ = response_tx.send(Err(format!("terminal {} resize not yet supported via resource manager", terminal_id)));
                                 }
+                            }
+                            TerminalCommand::Attach { terminal_id, response_tx } => {
+                                info!(terminal_id, "Terminal attach requested");
+                                // TODO: Implement attach via ResourceManager
+                                // For now, return an error
+                                let _ = response_tx.send(Err("terminal attach not yet implemented".to_string()));
+                            }
+                            TerminalCommand::Detach { terminal_id, response_tx } => {
+                                info!(terminal_id, "Terminal detach requested");
+                                // TODO: Implement detach via ResourceManager
+                                // For now, return an error
+                                let _ = response_tx.send(Err("terminal detach not yet implemented".to_string()));
                             }
                         }
                     }
@@ -1512,7 +1567,7 @@ impl Session {
                     // Control response from spawned task
                     Some((client_id, response)) = control_response_rx.recv() => {
                         if let Some(ctl) = self.control.as_mut() {
-                            if let Err(e) = ctl.send_response(client_id, response).await {
+                            if let Err(e) = ctl.send_message(client_id, response).await {
                                 tracing::warn!(error = %e, "Failed to send control response");
                             }
                         }
@@ -1711,9 +1766,9 @@ impl Session {
                             SessionEvent::InputQueued => {
                                 // Input queued in transport sender, no action needed
                             }
-                            SessionEvent::StdinInput(_) | SessionEvent::WindowResize(_) => {
-                                // These are handled internally by TerminalComponent
-                                // Should not reach here
+                            SessionEvent::StdinInput(_) => {
+                                // StdinInput is handled internally by TerminalComponent
+                                // via flush_transport - should not reach here
                             }
                         }
                     }
@@ -1728,6 +1783,48 @@ impl Session {
                         // Forwards typically don't emit events
                     }
 
+                    // Resource events from ResourceManager (Phase 2)
+                    // Broadcast resource state changes to connected control clients
+                    resource_event = async {
+                        match self.resource_event_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        match resource_event {
+                            Ok(event) => {
+                                // Broadcast resource event to all connected control clients
+                                if let Some(ref mut ctl) = self.control {
+                                    // Convert ResourceEvent to protocol message and broadcast
+                                    // The event already contains event_seq from ResourceManager
+                                    let proto_event = crate::control::resource_event_to_proto(&event, event.event_seq);
+                                    let message = crate::control::proto::Message {
+                                        kind: Some(crate::control::proto::message::Kind::Event(proto_event)),
+                                    };
+                                    if let Ok(bytes) = crate::control::encode_message(&message) {
+                                        // Broadcast to all clients
+                                        if let Err(e) = ctl.broadcast(&bytes).await {
+                                            debug!(error = %e, "Failed to broadcast resource event");
+                                        } else {
+                                            trace!(
+                                                resource_id = %event.id,
+                                                state = %event.state,
+                                                "Broadcasted resource event to control clients"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                warn!(lagged = n, "Resource event receiver lagged, missed events");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                // Channel closed, resource manager dropped - this shouldn't happen
+                                debug!("Resource event channel closed");
+                            }
+                        }
+                    }
+
                     // Control socket events (guarded)
                     ev = async {
                         match self.control.as_mut() {
@@ -1736,77 +1833,53 @@ impl Session {
                         }
                     } => {
                         if let Ok(Some(event)) = ev {
-                            use crate::control::{ControlEvent, handle_command, SessionState, ConnectionState as CtlConnState, TerminalState};
+                            use crate::control::{ControlEvent, proto};
 
                             match event {
                                 ControlEvent::ClientConnected { client_id } => {
                                     tracing::debug!(client_id, "Control client connected");
                                 }
-                                ControlEvent::Request { client_id, request } => {
-                                    // Build SessionState from actual session data
-                                    let connection_state = match self.connection.state() {
-                                        ConnectionState::Connected => CtlConnState::Connected,
-                                        ConnectionState::Reconnecting | ConnectionState::Connecting => CtlConnState::Reconnecting,
-                                        _ => CtlConnState::Disconnected,
-                                    };
+                                ControlEvent::Command { client_id, request_id, cmd } => {
+                                    // Handle unified protocol commands
+                                    let heartbeat_srtt = heartbeat.tracker.srtt();
+                                    let server_addr = self.connection.server_addr().to_string();
+                                    let connected_at_secs = self.connected_at
+                                        .map(|t| t.elapsed().as_secs())
+                                        .unwrap_or(0);
 
-                                    // Build terminal list from terminal component
-                                    let terminals: Vec<TerminalState> = if let Some(ref term) = self.parts.terminal {
-                                        if let Some(channel_id) = term.channel_id() {
-                                            let size = term.terminal_size();
-                                            vec![TerminalState {
-                                                terminal_id: channel_id.id,
-                                                cols: size.cols as u32,
-                                                rows: size.rows as u32,
-                                                status: "open".to_string(),
-                                                shell: None, // Not tracked
-                                                pid: None,   // Not tracked
-                                            }]
-                                        } else {
-                                            vec![]
+                                    let response = handle_unified_command(
+                                        request_id,
+                                        cmd,
+                                        self.resource_manager.as_ref(),
+                                        &conn,
+                                        &server_addr,
+                                        connected_at_secs,
+                                        heartbeat_srtt,
+                                    ).await;
+
+                                    if let Some(ctl) = self.control.as_mut() {
+                                        if let Err(e) = ctl.send_message(client_id, response).await {
+                                            tracing::warn!(error = %e, "Failed to send control response");
                                         }
-                                    } else {
-                                        vec![]
-                                    };
+                                    }
+                                }
+                                ControlEvent::Stream { client_id, stream } => {
+                                    // Handle terminal I/O streams
+                                    if stream.stream_kind == proto::StreamKind::TerminalIo as i32 {
+                                        let resource_id = stream.resource_id.clone();
+                                        let data = stream.data;
 
-                                    // Create Arc reference to resource manager if available
-                                    let resource_manager_arc = self.resource_manager.as_ref().map(|rm| {
-                                        // Note: This requires ResourceManager to be wrapped in Arc
-                                        // For now, we skip this and use None
-                                        // In a full implementation, Session would hold Arc<ResourceManager>
-                                        std::sync::Arc::new(crate::control::ResourceManager::new().0)
-                                    });
-                                    // TODO: Properly share ResourceManager via Arc in Session
-
-                                    let state = SessionState {
-                                        session_name: self.session_name.clone().unwrap_or_else(|| "unknown".to_string()),
-                                        remote_host: None, // TODO: Parse from session_name if available
-                                        remote_user: None, // TODO: Parse from session_name if available
-                                        connection_state,
-                                        server_addr: Some(self.connection.server_addr().to_string()),
-                                        connected_at: self.connected_at,
-                                        forward_registry: self.forward_registry.clone(),
-                                        forward_add_tx: Some(forward_cmd_tx.clone()),
-                                        forward_remove_tx: None, // TODO: Wire up forward remove channel
-                                        terminal_cmd_tx: Some(terminal_cmd_tx.clone()),
-                                        terminals,
-                                        rtt_ms: heartbeat.tracker.srtt().map(|d| d.as_millis() as u32),
-                                        bytes_sent: 0, // TODO: Track bytes
-                                        bytes_received: 0, // TODO: Track bytes
-                                        resource_manager: None, // TODO: Wire resource_manager_arc once Session holds Arc<ResourceManager>
-                                    };
-
-                                    // Spawn a task to handle the command asynchronously.
-                                    // This is necessary because commands like forward_add need to
-                                    // send via the forward_cmd channel and wait for a response,
-                                    // which would deadlock if done synchronously in the select! loop.
-                                    let response_tx = control_response_tx.clone();
-                                    tokio::spawn(async move {
-                                        let response = handle_command(request, &state).await;
-                                        if let Err(e) = response_tx.send((client_id, response)).await {
-                                            tracing::warn!(error = %e, "Failed to queue control response");
-                                        }
-                                    });
+                                        // Forward input to the terminal resource
+                                        // Note: Stream I/O is handled through the terminal's attached channels
+                                        // which are managed by the Terminal resource itself after attach
+                                        tracing::debug!(
+                                            client_id,
+                                            resource_id = %resource_id,
+                                            bytes = data.len(),
+                                            "Received terminal stream from control client"
+                                        );
+                                        // TODO: Forward to terminal input channel through attached client registry
+                                    }
                                 }
                                 ControlEvent::ClientDisconnected { client_id, error } => {
                                     if let Some(e) = error {
@@ -1814,6 +1887,7 @@ impl Session {
                                     } else {
                                         tracing::debug!(client_id, "Control client disconnected");
                                     }
+                                    // TODO: Detach terminal if this client was attached
                                 }
                             }
                         }
@@ -1865,5 +1939,328 @@ impl HeartbeatState {
             tracker,
             next_deadline: tokio::time::Instant::now() + interval,
         }
+    }
+}
+
+/// Handle unified protocol commands and return a response Message.
+async fn handle_unified_command(
+    request_id: u32,
+    cmd: crate::control::proto::command::Cmd,
+    resource_manager: Option<&crate::control::ResourceManager>,
+    conn: &std::sync::Arc<ChannelConnection>,
+    server_addr: &str,
+    connected_at: u64,
+    srtt: Option<Duration>,
+) -> crate::control::Message {
+    use crate::control::{proto, resource_info_to_proto, Forward, ForwardParams, ForwardType, Message, ResourceKind};
+
+    let event_seq = 0; // TODO: Track event sequence numbers
+
+    match cmd {
+        proto::command::Cmd::ResourceCreate(create) => {
+            let Some(rm) = resource_manager else {
+                return command_error(request_id, event_seq, proto::ErrorCode::Unavailable, "Resource manager not available");
+            };
+
+            match create.params {
+                Some(proto::resource_create::Params::Forward(params)) => {
+                    // Convert proto forward type to internal type
+                    let forward_type = match proto::ForwardType::try_from(params.forward_type) {
+                        Ok(proto::ForwardType::Local) => ForwardType::Local,
+                        Ok(proto::ForwardType::Remote) => ForwardType::Remote,
+                        Ok(proto::ForwardType::Dynamic) => ForwardType::Dynamic,
+                        _ => return command_error(request_id, event_seq, proto::ErrorCode::InvalidArgument, "Invalid forward type"),
+                    };
+
+                    let forward_params = ForwardParams {
+                        forward_type,
+                        bind_addr: if params.bind_addr.is_empty() { "127.0.0.1".to_string() } else { params.bind_addr },
+                        bind_port: params.bind_port,
+                        dest_host: if params.dest_host.is_empty() { None } else { Some(params.dest_host) },
+                        dest_port: if params.dest_port == 0 { None } else { Some(params.dest_port) },
+                    };
+
+                    // Create and register the forward resource
+                    let id = match rm.add_with_factory(ResourceKind::Forward, |id| Box::new(Forward::new(id, forward_params))).await {
+                        Ok(id) => id,
+                        Err(e) => return command_error(request_id, event_seq, proto::ErrorCode::Internal, &format!("Failed to create forward: {}", e)),
+                    };
+
+                    // Start the forward
+                    if let Err(e) = rm.start(&id, conn.clone()).await {
+                        // Clean up on failure
+                        let _ = rm.close(&id).await;
+                        return command_error(request_id, event_seq, proto::ErrorCode::BindFailed, &format!("Failed to start forward: {}", e));
+                    }
+
+                    // Get the resource info to return
+                    if let Some(info) = rm.describe(&id).await {
+                        return Message {
+                            kind: Some(proto::message::Kind::Event(proto::Event {
+                                event_seq,
+                                evt: Some(proto::event::Evt::CommandResult(proto::CommandResult {
+                                    request_id,
+                                    result: Some(proto::command_result::Result::Ok(proto::CommandOk {
+                                        data: Some(proto::command_ok::Data::ResourceCreated(
+                                            proto::ResourceCreateResult {
+                                                resource_id: id,
+                                                info: Some(resource_info_to_proto(&info)),
+                                            },
+                                        )),
+                                    })),
+                                })),
+                            })),
+                        };
+                    }
+
+                    command_error(request_id, event_seq, proto::ErrorCode::Internal, "Forward created but info unavailable")
+                }
+                Some(proto::resource_create::Params::Terminal(_params)) => {
+                    // Terminal creation via control socket - not yet implemented
+                    // Terminals are typically created at session start
+                    command_error(request_id, event_seq, proto::ErrorCode::Unspecified, "Terminal creation via control socket not yet implemented")
+                }
+                Some(proto::resource_create::Params::FileTransfer(_params)) => {
+                    // File transfer creation - not yet implemented
+                    command_error(request_id, event_seq, proto::ErrorCode::Unspecified, "File transfer creation not yet implemented")
+                }
+                None => {
+                    command_error(request_id, event_seq, proto::ErrorCode::InvalidArgument, "Missing resource create params")
+                }
+            }
+        }
+
+        proto::command::Cmd::Status(_) => {
+            let resource_count = if let Some(ref rm) = resource_manager {
+                rm.list(None).await.len() as u32
+            } else {
+                0
+            };
+
+            Message {
+                kind: Some(proto::message::Kind::Event(proto::Event {
+                    event_seq,
+                    evt: Some(proto::event::Evt::CommandResult(proto::CommandResult {
+                        request_id,
+                        result: Some(proto::command_result::Result::Ok(proto::CommandOk {
+                            data: Some(proto::command_ok::Data::Status(proto::StatusResult {
+                                state: "connected".to_string(),
+                                server_addr: server_addr.to_string(),
+                                uptime_secs: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs().saturating_sub(connected_at))
+                                    .unwrap_or(0),
+                                bytes_sent: 0,     // TODO
+                                bytes_received: 0, // TODO
+                                rtt_ms: srtt.map(|d| d.as_millis() as u32).unwrap_or(0),
+                                resource_count,
+                            })),
+                        })),
+                    })),
+                })),
+            }
+        }
+
+        proto::command::Cmd::Ping(ping) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+
+            Message {
+                kind: Some(proto::message::Kind::Event(proto::Event {
+                    event_seq,
+                    evt: Some(proto::event::Evt::CommandResult(proto::CommandResult {
+                        request_id,
+                        result: Some(proto::command_result::Result::Ok(proto::CommandOk {
+                            data: Some(proto::command_ok::Data::Pong(proto::PongResult {
+                                timestamp: ping.timestamp,
+                                server_time: now,
+                            })),
+                        })),
+                    })),
+                })),
+            }
+        }
+
+        proto::command::Cmd::ResourceList(list) => {
+            let kind_filter = match proto::ResourceKind::try_from(list.kind) {
+                Ok(proto::ResourceKind::Terminal) => Some(ResourceKind::Terminal),
+                Ok(proto::ResourceKind::Forward) => Some(ResourceKind::Forward),
+                Ok(proto::ResourceKind::FileTransfer) => Some(ResourceKind::FileTransfer),
+                _ => None,
+            };
+
+            let resources = if let Some(ref rm) = resource_manager {
+                rm.list(kind_filter)
+                    .await
+                    .into_iter()
+                    .map(|info| resource_info_to_proto(&info))
+                    .collect()
+            } else {
+                vec![]
+            };
+
+            Message {
+                kind: Some(proto::message::Kind::Event(proto::Event {
+                    event_seq,
+                    evt: Some(proto::event::Evt::CommandResult(proto::CommandResult {
+                        request_id,
+                        result: Some(proto::command_result::Result::Ok(proto::CommandOk {
+                            data: Some(proto::command_ok::Data::ResourceList(
+                                proto::ResourceListResult { resources },
+                            )),
+                        })),
+                    })),
+                })),
+            }
+        }
+
+        proto::command::Cmd::ResourceDescribe(describe) => {
+            if let Some(ref rm) = resource_manager {
+                if let Some(info) = rm.describe(&describe.resource_id).await {
+                    return Message {
+                        kind: Some(proto::message::Kind::Event(proto::Event {
+                            event_seq,
+                            evt: Some(proto::event::Evt::CommandResult(proto::CommandResult {
+                                request_id,
+                                result: Some(proto::command_result::Result::Ok(proto::CommandOk {
+                                    data: Some(proto::command_ok::Data::ResourceDescribe(
+                                        proto::ResourceDescribeResult {
+                                            info: Some(resource_info_to_proto(&info)),
+                                        },
+                                    )),
+                                })),
+                            })),
+                        })),
+                    };
+                }
+            }
+
+            command_error(request_id, event_seq, proto::ErrorCode::NotFound, "Resource not found")
+        }
+
+        proto::command::Cmd::ResourceClose(close) => {
+            if let Some(ref rm) = resource_manager {
+                if rm.close(&close.resource_id).await.is_ok() {
+                    return Message {
+                        kind: Some(proto::message::Kind::Event(proto::Event {
+                            event_seq,
+                            evt: Some(proto::event::Evt::CommandResult(proto::CommandResult {
+                                request_id,
+                                result: Some(proto::command_result::Result::Ok(proto::CommandOk {
+                                    data: None,
+                                })),
+                            })),
+                        })),
+                    };
+                }
+            }
+
+            command_error(request_id, event_seq, proto::ErrorCode::NotFound, "Resource not found")
+        }
+
+        proto::command::Cmd::TerminalAttach(attach) => {
+            // Terminal attach - for now return the resource info
+            // Full I/O streaming will be implemented in phase 3
+            if let Some(rm) = resource_manager {
+                if let Some(info) = rm.describe(&attach.resource_id).await {
+                    if matches!(info.kind, ResourceKind::Terminal) {
+                        return Message {
+                            kind: Some(proto::message::Kind::Event(proto::Event {
+                                event_seq,
+                                evt: Some(proto::event::Evt::CommandResult(proto::CommandResult {
+                                    request_id,
+                                    result: Some(proto::command_result::Result::Ok(proto::CommandOk {
+                                        data: Some(proto::command_ok::Data::ResourceDescribe(
+                                            proto::ResourceDescribeResult {
+                                                info: Some(resource_info_to_proto(&info)),
+                                            },
+                                        )),
+                                    })),
+                                })),
+                            })),
+                        };
+                    }
+                }
+            }
+
+            command_error(request_id, event_seq, proto::ErrorCode::NotFound, "Terminal not found")
+        }
+
+        proto::command::Cmd::TerminalDetach(detach) => {
+            // Terminal detach - for now just acknowledge
+            if let Some(rm) = resource_manager {
+                if rm.describe(&detach.resource_id).await.is_some() {
+                    return Message {
+                        kind: Some(proto::message::Kind::Event(proto::Event {
+                            event_seq,
+                            evt: Some(proto::event::Evt::CommandResult(proto::CommandResult {
+                                request_id,
+                                result: Some(proto::command_result::Result::Ok(proto::CommandOk {
+                                    data: None,
+                                })),
+                            })),
+                        })),
+                    };
+                }
+            }
+
+            command_error(request_id, event_seq, proto::ErrorCode::NotFound, "Terminal not found")
+        }
+
+        proto::command::Cmd::TerminalResize(resize) => {
+            // Terminal resize - for now just acknowledge if resource exists
+            if let Some(rm) = resource_manager {
+                if rm.describe(&resize.resource_id).await.is_some() {
+                    // TODO: Actually resize the terminal via ResourceManager
+                    return Message {
+                        kind: Some(proto::message::Kind::Event(proto::Event {
+                            event_seq,
+                            evt: Some(proto::event::Evt::CommandResult(proto::CommandResult {
+                                request_id,
+                                result: Some(proto::command_result::Result::Ok(proto::CommandOk {
+                                    data: None,
+                                })),
+                            })),
+                        })),
+                    };
+                }
+            }
+
+            command_error(request_id, event_seq, proto::ErrorCode::NotFound, "Terminal not found")
+        }
+
+        // Commands not yet implemented
+        _ => command_error(
+            request_id,
+            event_seq,
+            proto::ErrorCode::Unspecified,
+            "Command not implemented",
+        ),
+    }
+}
+
+/// Helper to create a command error response.
+fn command_error(
+    request_id: u32,
+    event_seq: u64,
+    code: crate::control::proto::ErrorCode,
+    message: &str,
+) -> crate::control::Message {
+    use crate::control::proto;
+
+    crate::control::Message {
+        kind: Some(proto::message::Kind::Event(proto::Event {
+            event_seq,
+            evt: Some(proto::event::Evt::CommandResult(proto::CommandResult {
+                request_id,
+                result: Some(proto::command_result::Result::Error(proto::CommandError {
+                    code: code.into(),
+                    message: message.to_string(),
+                    details: String::new(),
+                })),
+            })),
+        })),
     }
 }

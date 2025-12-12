@@ -38,10 +38,10 @@ pub mod resource;
 pub mod resources;
 pub mod socket;
 
-// Re-export main types from legacy interface
+// Re-export main types
 pub use client::ControlClient;
 pub use commands::{
-    handle_command, ConnectionState, ForwardAddCommand, SessionState, TerminalCommand,
+    ConnectionState, ForwardAddCommand, SessionState, TerminalCommand, TerminalAttachChannels,
     TerminalState,
 };
 pub use repl::{run_repl, list_sessions, discover_latest_session, SessionInfo};
@@ -68,17 +68,7 @@ pub(crate) mod proto {
     include!(concat!(env!("OUT_DIR"), "/qsh.control.rs"));
 }
 
-// Re-export commonly used protobuf types (legacy)
-pub use proto::{
-    ControlRequest, ControlResponse, ErrorResponse, ForwardAddRequest, ForwardAddResponse,
-    ForwardInfo, ForwardListRequest, ForwardListResponse, ForwardRemoveRequest,
-    ForwardRemoveResponse, GetStatusRequest, PingRequest, PongResponse, SessionInfoRequest,
-    SessionInfoResponse, StatusResponse, TerminalCloseRequest, TerminalCloseResponse,
-    TerminalInfo, TerminalListRequest, TerminalListResponse, TerminalOpenRequest,
-    TerminalOpenResponse, TerminalResizeRequest, TerminalResizeResponse,
-};
-
-// Re-export new unified protocol types
+// Re-export unified protocol types
 pub use proto::{
     Command, CommandError, CommandOk, CommandResult, EnvPair, Event, ExitCmd,
     FileCancelCmd, FileDownloadCmd, FileTransferCreateParams, FileTransferOptions, FileUploadCmd,
@@ -90,4 +80,7 @@ pub use proto::{
 };
 
 // Re-export proto enums
-pub use proto::{ErrorCode, ResourceKind as ProtoResourceKind, ResourceState as ProtoResourceState};
+pub use proto::{
+    ErrorCode, ForwardType as ProtoForwardType, ResourceKind as ProtoResourceKind,
+    ResourceState as ProtoResourceState,
+};
