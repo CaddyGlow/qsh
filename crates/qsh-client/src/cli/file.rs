@@ -103,24 +103,9 @@ impl CpCli {
 
     /// Build TransferOptions from CLI args.
     pub fn transfer_options(&self) -> qsh_core::protocol::TransferOptions {
-        use qsh_core::protocol::DeltaAlgo;
-
-        // Map deprecated delta flag to delta_algo
-        let delta_algo = if self.no_delta {
-            DeltaAlgo::None
-        } else {
-            // Default to RollingStreaming for best performance
-            DeltaAlgo::RollingStreaming
-        };
-
-        qsh_core::protocol::TransferOptions {
-            compress: !self.no_compress,
-            delta: !self.no_delta,
-            delta_algo,
-            recursive: self.recursive,
-            preserve_mode: self.preserve,
-            parallel: self.parallel.max(1),
-            skip_if_unchanged: self.skip_if_unchanged,
-        }
+        let mut opts = self.options.to_transfer_options();
+        // CpCli has preserve flag that TransferOptionsArgs doesn't have
+        opts.preserve_mode = self.preserve;
+        opts
     }
 }

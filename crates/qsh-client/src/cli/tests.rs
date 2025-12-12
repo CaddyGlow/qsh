@@ -548,7 +548,7 @@ mod tests {
     fn cp_parallel_flag() {
         let cli =
             CpCli::try_parse_from(["qscp", "-j", "8", "/local/file", "host:/remote/file"]).unwrap();
-        assert_eq!(cli.parallel, 8);
+        assert_eq!(cli.options.parallel, 8);
     }
 
     #[test]
@@ -584,21 +584,21 @@ mod tests {
     fn cp_resume_flag() {
         let cli = CpCli::try_parse_from(["qscp", "--resume", "/local/file", "host:/remote/file"])
             .unwrap();
-        assert!(cli.resume);
+        assert!(cli.options.resume);
     }
 
     #[test]
     fn cp_defaults() {
         let cli = CpCli::try_parse_from(["qscp", "/local/file", "host:/remote/file"]).unwrap();
         assert_eq!(cli.port, 22);
-        assert_eq!(cli.parallel, 4);
+        assert_eq!(cli.options.parallel, 4);
         assert_eq!(cli.verbose, 0);
-        assert!(!cli.recursive);
-        assert!(!cli.no_delta);
-        assert!(!cli.no_compress);
-        assert!(!cli.resume);
+        assert!(!cli.options.recursive);
+        assert!(!cli.options.no_delta);
+        assert!(!cli.options.no_compress);
+        assert!(!cli.options.resume);
         assert!(!cli.preserve);
-        assert!(!cli.skip_if_unchanged);
+        assert!(!cli.options.skip_unchanged);
         assert!(cli.identity.is_empty());
         assert!(cli.log_file.is_none());
         #[cfg(feature = "standalone")]
@@ -621,11 +621,11 @@ mod tests {
             "host:/remote/file",
         ])
         .unwrap();
-        assert!(cli.skip_if_unchanged);
+        assert!(cli.options.skip_unchanged);
 
         let cli2 =
             CpCli::try_parse_from(["qscp", "-u", "/local/file", "host:/remote/file"]).unwrap();
-        assert!(cli2.skip_if_unchanged);
+        assert!(cli2.options.skip_unchanged);
     }
 
     #[test]

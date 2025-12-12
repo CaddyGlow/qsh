@@ -15,4 +15,4 @@ pub mod engine;
 pub mod progress;
 
 pub use engine::{TransferEngine, TransferStats};
-pub use progress::{ProgressEvent, ProgressCallback};
+pub use progress::{IndicatifCallback, NoOpCallback, ProgressCallback, ProgressEvent, callback};

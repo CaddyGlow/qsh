@@ -497,21 +497,13 @@ async fn run_control_command(
         }
         Command::File(file_cmd) => {
             use qsh_client::cli::{FileAction, FilePath};
-            use qsh_client::control::proto::FileTransferOptions;
 
             let session_name = resolve_session_name(cli)?;
             let mut client = ControlClient::connect(&session_name).await?;
 
             match &file_cmd.action {
                 FileAction::Upload(args) => {
-                    let options = FileTransferOptions {
-                        recursive: args.recursive,
-                        resume: args.resume,
-                        delta: args.delta && !args.no_delta,
-                        compress: args.compress && !args.no_compress,
-                        parallel: args.parallel,
-                        skip_unchanged: args.skip_unchanged,
-                    };
+                    let options = args.options.to_proto_options();
 
                     let info = client
                         .upload_file(
@@ -528,14 +520,7 @@ async fn run_control_command(
                     Ok(0)
                 }
                 FileAction::Download(args) => {
-                    let options = FileTransferOptions {
-                        recursive: args.recursive,
-                        resume: args.resume,
-                        delta: args.delta && !args.no_delta,
-                        compress: args.compress && !args.no_compress,
-                        parallel: args.parallel,
-                        skip_unchanged: args.skip_unchanged,
-                    };
+                    let options = args.options.to_proto_options();
 
                     let info = client
                         .download_file(
@@ -556,14 +541,7 @@ async fn run_control_command(
                     let source = FilePath::parse(&args.source);
                     let dest = FilePath::parse(&args.dest);
 
-                    let options = FileTransferOptions {
-                        recursive: args.recursive,
-                        resume: args.resume,
-                        delta: args.delta && !args.no_delta,
-                        compress: args.compress && !args.no_compress,
-                        parallel: args.parallel,
-                        skip_unchanged: args.skip_unchanged,
-                    };
+                    let options = args.options.to_proto_options();
 
                     match (&source, &dest) {
                         (FilePath::Local(local), FilePath::Remote { path: remote, .. }) => {

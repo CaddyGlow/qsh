@@ -244,17 +244,11 @@ pub enum FileAction {
     Cancel(FileCancelArgs),
 }
 
-/// Arguments for file upload.
-#[derive(Debug, Parser)]
-pub struct FileUploadArgs {
-    /// Local file path
-    #[arg(value_name = "LOCAL")]
-    pub local_path: PathBuf,
-
-    /// Remote destination path
-    #[arg(value_name = "REMOTE")]
-    pub remote_path: String,
-
+/// Shared transfer options for file operations.
+///
+/// These options are common to qscp and `qsh file` commands.
+#[derive(Debug, Clone, Parser)]
+pub struct TransferOptionsArgs {
     /// Recursive transfer (for directories)
     #[arg(short = 'r', long)]
     pub recursive: bool,
@@ -284,8 +278,57 @@ pub struct FileUploadArgs {
     pub parallel: u32,
 
     /// Skip files that haven't changed
-    #[arg(long)]
+    #[arg(short = 'u', long = "skip-unchanged", visible_alias = "skip-if-unchanged")]
     pub skip_unchanged: bool,
+}
+
+impl TransferOptionsArgs {
+    /// Convert to protocol TransferOptions.
+    pub fn to_transfer_options(&self) -> qsh_core::protocol::TransferOptions {
+        use qsh_core::protocol::DeltaAlgo;
+
+        qsh_core::protocol::TransferOptions {
+            compress: self.compress && !self.no_compress,
+            delta: self.delta && !self.no_delta,
+            delta_algo: if self.delta && !self.no_delta {
+                DeltaAlgo::RollingStreaming
+            } else {
+                DeltaAlgo::None
+            },
+            recursive: self.recursive,
+            preserve_mode: false,
+            parallel: self.parallel.max(1) as usize,
+            skip_if_unchanged: self.skip_unchanged,
+        }
+    }
+
+    /// Convert to proto FileTransferOptions.
+    pub fn to_proto_options(&self) -> crate::control::proto::FileTransferOptions {
+        crate::control::proto::FileTransferOptions {
+            recursive: self.recursive,
+            resume: self.resume,
+            delta: self.delta && !self.no_delta,
+            compress: self.compress && !self.no_compress,
+            parallel: self.parallel,
+            skip_unchanged: self.skip_unchanged,
+        }
+    }
+}
+
+/// Arguments for file upload.
+#[derive(Debug, Parser)]
+pub struct FileUploadArgs {
+    /// Local file path
+    #[arg(value_name = "LOCAL")]
+    pub local_path: PathBuf,
+
+    /// Remote destination path
+    #[arg(value_name = "REMOTE")]
+    pub remote_path: String,
+
+    /// Transfer options
+    #[command(flatten)]
+    pub options: TransferOptionsArgs,
 }
 
 /// Arguments for file download.
@@ -299,37 +342,9 @@ pub struct FileDownloadArgs {
     #[arg(value_name = "LOCAL")]
     pub local_path: PathBuf,
 
-    /// Recursive transfer (for directories)
-    #[arg(short = 'r', long)]
-    pub recursive: bool,
-
-    /// Enable delta transfer (send only differences)
-    #[arg(long, default_value_t = true)]
-    pub delta: bool,
-
-    /// Disable delta transfer
-    #[arg(long = "no-delta")]
-    pub no_delta: bool,
-
-    /// Enable compression
-    #[arg(short = 'z', long, default_value_t = true)]
-    pub compress: bool,
-
-    /// Disable compression
-    #[arg(long = "no-compress")]
-    pub no_compress: bool,
-
-    /// Resume interrupted transfer
-    #[arg(long)]
-    pub resume: bool,
-
-    /// Number of parallel transfers
-    #[arg(short = 'j', long, default_value_t = 4)]
-    pub parallel: u32,
-
-    /// Skip files that haven't changed
-    #[arg(long)]
-    pub skip_unchanged: bool,
+    /// Transfer options
+    #[command(flatten)]
+    pub options: TransferOptionsArgs,
 }
 
 /// Arguments for file copy (auto-detect direction).
@@ -343,37 +358,9 @@ pub struct FileCpArgs {
     #[arg(value_name = "DEST")]
     pub dest: String,
 
-    /// Recursive transfer (for directories)
-    #[arg(short = 'r', long)]
-    pub recursive: bool,
-
-    /// Enable delta transfer (send only differences)
-    #[arg(long, default_value_t = true)]
-    pub delta: bool,
-
-    /// Disable delta transfer
-    #[arg(long = "no-delta")]
-    pub no_delta: bool,
-
-    /// Enable compression
-    #[arg(short = 'z', long, default_value_t = true)]
-    pub compress: bool,
-
-    /// Disable compression
-    #[arg(long = "no-compress")]
-    pub no_compress: bool,
-
-    /// Resume interrupted transfer
-    #[arg(long)]
-    pub resume: bool,
-
-    /// Number of parallel transfers
-    #[arg(short = 'j', long, default_value_t = 4)]
-    pub parallel: u32,
-
-    /// Skip files that haven't changed
-    #[arg(long)]
-    pub skip_unchanged: bool,
+    /// Transfer options
+    #[command(flatten)]
+    pub options: TransferOptionsArgs,
 }
 
 /// Arguments for canceling a file transfer.
@@ -736,29 +723,9 @@ pub struct CpCli {
     #[arg(required = true)]
     pub dest: String,
 
-    /// Recursive copy (directories)
-    #[arg(short = 'r', long)]
-    pub recursive: bool,
-
-    /// Disable delta sync (always transfer full files)
-    #[arg(long = "no-delta")]
-    pub no_delta: bool,
-
-    /// Disable compression
-    #[arg(long = "no-compress")]
-    pub no_compress: bool,
-
-    /// Resume interrupted transfer
-    #[arg(long = "resume")]
-    pub resume: bool,
-
-    /// Skip transfer if file is already up to date (size + mtime + hash match)
-    #[arg(long = "skip-if-unchanged", short = 'u')]
-    pub skip_if_unchanged: bool,
-
-    /// Number of parallel transfers
-    #[arg(short = 'j', long = "parallel", default_value = "4")]
-    pub parallel: usize,
+    /// Transfer options
+    #[command(flatten)]
+    pub options: TransferOptionsArgs,
 
     /// Preserve file permissions
     #[arg(short = 'p', long = "preserve")]
